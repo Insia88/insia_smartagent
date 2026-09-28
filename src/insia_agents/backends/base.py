@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, runtime_checkable
 
-from ..models import Brief, ChannelId, Draft, Finding, FormatCheck, Plan, ResearchPack, ResearchQuestion, Review, Source
+from ..models import (Brief, ChannelId, Draft, Finding, FormatCheck, Plan, Profile, ResearchPack, ResearchQuestion,
+                      Review, Source, UsageRecord, UserDocument)
 
 EmitFn = Callable[[str, dict[str, Any]], None]
 NoticeFn = Callable[[str, str, str], None]  # (agent, level, message)
+UsageFn = Callable[[UsageRecord], None]
+
+
+@dataclass
+class RunContext:
+    """Per-run inputs beyond the brief: the company profile, user materials and
+    the reference date. Backends read ``backend.context`` (set before a run)."""
+
+    profile: Profile | None = None
+    documents: list[UserDocument] = field(default_factory=list)
+    today: str = ""
+    instructions: str = ""  # human revision instructions for item jobs
 
 
 @runtime_checkable
