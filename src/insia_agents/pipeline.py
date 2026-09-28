@@ -252,9 +252,10 @@ def _default_runner(bus: EventBus, settings: Settings) -> SimRunner | ThreadRunn
 # ---------------------------------------------------------------------------
 
 
-def record_cost(record: UsageRecord) -> float:
+def record_cost(record: UsageRecord, *, home: str | Path | None = None) -> float:
     """USD cost of a usage record: its ``cost_usd`` when the backend priced it,
-    otherwise priced with ``costs.cost_of`` (0 when the model price is unknown)."""
+    otherwise priced with ``costs.cost_of`` (0 when the model price is unknown).
+    ``home`` is the workspace whose ``prices.json`` applies."""
     try:
         cost = float(record.cost_usd or 0.0)
     except (TypeError, ValueError):
@@ -267,7 +268,7 @@ def record_cost(record: UsageRecord) -> float:
             or record.web_search_requests):
         return 0.0
     try:
-        return max(0.0, float(_cost_of(record)))
+        return max(0.0, float(_cost_of(record, home=home)))
     except Exception:  # noqa: BLE001 - a pricing problem must never break a run
         log.warning("사용량 비용을 계산하지 못했어요 (model=%r)", record.model, exc_info=True)
         return 0.0
@@ -309,7 +310,7 @@ class UsageMeter:
             except Exception:  # noqa: BLE001
                 log.warning("알 수 없는 사용량 기록을 건너뛰어요: %r", record)
                 return
-        cost = record_cost(record)
+        cost = record_cost(record, home=getattr(self.workspace, "home", None))
         record = record.model_copy(update={"run_id": record.run_id or self.run_id, "cost_usd": cost,
                                            "created_at": record.created_at or _iso_now()})
         with self._lock:

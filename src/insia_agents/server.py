@@ -1990,8 +1990,8 @@ def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, w
     env ``INSIA_PUBLIC_HOSTS`` (comma-separated) and ``trust_proxy=False`` to env
     ``INSIA_TRUST_PROXY`` (``1``/``true``), so a container can be configured
     with environment variables alone. Raises ``ServerConfigError`` (a
-    ``ValueError`` with a Korean message) when a non-loopback ``host`` has no
-    token, the token is too weak, a ``public_hosts`` entry is invalid or the
+    ``ValueError`` with a Korean message) when a non-loopback ``host`` or any
+    ``public_hosts`` entry has no token, the token is too weak, a ``public_hosts`` entry is invalid or the
     workspace cannot be opened; ``OSError`` when the port cannot be bound.
     """
     token = check_token(token if token is not None and str(token).strip() else os.environ.get("INSIA_ACCESS_TOKEN"))
@@ -2004,6 +2004,10 @@ def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, w
         raise ServerConfigError(
             f"{host or '모든 네트워크 주소'}에서 서버를 열려면 접근 토큰이 필요해요. INSIA_ACCESS_TOKEN 환경 변수나 --token으로 "
             f"{MIN_TOKEN_CHARS}자 이상의 토큰을 정해 주세요. 내 PC에서만 쓴다면 --host 127.0.0.1(기본값)로 실행하세요.")
+    if hosts and token is None:  # a reverse proxy makes even a loopback bind reachable from outside
+        raise ServerConfigError(
+            "도메인(--public-host / INSIA_PUBLIC_HOSTS)으로 열면 리버스 프록시를 거쳐 바깥에서 접속할 수 있어서 접근 토큰이 "
+            f"꼭 필요해요. INSIA_ACCESS_TOKEN 환경 변수나 --token으로 {MIN_TOKEN_CHARS}자 이상의 토큰을 정해 주세요.")
     web_root = Path(web_dir) if web_dir is not None else settings.web_dir
     try:
         manager = RunManager(settings, workspace=workspace, max_live=max_live, max_mock=max_mock)

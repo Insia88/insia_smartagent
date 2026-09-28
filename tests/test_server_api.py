@@ -380,6 +380,14 @@ def test_resume_refuses_running_and_non_resumable_runs(srv):
     assert resp.status == 409 and data["can_force"] is True
     resp, data = request(srv, "POST", "/api/runs/20260928-000000-busy/cancel", {})
     assert resp.status == 409 and "이 서버에서 실행 중인 작업이 아니에요" in data["error"]
+    # an imported Claude Code run (insia import-run) is a record, never something to resume
+    ws.create_run("20260928-000001-import", Brief(topic="가져온 실행", channels=["linkedin"]), kind="import")
+    ws.update_run("20260928-000001-import", status="failed")
+    assert ok(srv, "GET", "/api/runs/20260928-000001-import")["resumable"] is False
+    listed = {r["run_id"]: r for r in ok(srv, "GET", "/api/runs")["runs"]}
+    assert listed["20260928-000001-import"]["resumable"] is False
+    resp, data = request(srv, "POST", "/api/runs/20260928-000001-import/resume", {})
+    assert resp.status == 400 and "이어서 실행할 수 없어요" in data["error"]
 
 
 def test_cancel_stops_a_running_job_and_it_can_be_resumed(srv):
@@ -647,6 +655,11 @@ def test_non_loopback_bind_needs_a_strong_token(settings, monkeypatch):
         make_server(settings, host="127.0.0.1", port=0, token="토큰토큰토큰토큰토큰토큰토큰")
     with pytest.raises(ServerConfigError, match="public-host"):
         make_server(settings, host="127.0.0.1", port=0, public_hosts=["https://insia.example.com"])
+    with pytest.raises(ServerConfigError, match="리버스 프록시"):  # loopback behind a proxy is still public
+        make_server(settings, host="127.0.0.1", port=0, public_hosts=["insia.example.com"])
+    monkeypatch.setenv("INSIA_PUBLIC_HOSTS", "insia.example.com")
+    with pytest.raises(ServerConfigError, match="리버스 프록시"):
+        make_server(settings, host="127.0.0.1", port=0)
     monkeypatch.setenv("INSIA_ACCESS_TOKEN", TOKEN)
     monkeypatch.setenv("INSIA_PUBLIC_HOSTS", "insia.example.com, Other.Example.org")
     monkeypatch.setenv("INSIA_TRUST_PROXY", "1")

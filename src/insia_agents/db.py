@@ -614,9 +614,20 @@ class Workspace:
         return self._document(row) if row else None
 
     def delete_document(self, doc_id: str) -> bool:
+        """Delete the document and its original file copies (``uploads/<id>_*``); False when it didn't exist."""
+        doc_id = str(doc_id or "").strip()
         with self._tx() as conn:
-            cursor = conn.execute("DELETE FROM documents WHERE id = ?", (str(doc_id or "").strip(),))
-        return cursor.rowcount > 0
+            cursor = conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        if cursor.rowcount <= 0:
+            return False
+        if self.uploads_dir.is_dir():
+            for original in self.uploads_dir.iterdir():
+                if original.name.startswith(f"{doc_id}_") and original.is_file():
+                    try:
+                        original.unlink()
+                    except OSError:  # the text is already gone from the DB; a stuck copy is harmless
+                        pass
+        return True
 
     # -- runs --------------------------------------------------------------------
     def create_run(self, run_id: str, brief: Brief, *, kind: str = "pipeline", options: dict | None = None,

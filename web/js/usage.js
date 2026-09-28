@@ -20,7 +20,7 @@
     revise: '수정', plan_calendar: '캘린더 계획', calendar: '캘린더 계획'
   };
 
-  var KIND_LABEL = { review: '재검수', revise: '수정 요청', edit: '사람 수정', slot: '캘린더 초안', plan: '캘린더 계획', resume: '이어서 실행', other: '캘린더 계획 등' };
+  var KIND_LABEL = { review: '재검수', revise: '수정 요청', edit: '사람 수정', slot: '캘린더 초안', plan: '캘린더 계획', resume: '이어서 실행', import: '가져오기', other: '캘린더 계획 등' };
 
   var S = { container: null, month: null, data: null, error: null, loading: false, focusDay: -1, ro: null, lastWidth: 0 };
 

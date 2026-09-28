@@ -1678,11 +1678,6 @@ def cmd_docs_rm(args: argparse.Namespace) -> int:
         doc = ws.get_document(args.doc_id)
         if doc is None or not ws.delete_document(doc.id):
             raise CommandError(f"자료 {args.doc_id}을(를) 찾을 수 없어요. 'insia docs list'로 id를 확인해 주세요.")
-        for original in ws.uploads_dir.glob(f"{doc.id}_*"):
-            try:
-                original.unlink()
-            except OSError:
-                pass
     print(f"자료 {doc.id}({doc.title})를 지웠어요. 이미 만든 초안과 실행 기록의 출처 표시는 그대로 남아요.")
     return 0
 
@@ -1707,7 +1702,7 @@ class _UsageSink:
     def __call__(self, record: Any) -> None:
         from .pipeline import record_cost
 
-        cost = record_cost(record)
+        cost = record_cost(record, home=self.ws.home)
         self.cost += cost
         try:
             self.ws.record_usage(record.model_copy(update={"cost_usd": cost}))
@@ -2544,7 +2539,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     try:
         from .costs import price_for
 
-        price = price_for(settings.model)
+        price = price_for(settings.model, home=settings.home)
         if price:
             add("info", "가격표", f"{settings.model}: 입력 ${price['input']:g}/MTok · 출력 ${price['output']:g}/MTok "
                 "(prices.json·INSIA_PRICE_*로 바꿔요)")

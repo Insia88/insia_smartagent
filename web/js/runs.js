@@ -19,7 +19,7 @@
   var ui = ws.ui;
   var el = U.el;
 
-  var KIND = { pipeline: '실행', slot: '캘린더 초안', review: '재검수', revise: '수정 요청', edit: '사람 수정' };
+  var KIND = { pipeline: '실행', slot: '캘린더 초안', review: '재검수', revise: '수정 요청', edit: '사람 수정', import: '가져오기' };
   var RUN_STATUS = { running: '진행 중', completed: '완료', failed: '실패', cancelled: '멈춤', interrupted: '중단됨' };
   var R = {
     watching: null,   // {runId, job, history, ended, event}

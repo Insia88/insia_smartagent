@@ -171,3 +171,24 @@ def test_mock_usage_is_free_and_estimated():
     assert record.input_tokens == 500 and record.output_tokens == 150
     assert estimate_tokens("") == 0 and estimate_tokens("a") == 1
     assert cost_of(record) == 0.0
+
+
+def test_usage_meter_prices_with_its_workspace_prices_json(tmp_path):
+    """Unpriced usage is priced with the run's workspace prices.json, not INSIA_HOME."""
+    from insia_agents.db import Workspace
+    from insia_agents.pipeline import UsageMeter, record_cost
+
+    home = tmp_path / "custom-home"  # INSIA_HOME (autouse fixture) points elsewhere
+    (home).mkdir()
+    (home / "prices.json").write_text(json.dumps({"models": {"claude-custom": {"input": 2, "output": 4}}}),
+                                      encoding="utf-8")
+    record = _record("claude-custom", input_tokens=1_000_000, output_tokens=500_000)
+    assert record_cost(record) == 0.0  # unknown model without the workspace file
+    assert record_cost(record, home=home) == pytest.approx(4.0)
+    ws = Workspace(home)
+    try:
+        meter = UsageMeter("r1", workspace=ws)
+        meter(record)
+        assert meter.spent == pytest.approx(4.0)
+    finally:
+        ws.close()

@@ -119,6 +119,22 @@ def test_profile_roundtrip(ws):
     assert ws.get_profile().company_name == "" and ws.get_profile().service_name == "스마트에이전트"
 
 
+def test_delete_document_removes_only_its_uploaded_originals(ws):
+    first = ws.add_document("소개서", "본문 1", filename="intro.md")
+    for _ in range(9):
+        ws.add_document("채우기", "본문")
+    tenth = ws.get_document("u10")
+    assert first.id == "u1" and tenth is not None
+    ws.uploads_dir.mkdir(parents=True, exist_ok=True)
+    mine = ws.uploads_dir / "u1_intro.md"
+    other = ws.uploads_dir / "u10_deck.pdf"
+    mine.write_text("x", encoding="utf-8")
+    other.write_text("y", encoding="utf-8")
+    assert ws.delete_document("u1") is True
+    assert not mine.exists() and other.exists()  # "u1_" must not match "u10_"
+    assert ws.delete_document("u1") is False and other.exists()
+
+
 def test_document_ids_are_monotonic_and_never_reused(ws):
     first = ws.add_document("회사 소개서", "우리 회사는 …", kind="markdown", filename="C:\\docs\\intro.md")
     second = ws.add_document("", "IR 자료 본문", filename="ir.txt")
