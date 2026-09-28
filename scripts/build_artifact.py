@@ -9,6 +9,8 @@ Output: ``dist/artifact/``
                where fetch() of sibling files is unavailable.
   demo/        demo-run.json (preferred) or sample-trace.json, copied as-is
   assets/      manifest.json + only the manifest-referenced files the page uses
+               (.glb models become self-contained .gltf.json files, since
+               artifacts serve .json but not .glb)
 
 Assets are added in priority order while the folder stays under the size
 budget (default 15.5 MB, hard limit 16 MB). Anything dropped or missing is set
@@ -25,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import shutil
@@ -122,6 +125,39 @@ def human(n: int) -> str:
     return f"{n / 1_000_000:.2f} MB" if n >= 100_000 else f"{n / 1000:.1f} KB"
 
 
+def glb_to_gltf_json(src: Path) -> bytes:
+    """Convert a binary .glb into a self-contained glTF JSON document.
+
+    Artifacts do not serve .glb files, but they serve .json. glTF allows the
+    binary buffer as a base64 data URI, and model-viewer (three.js GLTFLoader)
+    detects JSON glTF by content, not by file extension. Textures stored in the
+    buffer stay referenced through their bufferViews.
+    """
+    data = src.read_bytes()
+    if len(data) < 20 or data[:4] != b"glTF":
+        raise ValueError(f"GLB 파일이 아니에요: {src}")
+    doc = None
+    binary = b""
+    offset = 12
+    while offset + 8 <= len(data):
+        length = int.from_bytes(data[offset:offset + 4], "little")
+        kind = data[offset + 4:offset + 8]
+        chunk = data[offset + 8:offset + 8 + length]
+        if kind == b"JSON":
+            doc = json.loads(chunk.decode("utf-8"))
+        elif kind == b"BIN\x00":
+            binary = chunk
+        offset += 8 + length
+    if doc is None:
+        raise ValueError(f"GLB에 JSON 청크가 없어요: {src}")
+    buffers = doc.get("buffers") or []
+    if buffers:
+        if "uri" in buffers[0]:
+            raise ValueError(f"GLB의 첫 버퍼가 외부 파일을 가리켜요: {src}")
+        buffers[0]["uri"] = "data:application/octet-stream;base64," + base64.b64encode(binary[: buffers[0]["byteLength"]]).decode("ascii")
+    return json.dumps(doc, separators=(",", ":")).encode("utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="대시보드를 claude.ai 아티팩트 폴더로 빌드합니다.")
     ap.add_argument("--out", default=str(ROOT / "dist" / "artifact"), help="출력 폴더 (기본: dist/artifact)")
@@ -212,7 +248,12 @@ def main(argv: list[str] | None = None) -> int:
             dropped.append((key, f"파일 없음: web/assets/{rel}"))
             set_in(out_manifest, path, None)
             continue
-        size = src.stat().st_size
+        # artifacts don't serve .glb: ship it as self-contained glTF JSON instead
+        converted = glb_to_gltf_json(src) if rel.suffix.lower() == ".glb" else None
+        if converted is not None:
+            rel = rel.with_name(rel.stem + ".gltf.json")
+            set_in(out_manifest, path, str(rel))
+        size = len(converted) if converted is not None else src.stat().st_size
         if str(rel) in copied:
             used.append((f"{key} → {rel} (공유)", 0))
             continue
@@ -222,7 +263,10 @@ def main(argv: list[str] | None = None) -> int:
             continue
         dest = out / "assets" / Path(*rel.parts)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
+        if converted is not None:
+            dest.write_bytes(converted)
+        else:
+            shutil.copy2(src, dest)
         copied[str(rel)] = size
         total += size
         used.append((f"{key} → {rel}", size))
