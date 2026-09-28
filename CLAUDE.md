@@ -4,7 +4,7 @@
 
 같은 시스템을 두 방식으로 쓴다.
 1. **Claude Code**: `.claude/agents/`의 서브에이전트와 `.claude/skills/`의 슬래시 명령. 웹 검색은 Claude Code의 WebSearch·WebFetch를 쓴다.
-2. **Python 패키지 `insia_agents`**: Anthropic API로 도는 CLI와 로컬 대시보드(INSIA 에이전트 스튜디오). API 키가 없으면 녹화된 실행을 재생하는 mock 모드로 돈다.
+2. **Python 패키지 `insia_agents`**: Anthropic API로 도는 CLI와 로컬 대시보드(INSIA 에이전트 스튜디오). API 자격 증명이 없으면 mock 모드로 돈다. mock은 샘플 브리프(`examples/sample-run/brief.json`)면 녹화된 실행을 재생하고, 다른 주제면 `[데모]` 템플릿으로 같은 흐름을 만든다.
 
 ## 에이전트 세 명
 
@@ -45,15 +45,16 @@ claude --agent orchestrator          # 세션 전체를 총괄 에이전트로 �
 ## 개발 명령
 
 ```bash
-pip install -e .                               # 패키지 설치 (개발 모드)
+pip install -e . pytest                        # 패키지(개발 모드)와 pytest 설치
 pytest                                         # 테스트 (오프라인)
-python -m insia_agents run --mode mock         # 키 없이 샘플 실행 재생
+python -m insia_agents run --brief examples/sample-run/brief.json --mode mock --speed 0   # 키 없이 샘플 실행 재생
 python -m insia_agents run --topic "…" --channels bizplan,naver_blog   # 실제 실행 (ANTHROPIC_API_KEY 필요)
 python -m insia_agents serve                   # 대시보드 http://127.0.0.1:8765
 python -m insia_agents check <draft.json>      # 초안 형식 검사
+python scripts/build_artifact.py               # 대시보드 단일 페이지 빌드 (dist/artifact)
 ```
 
-설치 전에는 `PYTHONPATH=src python -m insia_agents …`로 실행한다.
+설치 전에는 `PYTHONPATH=src python -m insia_agents …`로 실행한다. `run`에는 `--brief` 파일이나 `--topic`이 꼭 있어야 한다. `--speed`는 mock 재생 배속이다(기본 1 = 실제 시간, 클수록 빠름, 0 = 기다리지 않음). 대시보드는 `file://`로 열면 기록을 불러오지 못하니 `serve`나 `web/`에서 띄운 `python3 -m http.server`로 연다. push·PR마다 `.github/workflows/ci.yml`이 `pytest`와 `build_artifact.py`를 돌린다.
 
 ## 파일 지도
 

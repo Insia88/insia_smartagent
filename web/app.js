@@ -353,25 +353,33 @@
   }
 
   // ------------------------------------------------------------------ markdown (escape first)
+  function mdEmphasis(t) {
+    t = t.replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>');
+    return t.replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
+  }
   function mdInline(raw, ctx) {
-    var s = esc(raw);
+    // \u0000 is reserved for link placeholders below
+    var s = esc(String(raw === null || raw === undefined ? '' : raw).replace(/\u0000/g, ''));
     return s.split(/(`[^`]+`)/g).map(function (seg) {
       if (seg.length > 2 && seg.charAt(0) === '`' && seg.charAt(seg.length - 1) === '`') return '<code>' + seg.slice(1, -1) + '</code>';
       var t = seg;
+      var links = [];
       t = t.replace(/\[이미지\s*[:：]\s*([^\]]+)\]/g, '<span class="md-img">이미지 · $1</span>');
+      // finished anchors are parked behind placeholders so the [sN] and emphasis passes never touch their hrefs
       t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, function (m, txt, url) {
-        return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>';
+        links.push('<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + mdEmphasis(txt) + '</a>');
+        return '\u0000' + (links.length - 1) + '\u0000';
       });
       t = t.replace(/\[(s\d+)\]/g, function (m, id) {
         var src = ctx && ctx.sources && ctx.sources[id];
         if (src && /^https?:\/\//i.test(src.url || '')) {
-          return '<a class="md-ref" href="' + esc(src.url) + '" target="_blank" rel="noopener noreferrer" title="' + esc((src.publisher ? src.publisher + ' · ' : '') + (src.title || '')) + '">' + id + '</a>';
+          links.push('<a class="md-ref" href="' + esc(src.url) + '" target="_blank" rel="noopener noreferrer" title="' + esc((src.publisher ? src.publisher + ' · ' : '') + (src.title || '')) + '">' + id + '</a>');
+          return '\u0000' + (links.length - 1) + '\u0000';
         }
         return '<span class="md-ref">' + id + '</span>';
       });
-      t = t.replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>');
-      t = t.replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
-      return t;
+      t = mdEmphasis(t);
+      return t.replace(/\u0000(\d+)\u0000/g, function (m, i) { return links[+i] || ''; });
     }).join('');
   }
 
@@ -688,7 +696,11 @@
       (rv.x - 60).toFixed(1) + ' ' + (rv.cy + rv.h * 0.18 + dy).toFixed(1) + ' ' + (rv.x + 4).toFixed(1) + ' ' + (rv.cy + rv.h * 0.18).toFixed(1));
     CHANNEL_IDS.forEach(function (c) {
       var card = dom.cards[c].card;
-      if (card.hidden) return;
+      if (card.hidden) {
+        // channel not in this run: drop the boot-time geometry so no wire points at an empty slot
+        ['orchestrator|', 'reviewer|', 'researcher|'].forEach(function (pre) { set(pre + c, 'M0 0'); });
+        return;
+      }
       var cb = box(card);
       var top = { x: cb.cx, y: cb.y + 2 };
       set('orchestrator|' + c, curve({ x: o.cx, y: o.b - 4 }, top));
@@ -905,8 +917,10 @@
 
   // ------------------------------------------------------------------ live mode
   function startLiveRun(body) {
+    // same-origin relative URL with an explicit JSON content type (the server rejects anything else on /api)
     return fetch('/api/runs', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body)
+      method: 'POST', mode: 'same-origin', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body)
     }).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (j) {
         if (!r.ok || !j.run_id) throw new Error(j.error || j.detail || ('서버 응답 ' + r.status));
@@ -959,6 +973,20 @@
     };
     es.onerror = function () {
       if (liveSource !== es) return;
+      if (es.readyState === 2) {
+        // EventSource.CLOSED: the browser gave up (e.g. 404 after a server restart) and will not reconnect
+        es.close();
+        liveSource = null;
+        player.mode = 'replay';
+        player.playing = false;
+        var lost = { seq: -1, t: player.t, type: 'run.failed', agent: 'system', data: { error: '서버에서 이 실행을 더 이상 찾을 수 없어요. 새 실행을 시작해 주세요.' } };
+        player.events.push(lost);
+        player.idx = player.events.length;
+        safeApply(lost);
+        effects(lost);
+        dirty = true;
+        return;
+      }
       if (!warned) {
         warned = true;
         state = applyEvent(state, { seq: -1, t: player.t, type: 'log', agent: 'system', data: { level: 'warn', message: '서버 연결이 잠시 끊겼어요. 다시 연결하는 중이에요.' } });
@@ -1089,7 +1117,9 @@
       parts.card.dataset.state = ch.state;
       parts.state.textContent = CH_STATE_LABEL[ch.state] || ch.state;
       parts.round.textContent = 'R' + (ch.round || 0);
-      parts.round.title = '라운드 ' + (ch.round || 0) + (ch.round ? ' (수정 ' + ch.round + '회)' : ' (첫 초안)');
+      parts.round.title = ch.final
+        ? '최종본은 R' + (ch.round || 0) + (ch.final.rounds ? ' (수정 ' + ch.final.rounds + '회 중 가장 좋은 라운드)' : ' (첫 초안)')
+        : '라운드 ' + (ch.round || 0) + (ch.round ? ' (수정 ' + ch.round + '회)' : ' (첫 초안)');
       if (typeof ch.score === 'number') {
         parts.num.textContent = String(ch.score);
         parts.fill.style.width = Math.max(0, Math.min(100, ch.score)) + '%';
@@ -1102,12 +1132,16 @@
       parts.pass.style.left = 'calc(' + passScore + '% - 1px)';
       parts.pass.setAttribute('data-label', String(passScore));
       parts.chips.textContent = '';
-      formatChips(id, ch).forEach(function (c) {
-        parts.chips.appendChild(el('span', { class: 'chip', 'data-ok': c.ok === null ? null : String(c.ok), title: c.title || null, text: c.text }));
-      });
-      parts.history.textContent = ch.reviews.length ? ch.reviews.map(function (r) { return 'R' + r.round + ' ' + r.score; }).join(' → ') : (ch.drafts.length ? '검수 전' : '');
+      if (ch.state === 'error') {
+        parts.chips.appendChild(el('span', { class: 'ch-error', title: ch.error || null, text: ch.error || '작업이 실패했어요' }));
+      } else {
+        formatChips(id, ch).forEach(function (c) {
+          parts.chips.appendChild(el('span', { class: 'chip', 'data-ok': c.ok === null ? null : String(c.ok), title: c.title || null, text: c.text }));
+        });
+      }
+      parts.history.textContent = ch.reviews.length ? ch.reviews.map(function (r) { return 'R' + r.round + ' ' + r.score; }).join(' → ') : (ch.drafts.length && ch.state !== 'error' ? '검수 전' : '');
       var name = (manifest.channels[id] && manifest.channels[id].name) || chName(id);
-      parts.card.setAttribute('aria-label', name + ', ' + (CH_STATE_LABEL[ch.state] || '') + (typeof ch.score === 'number' ? ', ' + ch.score + '점' : '') + ', 자세히 보기');
+      parts.card.setAttribute('aria-label', name + ', ' + (CH_STATE_LABEL[ch.state] || '') + (ch.state === 'error' && ch.error ? ': ' + ch.error : '') + (typeof ch.score === 'number' ? ', ' + ch.score + '점' : '') + ', 자세히 보기');
     });
   }
 
@@ -1135,7 +1169,22 @@
     var body = $('researchBody');
     var researcher = s.agents.researcher;
     var active = !!ACTIVE_STATUSES[researcher.status];
-    $('researchState').textContent = active ? (STATUS_LABEL[researcher.status] || '진행 중') : (r.completed ? '완료' + (r.followups ? ' · 추가 ' + r.followups + '회' : '') : (s.plan ? '준비' : '대기'));
+    $('researchState').textContent = active ? (STATUS_LABEL[researcher.status] || '진행 중') : researcher.status === 'error' ? '중단' : (r.completed ? '완료' + (r.followups ? ' · 추가 ' + r.followups + '회' : '') : (s.plan ? '준비' : '대기'));
+    // the board is rebuilt on every research event; remember which source link had keyboard focus
+    var ae = document.activeElement;
+    var focusKey = ae && ae !== body && body.contains(ae) && ae.getAttribute('data-src') || null;
+    try {
+      buildResearch(s, r, body, active, force);
+    } finally {
+      if (focusKey && document.activeElement !== ae) {
+        var links = body.querySelectorAll('a[data-src]');
+        for (var i = 0; i < links.length; i++) {
+          if (links[i].getAttribute('data-src') === focusKey) { links[i].focus({ preventScroll: true }); break; }
+        }
+      }
+    }
+  }
+  function buildResearch(s, r, body, active, force) {
     body.textContent = '';
     if (!s.plan && !r.sources.length && !r.queries.length) {
       body.appendChild(el('p', { class: 'empty', text: '리서치 에이전트가 찾은 출처와 근거가 여기에 쌓여요.' }));
@@ -1188,7 +1237,7 @@
           var safeUrl = /^https?:\/\//i.test(src.url || '') ? src.url : null;
           return el('li', { class: 'source' + (isNew ? ' is-new' : '') }, [
             el('span', { class: 'tier-badge', 'data-tier': String(src.tier || 3), title: TIER_LABEL[src.tier] || '', text: 'T' + (src.tier || '?') }),
-            safeUrl ? el('a', { href: safeUrl, target: '_blank', rel: 'noopener noreferrer', text: src.title || safeUrl }) : el('span', { text: src.title || '' }),
+            safeUrl ? el('a', { href: safeUrl, target: '_blank', rel: 'noopener noreferrer', 'data-src': src.id || src.url, text: src.title || safeUrl }) : el('span', { text: src.title || '' }),
             el('span', { class: 'source-meta' }, [
               el('span', { class: 'source-id', text: src.id || '' }), ' · ',
               (TIER_LABEL[src.tier] || '') + (src.publisher ? ' · ' + src.publisher : '') + (src.published ? ' · ' + src.published : '')
@@ -1431,6 +1480,9 @@
     var pane = $('pane-content');
     pane.textContent = '';
     var draft = last(ch.drafts);
+    if (ch.state === 'error') {
+      pane.appendChild(el('p', { class: 'pane-error' }, [el('b', { text: '이 채널 작업이 실패했어요' }), ' · ' + (ch.error || '원인을 알 수 없어요')]));
+    }
     if (ch.final) {
       var status = el('span', { class: 'copy-status', role: 'status' });
       var fallback = el('textarea', { class: 'copy-fallback field-like', rows: '8', readonly: true, 'aria-label': '복사할 텍스트', hidden: true });
@@ -1452,14 +1504,19 @@
         ]));
       }
     } else if (draft) {
-      pane.appendChild(el('p', { class: 'pane-note', text: '최신 초안 R' + (draft.round || 0) + ' 발췌예요. 최종본이 확정되면 전체 본문이 여기에 표시돼요.' }));
+      pane.appendChild(el('p', {
+        class: 'pane-note',
+        text: ch.state === 'error'
+          ? '마지막 초안 R' + (draft.round || 0) + ' 발췌예요. 최종본은 만들어지지 않았어요.'
+          : '최신 초안 R' + (draft.round || 0) + ' 발췌예요. 최종본이 확정되면 전체 본문이 여기에 표시돼요.'
+      }));
       pane.appendChild(el('h3', { class: 'out-title', text: draft.title || '' }));
       pane.appendChild(el('div', { class: 'md' }, el('blockquote', { text: draft.excerpt || '' })));
       pane.appendChild(el('p', { class: 'pane-note', text: '분량 ' + charsLabel(id, draft) }));
       if (draft.hashtags && draft.hashtags.length) {
         pane.appendChild(el('div', { class: 'hashtags' }, draft.hashtags.map(function (h) { return el('span', { text: h }); })));
       }
-    } else {
+    } else if (ch.state !== 'error') {
       pane.appendChild(el('p', { class: 'empty', text: '아직 초안이 없어요. 총괄 에이전트가 쓰기 시작하면 여기에서 볼 수 있어요.' }));
     }
   }
@@ -1490,18 +1547,23 @@
   function renderReviewPane(id, ch) {
     var pane = $('pane-review');
     pane.textContent = '';
+    if (ch.state === 'error') {
+      pane.appendChild(el('p', { class: 'pane-error' }, [el('b', { text: '검수를 마치지 못했어요' }), ' · ' + (ch.error || '원인을 알 수 없어요')]));
+    }
     if (!ch.reviews.length) {
-      pane.appendChild(el('p', { class: 'empty', text: ch.state === 'reviewing' ? '검수 에이전트가 채점하는 중이에요.' : '아직 검수 결과가 없어요.' }));
+      if (ch.state !== 'error') pane.appendChild(el('p', { class: 'empty', text: ch.state === 'reviewing' ? '검수 에이전트가 채점하는 중이에요.' : '아직 검수 결과가 없어요.' }));
       return;
     }
     var rounds = ch.reviews.map(function (r) { return r.round; });
-    var round = drawerReviewRound !== null && rounds.indexOf(drawerReviewRound) >= 0 ? drawerReviewRound : rounds[rounds.length - 1];
+    var finalRound = ch.final && rounds.indexOf(ch.final.round) >= 0 ? ch.final.round : null;
+    var round = drawerReviewRound !== null && rounds.indexOf(drawerReviewRound) >= 0 ? drawerReviewRound
+      : finalRound !== null ? finalRound : rounds[rounds.length - 1];
     var r = ch.reviews.filter(function (x) { return x.round === round; })[0];
     if (rounds.length > 1) {
       pane.appendChild(el('div', { class: 'seg', role: 'group', 'aria-label': '검수 라운드' }, rounds.map(function (rd) {
         var rv = ch.reviews.filter(function (x) { return x.round === rd; })[0];
         return el('button', {
-          type: 'button', 'aria-pressed': String(rd === round), text: 'R' + rd + ' · ' + rv.score + '점',
+          type: 'button', 'aria-pressed': String(rd === round), text: 'R' + rd + ' · ' + rv.score + '점' + (rd === finalRound ? ' · 최종' : ''),
           onclick: function () { drawerReviewRound = rd; renderReviewPane(id, state.channels[id]); }
         });
       })));
@@ -1595,7 +1657,8 @@
         el('div', { class: 'round-body' }, [
           el('div', null, [
             el('b', { text: k ? '수정본' : '첫 초안' }), d ? ' · ' + charsLabel(id, d) : '',
-            r ? ' · ' : '', r ? el('span', { class: 'pill', 'data-tone': r.passed ? 'pass' : 'fail', text: r.score + '점 ' + (r.passed ? '통과' : '미통과') }) : ''
+            r ? ' · ' : '', r ? el('span', { class: 'pill', 'data-tone': r.passed ? 'pass' : 'fail', text: r.score + '점 ' + (r.passed ? '통과' : '미통과') }) : '',
+            ch.final && ch.final.round === k ? [' ', el('span', { class: 'pill', 'data-tone': 'final', text: '최종본' })] : ''
           ]),
           d && d.change_log && d.change_log.length ? el('ul', null, d.change_log.map(function (c) { return el('li', { text: c }); })) : null,
           r && !r.passed && r.issues && r.issues[0] ? el('span', { class: 'pane-note', text: '주요 지적: ' + r.issues[0].problem }) : null

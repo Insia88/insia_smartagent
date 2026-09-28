@@ -45,11 +45,11 @@ insia run --topic "동네 베이커리 온라인 주문 서비스" \
   --keywords "베이커리 온라인 주문,동네 빵집"
 ```
 
-결과는 `outputs/<run_id>/`에 채널별 최종본(`<channel>.md`), 검수 결과(`<channel>.review.json`), 리서치 자료(`research.json`), 이벤트 로그(`events.jsonl`)로 저장됩니다.
+결과는 `outputs/<run_id>/`에 채널별 최종본(`<channel>.md`), 검수 결과(`<channel>.review.json`), 브리프·계획·리서치 자료(`brief.json`, `plan.json`, `research.json`), 전체 결과(`result.json`), 이벤트 로그(`events.jsonl`)로 저장됩니다. `--out`으로 폴더를 바꾸고, `--no-save`면 저장하지 않습니다.
 
-주요 옵션: `--mode auto|live|mock` (기본 auto: 자격 증명이 있으면 live), `--max-rounds 2` (최대 수정 횟수), `--pass-score 80` (통과 점수), `--record trace.json` (대시보드용 기록 저장), `--speed` (모의 모드 재생 속도).
+주요 옵션: `--mode auto|live|mock` (기본 auto: 자격 증명이 있으면 live), `--max-rounds 2` (최대 수정 횟수), `--pass-score 80` (통과 점수), `--record trace.json` (대시보드용 기록 저장), `--speed` (모의 모드 재생 배속: 기본 1 = 실제 시간, 클수록 빠름, 0 = 기다리지 않음), `--quiet` (채널 완료와 최종 결과만 출력). 전체 목록은 `insia run --help`.
 
-모델은 기본 `claude-opus-5`이고 `INSIA_MODEL` 환경 변수로 바꿀 수 있습니다. 안전 분류기가 요청을 거절하면 서버 측 폴백(`fallbacks: "default"`)이 다른 모델로 이어서 처리하며, 설정으로 끌 수 있습니다.
+모델은 기본 `claude-opus-5`이고 `--model` 또는 `INSIA_MODEL` 환경 변수로 바꿀 수 있습니다. 안전 분류기가 요청을 거절하면 서버 측 폴백(`fallbacks: "default"`)이 다른 모델로 이어서 처리하며, `--no-fallbacks` 또는 `INSIA_FALLBACKS=0`으로 끌 수 있습니다.
 
 ### 2) Claude Code에서 쓰기
 
@@ -139,5 +139,7 @@ pip install -e . pytest
 pytest                                 # 오프라인 테스트
 python scripts/build_artifact.py       # 대시보드를 단일 페이지(dist/artifact)로 빌드
 ```
+
+GitHub Actions(`.github/workflows/ci.yml`)가 push와 pull request마다 Python 3.11에서 테스트와 단일 페이지 빌드를 돌립니다.
 
 구조와 이벤트 형식은 [docs/architecture.md](docs/architecture.md), [docs/event-schema.md](docs/event-schema.md)를 보세요.

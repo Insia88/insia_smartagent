@@ -111,7 +111,7 @@ sequenceDiagram
 
 - 브리프 주제가 `examples/sample-run/brief.json`과 같으면 녹화된 실행을 재생합니다: `plan.json`, `research.json`, `drafts/<channel>.r<N>.json`, `reviews/<channel>.r<N>.json`, (있으면) `followups/<channel>.r<N>.json`(R N 검수가 요청한 추가 조사 결과, ResearchPack 형식)과 `meta.json`(`{"model": …}`). 요청한 라운드 파일이 없으면 가장 최근 라운드를 다시 씁니다. 녹화된 검수도 `finalize_review`를 거치므로 형식 점수는 늘 코드 기준입니다.
 - 다른 주제면 브리프로 `[데모]` 템플릿 콘텐츠를 만듭니다. 구체 통계는 만들지 않고 `○○` 자리표시만 씁니다. 첫 초안 일부는 일부러 기준을 못 맞춥니다(링크드인 첫 두 줄 길이·해시태그 수, 블로그 소제목·이미지 자리, 사업계획서 TAM·SAM·SOM과 사업비 표). 수정본은 채널 형식을 모두 통과해 실제와 비슷한 검수 루프가 보입니다.
-- 걸리는 시간은 가상 시계(`SimClock`)로 흘러갑니다. 실제로 기다리는 시간 = 가상 초 × `speed`이고, `speed 0`이면 기다리지 않아도 이벤트의 `t`는 현실적인 값을 가집니다.
+- 걸리는 시간은 가상 시계(`SimClock`)로 흘러갑니다. `speed`는 재생 배속입니다. 실제로 기다리는 시간 = 가상 초 ÷ `speed`(1이면 실제 시간, 2면 두 배 빠르게)이고, `speed 0`이면 기다리지 않아도 이벤트의 `t`는 현실적인 값을 가집니다.
 
 ### 러너
 
@@ -124,7 +124,7 @@ sequenceDiagram
 
 `web/`의 대시보드("INSIA 에이전트 스튜디오")는 빌드 없이 도는 정적 페이지입니다.
 
-- **데모 모드**: `/api/health`에 닿지 않으면(파일로 열었거나 Artifact로 게시한 경우) `demo/demo-run.json`(없으면 `demo/sample-trace.json`)을 불러와 `t`에 맞춰 재생합니다. `insia run --record web/demo/demo-run.json`이 이 파일을 만듭니다.
+- **데모 모드**: 페이지를 열면 `build_artifact.py`가 페이지에 넣은 기록(`<script id="insia-trace">`)을, 없으면 `demo/demo-run.json`을, 그것도 없으면 `demo/sample-trace.json`을 불러와 `t`에 맞춰 재생합니다. `insia run --record web/demo/demo-run.json`이 이 파일을 만듭니다. `/api/health`에 닿지 않으면(정적 서버로 띄웠거나 Artifact로 게시한 경우) 재생만 합니다. 브라우저는 `file://` 페이지의 `fetch()`를 막으므로 `web/index.html`을 파일로 바로 열면 기록을 불러오지 못합니다. `insia serve`, `web/`에서 띄운 `python3 -m http.server`, 또는 기록이 페이지 안에 들어 있는 `dist/artifact/index.html`(빌드 결과)로 여세요.
 - **라이브 모드**: `insia serve`로 띄우면 브리프 폼을 `/api/sample-brief`로 채우고, `POST /api/runs`로 실행을 시작한 뒤 `EventSource('/api/runs/<id>/events')`로 이벤트를 받습니다. 종료 이벤트를 받으면 연결을 닫습니다.
 - 두 모드 모두 같은 순수 리듀서 `applyEvent(state, event)`로 상태를 만들고 그립니다.
   - `agent.status` → 캐릭터의 상태 칩과 말풍선, 활성 캐릭터는 루프 영상 재생
@@ -140,13 +140,13 @@ sequenceDiagram
 |---|---|
 | `GET /api/health` | `{mode, model, version, default_mode, live_available}` |
 | `GET /api/sample-brief` | 샘플 브리프 |
-| `POST /api/runs` | 브리프 JSON(+ 선택 `options: {mode, speed, max_rounds, pass_score}`), 본문 64KB 이하 → `201 {run_id, events_url, status_url}` |
+| `POST /api/runs` | 브리프 JSON(+ 선택 `options: {mode, speed, max_rounds, pass_score}`, `speed`는 mock 재생 배속), `Content-Type: application/json`, 본문 64KB 이하 → `201 {run_id, mode, events_url, status_url}` |
 | `GET /api/runs` | 최근 실행 목록 |
 | `GET /api/runs/<id>` | 상태와 끝난 실행의 `RunResult` |
 | `GET /api/runs/<id>/events` | SSE: 지난 이벤트 재생 → 새 이벤트, 15초마다 heartbeat, 종료 이벤트 뒤 연결 종료 |
 | 그 밖의 `GET` | `web/` 정적 파일. `..`·인코딩된 `..`·역슬래시·숨김 파일·폴더 밖으로 나가는 심볼릭 링크를 막고, 영상용 Range 요청과 `.glb`(`model/gltf-binary`) MIME을 지원 |
 
-기본 주소는 `127.0.0.1:8765`입니다. 인증이 없으므로 외부에 열지 마세요.
+기본 주소는 `127.0.0.1:8765`입니다. API는 같은 서버에서 연 대시보드 페이지가 쓰도록 만든 것입니다. `Host`가 루프백이나 바인드 주소가 아닌 요청은 거절하고, `POST`는 같은 출처에서 온 JSON 요청만 받습니다. 인증이 없으므로 외부에 열지 마세요.
 
 ## 설정
 

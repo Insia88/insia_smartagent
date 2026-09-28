@@ -50,7 +50,7 @@ color: cyan
 
 - id는 `f1`, `s1`부터 순서대로. sources는 URL 기준 중복 없이, 실제 인용한 것만.
 - `confidence`: `high`(Tier 1 원문 직접 확인 또는 Tier 2 두 곳 일치), `medium`(Tier 2 한 곳, 또는 정의·연도가 조금 다름), `low`(Tier 3뿐이거나 원문 미확인).
-- `accessed`는 오늘 날짜.
+- `accessed`는 원문을 확인한 날짜 = 기준일. 기준일은 입력에 `today`가 있으면 그 날짜, 없으면 세션의 오늘 날짜다(공유 프롬프트와 같은 규칙).
 - 저장한 JSON이 문법적으로 올바른지 Read로 다시 열어 확인한다.
 
 ## 추가 조사

@@ -14,8 +14,12 @@ Assets are added in priority order while the folder stays under the size
 budget (default 15.5 MB, hard limit 16 MB). Anything dropped or missing is set
 to null in the artifact's manifest so the page falls back gracefully.
 
+The output folder is deleted and rebuilt on every run. Outside dist/ the script
+only deletes an empty folder or one that holds nothing but an earlier build
+(index.html with the embedded trace, demo/, assets/); anything else needs --force.
+
 Usage:
-  python3 scripts/build_artifact.py [--out dist/artifact] [--all-assets] [--budget-mb 15.5]
+  python3 scripts/build_artifact.py [--out dist/artifact] [--all-assets] [--budget-mb 15.5] [--force]
 """
 
 from __future__ import annotations
@@ -82,8 +86,9 @@ def section(html: str, name: str) -> str:
 
 def json_for_script(obj) -> str:
     text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-    # never let embedded data close the <script> element
-    return text.replace("</", "<\\/").replace("<!--", "<\\!--")
+    # never let embedded data close the <script> element or open an HTML comment.
+    # \u003c / \u003e / \u0026 are valid JSON escapes, so JSON.parse still returns the original text.
+    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
 def load_trace() -> tuple[Path, dict]:
@@ -102,6 +107,17 @@ def load_trace() -> tuple[Path, dict]:
     raise SystemExit("web/demo/demo-run.json 또는 sample-trace.json이 필요해요.")
 
 
+BUILD_ENTRIES = {"index.html", "demo", "assets"}
+
+
+def previous_build(out: Path) -> bool:
+    """True when ``out`` holds only what an earlier run of this script wrote."""
+    index = out / "index.html"
+    if not index.is_file() or not {p.name for p in out.iterdir()} <= BUILD_ENTRIES:
+        return False
+    return 'id="insia-trace"' in index.read_text(encoding="utf-8", errors="replace")
+
+
 def human(n: int) -> str:
     return f"{n / 1_000_000:.2f} MB" if n >= 100_000 else f"{n / 1000:.1f} KB"
 
@@ -111,12 +127,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default=str(ROOT / "dist" / "artifact"), help="출력 폴더 (기본: dist/artifact)")
     ap.add_argument("--budget-mb", type=float, default=15.5, help="폴더 전체 용량 예산 MB (기본 15.5)")
     ap.add_argument("--all-assets", action="store_true", help="대시보드가 쓰지 않는 컷아웃·히어로 에셋도 포함")
+    ap.add_argument("--force", action="store_true", help="dist/ 밖의 출력 폴더에 이전 빌드가 아닌 파일이 있어도 지우고 다시 만들기")
     args = ap.parse_args(argv)
 
     out = Path(args.out).resolve()
     # the folder is wiped before each build: only allow dist/** or a folder named artifact*
-    if (ROOT / "dist") not in out.parents and not out.name.startswith("artifact"):
+    in_dist = (ROOT / "dist") in out.parents
+    if not in_dist and not out.name.startswith("artifact"):
         raise SystemExit(f"출력 폴더는 dist/ 아래이거나 이름이 artifact로 시작해야 해요: {out}")
+    if out == ROOT or out in ROOT.parents:
+        raise SystemExit(f"프로젝트 폴더나 그 상위 폴더는 출력 폴더로 쓸 수 없어요: {out}")
+    if out.exists():
+        if not out.is_dir():
+            raise SystemExit(f"출력 경로가 폴더가 아니에요: {out}")
+        # outside dist/, a folder like ~/artifacts may hold unrelated files: wipe only an earlier build
+        if not in_dist and not args.force and any(out.iterdir()) and not previous_build(out):
+            raise SystemExit(
+                f"{out}에 이 스크립트가 만들지 않은 파일이 있어 지우지 않았어요. "
+                "빈 폴더나 새 폴더를 고르거나, 폴더 내용을 지워도 된다면 --force를 붙여 주세요."
+            )
     budget = int(min(args.budget_mb * 1_000_000, HARD_LIMIT))
 
     html = (WEB / "index.html").read_text(encoding="utf-8")
