@@ -211,7 +211,7 @@
       "id": "caption_length",
       "label": "캡션 길이",
       "passed": true,
-      "value": "915자",
+      "value": "923자",
       "expected": "1~2,200자"
     },
     {

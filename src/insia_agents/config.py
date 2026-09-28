@@ -44,6 +44,9 @@ def _find_dir(env_value: str | None, relative: str) -> Path | None:
     return None
 
 
+MIN_SPEED = 0.1  # mock playback: at most 10x slower than real time (0 = no waiting)
+
+
 def today_kst() -> str:
     return datetime.now(KST).date().isoformat()
 
@@ -118,8 +121,8 @@ class Settings:
             raise ValueError("max_rounds는 0~5 사이여야 해요")
         if not 0 <= self.pass_score <= 100:
             raise ValueError("pass_score는 0~100 사이여야 해요")
-        if not 0 <= self.speed <= 100:
-            raise ValueError("speed는 0~100 사이여야 해요 (1 = 실제 시간, 2 = 2배 빠르게, 0 = 기다리지 않음)")
+        if not (self.speed == 0 or MIN_SPEED <= self.speed <= 100):
+            raise ValueError(f"speed는 0 또는 {MIN_SPEED}~100 사이여야 해요 (1 = 실제 시간, 2 = 2배 빠르게, 0 = 기다리지 않음)")
         if not (self.max_cost_usd >= 0 and self.max_cost_usd == self.max_cost_usd and self.max_cost_usd != float("inf")):
             raise ValueError("max_cost_usd는 0 이상인 유한한 숫자여야 해요 (0 = 상한 없음)")
         if not 0 <= self.max_document_chars <= 1_000_000:
@@ -155,12 +158,29 @@ def load_sample_brief(settings: "Settings | None" = None):
 
 
 def has_credentials(env: Mapping[str, str] | None = None, home: Path | None = None) -> bool:
-    """True when the zero-arg ``anthropic.Anthropic()`` client can find credentials."""
+    """True when the zero-arg ``anthropic.Anthropic()`` client can find credentials.
+
+    Mirrors the SDK's resolution order (API key → auth token → named profile /
+    config dir → workload identity federation → the active or default profile
+    on disk). An empty ``~/.config/anthropic`` folder does not count.
+    """
     env = os.environ if env is None else env
-    if env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN"):
+    get = lambda key: (env.get(key) or "").strip()  # noqa: E731
+    if get("ANTHROPIC_API_KEY") or get("ANTHROPIC_AUTH_TOKEN"):
+        return True
+    if get("ANTHROPIC_PROFILE") or get("ANTHROPIC_CONFIG_DIR"):
+        return True
+    if get("ANTHROPIC_FEDERATION_RULE_ID") and get("ANTHROPIC_ORGANIZATION_ID") and (
+            get("ANTHROPIC_IDENTITY_TOKEN") or get("ANTHROPIC_IDENTITY_TOKEN_FILE")):
         return True
     home = home if home is not None else Path.home()
-    return (home / ".config" / "anthropic").is_dir()
+    config_dir = home / ".config" / "anthropic"
+    try:
+        active = (config_dir / "active_config").read_text(encoding="utf-8").strip()
+    except OSError:
+        active = ""
+    profile = active or "default"
+    return bool(active) or (config_dir / "configs" / f"{profile}.json").is_file()
 
 
 def resolve_mode(mode: Mode, env: Mapping[str, str] | None = None, home: Path | None = None) -> tuple[Literal["live", "mock"], str]:

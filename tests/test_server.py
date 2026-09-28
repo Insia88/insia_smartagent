@@ -192,7 +192,7 @@ def test_symlinked_index_html_cannot_escape_root(web_dir):
 @pytest.mark.parametrize("path", ["/api/health", "/api/runs", "/api/sample-brief", "/api/runs/x/events"])
 def test_api_rejects_foreign_host_header(server, path):
     port = server.server_address[1]
-    for host in ("attacker.example", f"attacker.example:{port}", f"127.0.0.1:{port + 1}", "127.0.0.1",
+    for host in ("attacker.example", f"attacker.example:{port}",
                  f"localhost.attacker.example:{port}", f"evil@127.0.0.1:{port}"):
         resp, body = request(server, "GET", path, headers={"Host": host})
         assert resp.status == 403, (path, host)
@@ -201,7 +201,9 @@ def test_api_rejects_foreign_host_header(server, path):
 
 def test_api_accepts_loopback_host_names(server):
     port = server.server_address[1]
-    for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"LOCALHOST:{port}", f"[::1]:{port}"):
+    # a forwarded port (ssh -L 9999:127.0.0.1:<port>, docker -p) arrives with a different port
+    for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"LOCALHOST:{port}", f"[::1]:{port}",
+                 f"127.0.0.1:{port + 1}", "127.0.0.1", "localhost:9999"):
         resp, _ = request(server, "GET", "/api/health", headers={"Host": host})
         assert resp.status == 200, host
     # the dashboard's static files are not API routes
@@ -236,7 +238,8 @@ def test_post_rejects_foreign_host_origin_and_non_json_body(server):
 def test_post_from_the_dashboard_origin_is_accepted(server):
     port = server.server_address[1]
     payload = {"topic": "대시보드", "channels": ["instagram"], "options": {"speed": 0}}
-    for origin, host in ((f"http://127.0.0.1:{port}", f"127.0.0.1:{port}"), (f"http://localhost:{port}", f"localhost:{port}")):
+    for origin, host in ((f"http://127.0.0.1:{port}", f"127.0.0.1:{port}"), (f"http://localhost:{port}", f"localhost:{port}"),
+                         ("http://localhost:9999", "localhost:9999")):  # dashboard opened through a port forward
         resp, body = request(server, "POST", "/api/runs", payload,
                              headers={"Origin": origin, "Host": host, "Content-Type": "application/json; charset=utf-8"})
         assert resp.status == 201, (origin, body)
@@ -251,7 +254,7 @@ def test_wildcard_bind_allows_ip_literals_but_not_names(settings):
         assert srv.allows_host("192.168.0.10", port) and srv.allows_host("127.0.0.1", port)
         assert srv.allows_host("localhost", port)
         assert not srv.allows_host("attacker.example", port)
-        assert not srv.allows_host("192.168.0.10", port + 1)
+        assert srv.allows_host("192.168.0.10", port + 1)  # forwarded ports are fine; the name decides
     finally:
         srv.server_close()
 
@@ -274,10 +277,18 @@ def test_non_finite_and_deeply_nested_json_get_400(server, raw):
     assert json.loads(body)["error"]
 
 
+def test_post_origin_must_match_the_requested_host(server):
+    port = server.server_address[1]
+    payload = {"topic": "x", "channels": ["linkedin"], "options": {"speed": 0}}
+    resp, _ = request(server, "POST", "/api/runs", payload,
+                      headers={"Origin": "http://localhost:9999", "Host": f"localhost:{port}"})
+    assert resp.status == 403
+
+
 def test_parse_options_numbers():
     assert parse_options({"speed": 2, "max_rounds": 3.0, "pass_score": 90}) == {"speed": 2.0, "max_rounds": 3, "pass_score": 90}
     for raw in ({"speed": float("inf")}, {"pass_score": float("nan")}, {"max_rounds": 10 ** 400},
-                {"speed": 10 ** 400}, {"max_rounds": 1.5}, {"max_rounds": True}):
+                {"speed": 10 ** 400}, {"speed": 1e-6}, {"max_rounds": 1.5}, {"max_rounds": True}):
         with pytest.raises(RequestError) as info:
             parse_options(raw)
         assert info.value.status == 400, raw

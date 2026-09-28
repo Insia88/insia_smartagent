@@ -94,7 +94,7 @@ sequenceDiagram
 
 ## 모드
 
-`--mode auto`(기본)는 `ANTHROPIC_API_KEY`나 `ANTHROPIC_AUTH_TOKEN`이 있거나 `~/.config/anthropic` 프로필이 있으면 live, 아니면 mock으로 정하고 로그에 이유를 남깁니다.
+`--mode auto`(기본)는 Anthropic SDK와 같은 순서로 자격 증명을 찾습니다. `ANTHROPIC_API_KEY`·`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`·`ANTHROPIC_CONFIG_DIR`, 워크로드 아이덴티티 연동 변수, `~/.config/anthropic`의 활성·기본 프로필(`ant auth login`으로 만든 것) 중 하나가 있으면 live, 없으면 mock으로 정하고 로그에 이유를 남깁니다. 빈 `~/.config/anthropic` 폴더는 자격 증명으로 치지 않습니다.
 
 ### live — `AnthropicBackend`
 
@@ -146,7 +146,7 @@ sequenceDiagram
 | `GET /api/runs/<id>/events` | SSE: 지난 이벤트 재생 → 새 이벤트, 15초마다 heartbeat, 종료 이벤트 뒤 연결 종료 |
 | 그 밖의 `GET` | `web/` 정적 파일. `..`·인코딩된 `..`·역슬래시·숨김 파일·폴더 밖으로 나가는 심볼릭 링크를 막고, 영상용 Range 요청과 `.glb`(`model/gltf-binary`) MIME을 지원 |
 
-기본 주소는 `127.0.0.1:8765`입니다. API는 같은 서버에서 연 대시보드 페이지가 쓰도록 만든 것입니다. `Host`가 루프백이나 바인드 주소가 아닌 요청은 거절하고, `POST`는 같은 출처에서 온 JSON 요청만 받습니다. 인증이 없으므로 외부에 열지 마세요.
+기본 주소는 `127.0.0.1:8765`입니다. API는 같은 서버에서 연 대시보드 페이지가 쓰도록 만든 것입니다. `Host` 이름이 루프백(`127.0.0.1`, `localhost`, `[::1]`)이나 바인드 주소가 아닌 요청은 거절합니다(포트는 보지 않으므로 `ssh -L`·`docker -p` 포트 포워딩으로 열어도 됩니다). `POST`는 `Origin`이 요청한 주소와 같은(같은 출처) JSON 요청만 받습니다. 인증이 없으므로 외부에 열지 마세요.
 
 ## 설정
 

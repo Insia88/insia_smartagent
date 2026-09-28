@@ -300,7 +300,7 @@
       "id": "length",
       "label": "분량(공백 제외)",
       "passed": true,
-      "value": "2,732자",
+      "value": "2,781자",
       "expected": "1,500~3,000자"
     },
     {

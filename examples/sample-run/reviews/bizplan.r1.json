@@ -509,7 +509,7 @@
       "id": "length",
       "label": "분량(공백 제외)",
       "passed": true,
-      "value": "13,279자",
+      "value": "13,904자",
       "expected": "3,000~15,000자"
     },
     {

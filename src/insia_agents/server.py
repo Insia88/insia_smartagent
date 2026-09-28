@@ -39,7 +39,7 @@ from pydantic import ValidationError
 
 from . import __version__
 from .backends.base import BackendError
-from .config import Settings, has_credentials, load_sample_brief, resolve_mode
+from .config import MIN_SPEED, Settings, has_credentials, load_sample_brief, resolve_mode
 from .models import Brief, RunResult
 from .pipeline import new_run_id, prepare_run, run_pipeline
 
@@ -150,6 +150,8 @@ def parse_options(raw: Any) -> dict[str, Any]:
         # Range first: int/float comparison is exact, so a huge int never reaches float().
         if not lo <= value <= hi:
             raise RequestError(400, f"options.{key}는 {lo}~{hi} 사이여야 해요")
+        if key == "speed" and 0 < value < MIN_SPEED:
+            raise RequestError(400, f"options.speed는 0(기다리지 않음) 또는 {MIN_SPEED}~100 사이여야 해요")
         if kind is int and isinstance(value, float) and not value.is_integer():
             raise RequestError(400, f"options.{key}는 정수여야 해요")
         out[key] = kind(value)
@@ -253,14 +255,17 @@ class InsiaServer(ThreadingHTTPServer):
         host, port = self.server_address[:2]
         return f"http://{host}:{port}/"
 
-    def allows_host(self, name: str, port: int) -> bool:
-        """True for loopback names or the bind address, on this server's port.
+    def allows_host(self, name: str, port: int | None = None) -> bool:
+        """True for loopback names or the bind address.
 
-        When listening on every interface (``0.0.0.0``), any IP literal is also
-        accepted so LAN access keeps working; DNS rebinding needs a domain name.
+        The port is not compared: a browser always sends the port it actually
+        connected to, which differs from ours behind ``ssh -L`` / ``docker -p``
+        port forwards, and DNS rebinding is already stopped by the name check
+        (a rebinding page carries the attacker's hostname). When listening on
+        every interface (``0.0.0.0``), any IP literal is also accepted so LAN
+        access keeps working.
         """
-        if port != self.server_address[1]:
-            return False
+        del port  # kept for callers; see docstring
         if name in LOOPBACK_HOSTS or name in (self.bind_host, str(self.server_address[0]).lower()):
             return True
         if self.bind_host in WILDCARD_HOSTS:
@@ -306,16 +311,17 @@ class InsiaHandler(BaseHTTPRequestHandler):
         parsed = split_host(self.headers.get("Host") or "")
         if parsed is None or not self.server.allows_host(*parsed):
             self.close_connection = True
-            port = self.server.server_address[1]
-            raise RequestError(403, f"허용되지 않은 주소(Host)로 들어온 요청이에요. "
-                                    f"http://127.0.0.1:{port}/ 또는 http://localhost:{port}/ 로 접속해 주세요.")
+            raise RequestError(403, "허용되지 않은 주소(Host)로 들어온 요청이에요. "
+                                    "http://127.0.0.1:<포트>/ 또는 http://localhost:<포트>/ 로 접속해 주세요.")
 
     def _check_post_headers(self) -> None:
         """Same-origin ``Origin`` (when sent) and a JSON body type, so other sites cannot POST."""
         origin = self.headers.get("Origin")
         if origin is not None:
+            # same-origin: Origin must name exactly the host:port this request was sent to
             parsed = split_host(origin[len("http://"):]) if origin.lower().startswith("http://") else None
-            if parsed is None or not self.server.allows_host(*parsed):
+            requested = split_host(self.headers.get("Host") or "")
+            if parsed is None or parsed != requested or not self.server.allows_host(parsed[0]):
                 self.close_connection = True
                 raise RequestError(403, "다른 사이트에서 보낸 요청은 받을 수 없어요. 대시보드에서 실행해 주세요.")
         media_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()

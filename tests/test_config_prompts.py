@@ -13,10 +13,27 @@ def test_resolve_mode(tmp_path):
     assert resolve_mode("auto", env={"ANTHROPIC_API_KEY": "x"}, home=home)[0] == "live"
     assert resolve_mode("auto", env={"ANTHROPIC_AUTH_TOKEN": "x"}, home=home)[0] == "live"
     (home / ".config" / "anthropic").mkdir(parents=True)
+    assert not has_credentials(env={}, home=home)  # an empty config folder is not a credential
+    (home / ".config" / "anthropic" / "configs").mkdir()
+    (home / ".config" / "anthropic" / "configs" / "default.json").write_text("{}", encoding="utf-8")
     assert has_credentials(env={}, home=home)
     assert resolve_mode("auto", env={}, home=home)[0] == "live"
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert has_credentials(env={"ANTHROPIC_CONFIG_DIR": str(tmp_path / "cfg")}, home=empty)
+    assert has_credentials(env={"ANTHROPIC_PROFILE": "work"}, home=empty)
+    assert has_credentials(env={"ANTHROPIC_FEDERATION_RULE_ID": "r", "ANTHROPIC_ORGANIZATION_ID": "o",
+                                "ANTHROPIC_IDENTITY_TOKEN_FILE": "/t"}, home=empty)
+    assert not has_credentials(env={"ANTHROPIC_FEDERATION_RULE_ID": "r"}, home=empty)
     assert resolve_mode("mock", env={"ANTHROPIC_API_KEY": "x"}, home=home)[0] == "mock"
     assert resolve_mode("live", env={}, home=home)[0] == "live"
+
+
+def test_speed_floor():
+    assert Settings.from_env(env={}, speed=0).speed == 0
+    assert Settings.from_env(env={}, speed=0.1).speed == 0.1
+    with pytest.raises(ValueError):
+        Settings.from_env(env={}, speed=1e-6)
 
 
 def test_settings_from_env():
