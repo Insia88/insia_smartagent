@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import defaultdict
 from typing import Any
@@ -47,12 +48,16 @@ def run(ctx: AgentContext, store: ResearchStore, questions: list[ResearchQuestio
         else:  # live: show searches as they happen
             ctx.bus.emit(event_type, AGENT, data)
 
-    # No yields while holding the lock (the mock runner is single-threaded).
-    with store.lock:
-        raw = ctx.backend.research(ctx.brief, questions, emit, existing=store.pack if followup else None)
+    # The backend call runs without the lock: a live follow-up search can take minutes and the
+    # other channels need store.snapshot() meanwhile. merge_research renumbers against whatever
+    # the pack holds by the time the call returns, so ids stay continuous.
+    existing = store.snapshot() if followup else None
+    raw = ctx.backend.research(ctx.brief, questions, emit, existing=existing)
+    with store.lock:  # no yields while holding the lock (the mock runner is single-threaded)
         merged, added = merge_research(store.pack, raw)
         store.pack = merged
-        store.questions.extend(questions)
+        if not followup:  # follow-up questions were recorded by followup() when their ids were allocated
+            store.questions.extend(questions)
 
     queries: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for event_type, data in buffered:
@@ -111,10 +116,20 @@ def run(ctx: AgentContext, store: ResearchStore, questions: list[ResearchQuestio
     return added
 
 
+def _next_question_number(existing: list[ResearchQuestion]) -> int:
+    """Number after the highest ``qN`` id (or the count, if larger), so plan ids like q1, q3, q4 give q5."""
+    numbers = [int(m.group(1)) for q in existing if (m := re.fullmatch(r"q(\d+)", q.id.strip().lower()))]
+    return max(max(numbers, default=0), len(existing)) + 1
+
+
 def followup(ctx: AgentContext, store: ResearchStore, needs: list[str], channel: ChannelId) -> Step[ResearchPack]:
+    # Allocate and record the ids in one locked step: two channels asking for follow-ups at the
+    # same time must never get the same question id.
     with store.lock:
-        existing = list(store.questions)
-    questions = followup_questions(needs, channel, existing)
+        start = _next_question_number(store.questions)
+        questions = [q.model_copy(update={"id": f"q{start + i}"})
+                     for i, q in enumerate(followup_questions(needs, channel))]
+        store.questions.extend(questions)
     if not questions:
         return ResearchPack(findings=[], sources=[], gaps=[])
     ctx.handoff("orchestrator", AGENT, "task", f"{channel_label(channel)} 추가 조사 {len(questions)}건 요청", channel)

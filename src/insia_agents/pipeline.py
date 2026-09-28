@@ -6,15 +6,16 @@ runner:
 - ``SimRunner`` (mock): a tiny discrete-event scheduler over a ``SimClock``.
   Channels interleave in virtual time, deterministically (ties break by
   channel order), and ``t`` stays monotonic.
-- ``ThreadRunner`` (live): channels run concurrently in a ThreadPoolExecutor;
-  real time passes during API calls.
+- ``ThreadRunner`` (live): channels run concurrently in daemon worker threads;
+  real time passes during API calls. Ctrl+C (or ``cancel()``) stops the
+  channels at their next step.
 """
 
 from __future__ import annotations
 
 import heapq
 import secrets
-from concurrent.futures import ThreadPoolExecutor
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Generator, Hashable, TypeVar
@@ -34,6 +35,13 @@ K = TypeVar("K", bound=Hashable)
 
 class PipelineError(RuntimeError):
     pass
+
+
+class RunCancelled(PipelineError):
+    """The run was stopped (Ctrl+C or ``ThreadRunner.cancel()``)."""
+
+    def __init__(self, message: str = "실행을 중단했어요") -> None:
+        super().__init__(message)
 
 
 def new_run_id(now: datetime | None = None) -> str:
@@ -91,26 +99,68 @@ class SimRunner:
 
 
 class ThreadRunner:
-    """Runs steps in real time; parallel steps in worker threads (live mode)."""
+    """Runs steps in real time; parallel steps in worker threads (live mode).
+
+    Agent steps yield after every backend call, and each yield checks a cancel
+    flag. On Ctrl+C the flag is set and ``run_parallel`` re-raises at once
+    instead of waiting for every channel to finish its draft/review/revise
+    loop: a worker stops once its in-flight API call returns (or at its next
+    event, since ``run.failed`` closes the bus). Workers are daemon threads,
+    so they never hold the process open at exit (``insia serve`` included).
+    """
 
     def __init__(self, max_workers: int = 4) -> None:
         self.max_workers = max(1, max_workers)
+        self._cancel = threading.Event()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def _checkpoint(self, _delay: float) -> None:
+        if self._cancel.is_set():
+            raise RunCancelled()
 
     def run(self, gen: Generator[float, None, T]) -> T:
-        return _drive(gen, lambda _delay: None)
+        return _drive(gen, self._checkpoint)
 
     def run_parallel(self, gens: dict[K, Generator[float, None, Any]]) -> dict[K, Any]:
-        results: dict[K, Any] = {}
         if not gens:
-            return results
-        with ThreadPoolExecutor(max_workers=min(self.max_workers, len(gens)), thread_name_prefix="insia-channel") as pool:
-            futures = {key: pool.submit(self.run, gen) for key, gen in gens.items()}
-            for key, future in futures.items():
+            return {}
+        pending = list(gens)
+        results: dict[K, Any] = {}
+        lock = threading.Lock()
+
+        def worker() -> None:
+            while not self._cancel.is_set():
+                with lock:
+                    if not pending:
+                        return
+                    key = pending.pop(0)
                 try:
-                    results[key] = future.result()
-                except Exception as exc:
-                    results[key] = exc
-        return results
+                    value: Any = self.run(gens[key])
+                except BaseException as exc:  # the channel failed; others continue
+                    value = exc
+                with lock:
+                    results[key] = value
+
+        threads = [threading.Thread(target=worker, name=f"insia-channel_{i}", daemon=True)
+                   for i in range(min(self.max_workers, len(gens)))]
+        for thread in threads:
+            thread.start()
+        try:
+            for thread in threads:
+                while thread.is_alive():  # a timed join keeps Ctrl+C responsive on every platform
+                    thread.join(0.2)
+        except BaseException:  # Ctrl+C: stop the channels at their next step, do not wait for them
+            self.cancel()
+            raise
+        if self._cancel.is_set():
+            raise RunCancelled()
+        return {key: results[key] for key in gens if key in results}
 
 
 # ---------------------------------------------------------------------------
@@ -141,9 +191,14 @@ def channel_flow(ctx: AgentContext, plan: Plan, store: researcher.ResearchStore,
             yield from reviewer.conclude(ctx, result)
             break
         yield from reviewer.request_revision(ctx, result)
-        try:
-            if result.needs_research:
+        if result.needs_research:
+            try:
                 yield from researcher.followup(ctx, store, result.needs_research, channel)
+            except BackendError as exc:  # revise with the research we already have
+                ctx.log(f"{channel_label(channel)} 추가 조사 실패: {exc} — 지금 있는 근거로 수정을 이어가요", "warn", "researcher")
+                ctx.status("researcher", "error", f"{channel_label(channel)} 추가 조사를 마치지 못했어요")
+                ctx.status("researcher", "idle", "추가 조사 요청이 오면 다시 찾아볼게요")
+        try:
             current = yield from orchestrator.revise(ctx, plan, store.snapshot(), current, result)
         except BackendError as exc:
             ctx.log(f"{channel_label(channel)} 수정 중 오류: {exc} — 지금까지 가장 좋은 버전을 최종본으로 써요", "warn", "orchestrator")

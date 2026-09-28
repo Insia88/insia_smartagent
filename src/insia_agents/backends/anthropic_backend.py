@@ -22,7 +22,8 @@ The researcher runs two calls: a tool call with ``web_search_20260209`` +
 that ends in a research memo, then a tool-less structured call that converts
 the memo and the collected search results into a ``ResearchPack``. The split
 exists because structured outputs cannot be combined with citations, which
-web-search answers carry.
+web-search answers carry. Sources in that pack whose URL no search, fetch or
+memo produced are dropped (the second call has no tools to verify them).
 """
 
 from __future__ import annotations
@@ -326,6 +327,70 @@ def collect_research_notes(messages: Iterable[Any]) -> dict[str, Any]:
     }
 
 
+_URL_RE = re.compile(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
+
+
+def url_key(url: str) -> str:
+    """Lenient URL identity for grounding checks: ignores scheme, ``www.``,
+    fragment, trailing slash and case."""
+    key = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", url.strip().lower())
+    key = key.removeprefix("www.").split("#", 1)[0]
+    return key.rstrip("/")
+
+
+def _literal_url_keys(text: str) -> set[str]:
+    keys: set[str] = set()
+    for match in _URL_RE.findall(text or ""):
+        keys.add(url_key(match))
+        keys.add(url_key(match.rstrip(".,;:!?)]}'")))  # prose / markdown-link punctuation
+    return keys
+
+
+def grounded_url_keys(messages: Iterable[Any]) -> set[str]:
+    """Every URL the tool call actually saw: all search results (not only the
+    first 80 sent to the structuring call), fetched pages, citations, URLs in
+    the memo text and in dynamic-filtering code output."""
+    keys: set[str] = set()
+    for message in messages:
+        for block in _get(message, "content", None) or []:
+            kind = _type(block)
+            if kind == "text":
+                keys |= _literal_url_keys(_get(block, "text", "") or "")
+                for citation in _get(block, "citations", None) or []:
+                    if _get(citation, "url"):
+                        keys.add(url_key(_get(citation, "url")))
+            elif kind == "web_search_tool_result":
+                content = _get(block, "content")
+                for item in content if isinstance(content, list) else []:
+                    if _get(item, "url"):
+                        keys.add(url_key(_get(item, "url")))
+            elif kind == "web_fetch_tool_result":
+                content = _get(block, "content")
+                if _type(content) == "web_fetch_result" and _get(content, "url"):
+                    keys.add(url_key(_get(content, "url")))
+            elif kind.endswith("_tool_result"):  # e.g. code_execution run by dynamic filtering
+                content = _get(block, "content")
+                stdout = _get(content, "stdout", "") if content is not None else ""
+                if isinstance(stdout, str):
+                    keys |= _literal_url_keys(stdout)
+    keys.discard("")
+    return keys
+
+
+def drop_ungrounded_sources(pack: ResearchPack, allowed: set[str]) -> tuple[ResearchPack, list[str]]:
+    """Remove sources whose URL no search/fetch produced (the structuring call
+    has no tools, so such a URL is invented). Findings lose those source ids;
+    ``merge_research`` then moves findings left without a source to ``gaps``."""
+    kept = [s for s in pack.sources if url_key(s.url) in allowed]
+    if len(kept) == len(pack.sources):
+        return pack, []
+    dropped = [s for s in pack.sources if url_key(s.url) not in allowed]
+    dropped_ids = {s.id for s in dropped}
+    findings = [f.model_copy(update={"source_ids": [sid for sid in f.source_ids if sid not in dropped_ids]})
+                for f in pack.findings]
+    return pack.model_copy(update={"sources": kept, "findings": findings}), [s.url for s in dropped]
+
+
 # ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
@@ -414,10 +479,17 @@ class AnthropicBackend:
                     message = stream.get_final_message()
             except anthropic.AnthropicError as exc:
                 raise map_api_error(exc, self.model) from exc
+            except httpx2.RequestError as exc:
+                # The SDK wraps transport errors only before the response starts;
+                # a drop or timeout while the SSE body is being read escapes raw.
+                if isinstance(exc, httpx2.TimeoutException):
+                    raise APIConnectionFailed("응답을 받는 도중 시간이 초과됐어요. 네트워크를 확인하고 다시 실행해 주세요.",
+                                              kind="timeout", retryable=True) from exc
+                raise APIConnectionFailed("응답을 받는 도중 Anthropic API 연결이 끊겼어요. 네트워크·프록시를 확인하고 다시 실행해 주세요.",
+                                          kind="connection", retryable=True) from exc
             except TypeError as exc:
                 if "authentication" in str(exc).lower():  # the SDK raises this when no credentials resolve
-                    raise AuthError("API 자격 증명을 찾을 수 없어요. ANTHROPIC_API_KEY를 설정하거나 `ant auth login`을 실행해 주세요.",
-                                    kind="credentials") from exc
+                    raise AuthError(CREDENTIALS_HINT, kind="credentials") from exc
                 raise
             turns.append(message)
             stop = _get(message, "stop_reason")
@@ -488,6 +560,13 @@ class AnthropicBackend:
         )
         pack = self.structured_call(structure_request, ResearchPack, agent="researcher")
         assert isinstance(pack, ResearchPack)
+        allowed = grounded_url_keys(turns)
+        if existing is not None:
+            allowed |= {url_key(s.url) for s in existing.sources}
+        pack, dropped = drop_ungrounded_sources(pack, allowed)
+        if dropped:
+            shown = ", ".join(dropped[:3]) + (f" 외 {len(dropped) - 3}개" if len(dropped) > 3 else "")
+            self._notice("researcher", "warn", f"검색·열람 결과에서 확인되지 않은 출처 {len(dropped)}개를 리서치 팩에서 뺐어요: {shown}")
         return pack
 
     def _draft_tokens(self, channel: ChannelId) -> int:

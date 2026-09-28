@@ -12,17 +12,21 @@ from insia_agents.backends.anthropic_backend import (
     FALLBACK_BETA,
     AnthropicBackend,
     collect_research_notes,
+    drop_ungrounded_sources,
     echo_content,
+    map_api_error,
     match_question,
     message_text,
 )
 from insia_agents.backends.base import (
+    APICallError,
     APIConnectionFailed,
     AuthError,
     InvalidOutputError,
     OutputTruncatedError,
     RateLimitedError,
     RefusalError,
+    merge_research,
 )
 from insia_agents.channels import check_format
 from insia_agents.models import (
@@ -273,3 +277,80 @@ def test_collect_notes_and_question_matching(plan):
     assert notes["tool_errors"] == ["web_search 오류: max_uses_exceeded"]
     assert match_question("생성형 AI 이용률 2025", plan.questions) == "q2"
     assert match_question("소상공인 통계", plan.questions) == "q1"
+
+
+def test_echo_content_keeps_code_execution_pairs_before_fallback():
+    """Dynamic filtering runs code execution; its use/result pairs must echo together."""
+    blocks = [
+        {"type": "server_tool_use", "id": "c1", "name": "code_execution", "input": {"code": "..."}},
+        {"type": "code_execution_tool_result", "tool_use_id": "c1", "content": {"type": "code_execution_result", "stdout": ""}},
+        {"type": "server_tool_use", "id": "b1", "name": "bash_code_execution", "input": {"command": "ls"}},
+        {"type": "bash_code_execution_tool_result", "tool_use_id": "b1", "content": {"type": "bash_code_execution_result"}},
+        {"type": "server_tool_use", "id": "u1", "name": "code_execution", "input": {}},  # unpaired: dropped
+        {"type": "tool_use", "id": "t1", "name": "client_tool", "input": {}},  # client tool_use: dropped
+        {"type": "web_fetch_tool_result", "tool_use_id": "zz", "content": {}},  # result without a use: dropped
+        {"type": "text", "text": "부분"},
+        {"type": "fallback"},
+        {"type": "server_tool_use", "id": "w1", "name": "web_search", "input": {"query": "q"}},
+    ]
+    out = echo_content(blocks)
+    assert [(b["type"], b.get("id") or b.get("tool_use_id")) for b in out] == [
+        ("server_tool_use", "c1"), ("code_execution_tool_result", "c1"),
+        ("server_tool_use", "b1"), ("bash_code_execution_tool_result", "b1"),
+        ("text", None), ("server_tool_use", "w1"),
+    ]
+
+
+def test_map_api_error_without_credentials_error(monkeypatch):
+    """SDK 1.0-1.4 export no CredentialsError and raise a plain AnthropicError."""
+    missing = anthropic.AnthropicError("Credentials file not found at ~/.config/anthropic/credentials/default.json (profile 'default').")
+    credentials_error = getattr(anthropic, "CredentialsError", None)
+    if credentials_error is not None:  # SDK >= 1.5
+        assert type(map_api_error(missing, "claude-opus-5")) is APICallError  # not a CredentialsError there
+        assert isinstance(map_api_error(credentials_error("x"), "claude-opus-5"), AuthError)
+        monkeypatch.delattr(anthropic, "CredentialsError")
+    mapped = map_api_error(missing, "claude-opus-5")
+    assert isinstance(mapped, AuthError) and mapped.kind == "credentials" and "ant auth login" in str(mapped)
+    other = map_api_error(anthropic.AnthropicError("something else"), "claude-opus-5")
+    assert type(other) is APICallError and other.kind == "unknown"
+
+
+def test_research_drops_sources_no_tool_produced(settings, prompts_dir, brief, plan):
+    many = [SimpleNamespace(type="web_search_result", url=f"https://example.org/r{i}", title=f"r{i}", page_age="")
+            for i in range(100)]
+    search_result = SimpleNamespace(type="web_search_tool_result", tool_use_id="srv_1", content=[
+        SimpleNamespace(type="web_search_result", url="https://www.mss.go.kr/a", title="실태조사", page_age=""), *many])
+    memo = text("q1: 확인함. 원문은 https://kosis.kr/stat?id=1 참고.")
+    structured = ResearchPack(
+        findings=[Finding(id="f1", question_id="q1", claim="진짜", source_ids=["s1", "s4"], confidence="high"),
+                  Finding(id="f2", question_id="q1", claim="지어낸 수치", source_ids=["s4"], confidence="high")],
+        sources=[Source(id="s1", title="실태조사", url="http://mss.go.kr/a/", tier=1),       # scheme/www/slash differ
+                 Source(id="s2", title="KOSIS", url="https://kosis.kr/stat?id=1", tier=1),   # only in the memo
+                 Source(id="s3", title="r95", url="https://example.org/r95", tier=2),        # beyond the 80 sent on
+                 Source(id="s4", title="가짜 통계", url="https://made-up.example/stat", tier=1)],
+        gaps=[])
+    client = FakeClient([message([search_result, memo]), message([json_text(structured)])])
+    notices = []
+    backend = AnthropicBackend(settings, client=client)
+    backend.on_notice = lambda agent, level, msg: notices.append((agent, level, msg))
+    pack = backend.research(brief, plan.questions, lambda t, d: None)
+
+    assert [s.id for s in pack.sources] == ["s1", "s2", "s3"]
+    assert [f.source_ids for f in pack.findings] == [["s1"], []]
+    assert notices and notices[0][:2] == ("researcher", "warn") and "made-up.example" in notices[0][2]
+    merged, _ = merge_research(None, pack)
+    assert [f.claim for f in merged.findings] == ["진짜"]
+    assert any("지어낸 수치" in g for g in merged.gaps)
+
+
+def test_followup_research_keeps_existing_source_urls(settings, prompts_dir, brief, plan, pack):
+    reuse = ResearchPack(findings=[Finding(id="f2", question_id="q1", claim="재인용", source_ids=["s2"], confidence="medium")],
+                         sources=[Source(id="s2", title="실태조사", url="https://www.mss.go.kr/a", tier=1)], gaps=[])
+    client = FakeClient([message([text("새로 찾은 것 없음")]), message([json_text(reuse)])])
+    got = AnthropicBackend(settings, client=client).research(brief, plan.questions, lambda t, d: None, existing=pack)
+    assert got == reuse
+
+
+def test_drop_ungrounded_sources_is_a_noop_when_all_grounded(pack):
+    same, dropped = drop_ungrounded_sources(pack, {"mss.go.kr/a"})
+    assert same is pack and dropped == []

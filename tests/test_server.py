@@ -172,3 +172,161 @@ def test_resolve_static_and_range_helpers(web_dir):
     assert parse_range("bytes=-10", 100) == (90, 99)
     assert parse_range("bytes=200-300", 100) is None
     assert parse_range("items=0-1", 100) is None
+
+
+def test_symlinked_index_html_cannot_escape_root(web_dir):
+    sub = web_dir / "sub"
+    sub.mkdir()
+    (sub / "index.html").symlink_to(Path("..") / ".." / "secret.txt")
+    assert resolve_static(web_dir, "/sub/") is None
+    assert resolve_static(web_dir, "/sub") is None
+    inner = web_dir / "inner"
+    inner.mkdir()
+    (inner / "index.html").symlink_to(Path("..") / "index.html")  # a symlink that stays inside root is fine
+    assert resolve_static(web_dir, "/inner/") == (web_dir / "index.html").resolve()
+
+
+# -- cross-site protection (DNS rebinding / CSRF) ------------------------------
+
+
+@pytest.mark.parametrize("path", ["/api/health", "/api/runs", "/api/sample-brief", "/api/runs/x/events"])
+def test_api_rejects_foreign_host_header(server, path):
+    port = server.server_address[1]
+    for host in ("attacker.example", f"attacker.example:{port}", f"127.0.0.1:{port + 1}", "127.0.0.1",
+                 f"localhost.attacker.example:{port}", f"evil@127.0.0.1:{port}"):
+        resp, body = request(server, "GET", path, headers={"Host": host})
+        assert resp.status == 403, (path, host)
+        assert json.loads(body)["error"]
+
+
+def test_api_accepts_loopback_host_names(server):
+    port = server.server_address[1]
+    for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"LOCALHOST:{port}", f"[::1]:{port}"):
+        resp, _ = request(server, "GET", "/api/health", headers={"Host": host})
+        assert resp.status == 200, host
+    # the dashboard's static files are not API routes
+    resp, _ = request(server, "GET", "/", headers={"Host": "attacker.example"})
+    assert resp.status == 200
+
+
+def test_post_rejects_foreign_host_origin_and_non_json_body(server):
+    port = server.server_address[1]
+    payload = {"topic": "csrf", "channels": ["linkedin"], "options": {"speed": 0}}
+    resp, _ = request(server, "POST", "/api/runs", payload, headers={"Host": f"attacker.example:{port}"})
+    assert resp.status == 403
+    for origin in ("https://evil.example", "http://evil.example", f"http://127.0.0.1:{port + 1}", "null",
+                   f"https://127.0.0.1:{port}"):
+        resp, body = request(server, "POST", "/api/runs", payload, headers={"Origin": origin})
+        assert resp.status == 403, origin
+        assert json.loads(body)["error"]
+    # CORS "simple" content types (no preflight) are refused
+    raw = json.dumps(payload).encode("utf-8")
+    for ctype in ("text/plain;charset=UTF-8", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"):
+        resp, _ = request(server, "POST", "/api/runs", raw, headers={"Content-Type": ctype})
+        assert resp.status == 415, ctype
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("POST", "/api/runs", body=raw)  # no Content-Type at all
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 415
+    assert json.loads(request(server, "GET", "/api/runs")[1])["runs"] == []  # nothing started
+
+
+def test_post_from_the_dashboard_origin_is_accepted(server):
+    port = server.server_address[1]
+    payload = {"topic": "대시보드", "channels": ["instagram"], "options": {"speed": 0}}
+    for origin, host in ((f"http://127.0.0.1:{port}", f"127.0.0.1:{port}"), (f"http://localhost:{port}", f"localhost:{port}")):
+        resp, body = request(server, "POST", "/api/runs", payload,
+                             headers={"Origin": origin, "Host": host, "Content-Type": "application/json; charset=utf-8"})
+        assert resp.status == 201, (origin, body)
+        events, _ = read_sse(server, json.loads(body)["events_url"])
+        assert events[-1]["type"] == "run.completed"
+
+
+def test_wildcard_bind_allows_ip_literals_but_not_names(settings):
+    srv = make_server(settings, host="0.0.0.0", port=0, web_dir=None)
+    try:
+        port = srv.server_address[1]
+        assert srv.allows_host("192.168.0.10", port) and srv.allows_host("127.0.0.1", port)
+        assert srv.allows_host("localhost", port)
+        assert not srv.allows_host("attacker.example", port)
+        assert not srv.allows_host("192.168.0.10", port + 1)
+    finally:
+        srv.server_close()
+
+
+# -- malformed JSON / numbers ---------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", [
+    b'{"topic": "t", "options": {"max_rounds": Infinity}}',
+    b'{"topic": "t", "options": {"pass_score": NaN}}',
+    b'{"topic": "t", "options": {"speed": -Infinity}}',
+    b'{"topic": "t", "options": {"max_rounds": 1e400}}',
+    b'{"topic": "t", "options": {"speed": 1' + b"0" * 400 + b'}}',
+    b'{"topic": "t", "options": {"max_rounds": 1' + b"0" * 5000 + b'}}',
+    b"[" * 30000,
+])
+def test_non_finite_and_deeply_nested_json_get_400(server, raw):
+    resp, body = request(server, "POST", "/api/runs", raw)
+    assert resp.status == 400, body
+    assert json.loads(body)["error"]
+
+
+def test_parse_options_numbers():
+    assert parse_options({"speed": 2, "max_rounds": 3.0, "pass_score": 90}) == {"speed": 2.0, "max_rounds": 3, "pass_score": 90}
+    for raw in ({"speed": float("inf")}, {"pass_score": float("nan")}, {"max_rounds": 10 ** 400},
+                {"speed": 10 ** 400}, {"max_rounds": 1.5}, {"max_rounds": True}):
+        with pytest.raises(RequestError) as info:
+            parse_options(raw)
+        assert info.value.status == 400, raw
+
+
+# -- concurrency limit ----------------------------------------------------------
+
+
+def test_run_limit_holds_under_a_burst(settings, monkeypatch):
+    max_active, burst = 2, 6
+    release = threading.Event()
+    barrier = threading.Barrier(burst, timeout=10)
+    real_prepare = server_module.prepare_run
+
+    def slow_prepare(*args, **kwargs):
+        barrier.wait()  # every request is between "check" and "insert" at the same time
+        return real_prepare(*args, **kwargs)
+
+    def blocking_pipeline(*args, **kwargs):
+        release.wait(10)
+        raise RuntimeError("test stop")
+
+    monkeypatch.setattr(server_module, "prepare_run", slow_prepare)
+    monkeypatch.setattr(server_module, "run_pipeline", blocking_pipeline)
+    manager = RunManager(settings, max_active=max_active)
+    outcomes: list[object] = []
+    lock = threading.Lock()
+
+    def start() -> None:
+        try:
+            record = manager.start(Brief(topic="동시 실행", channels=["linkedin"]), {"speed": 0})
+            result: object = record
+        except RequestError as exc:
+            result = exc.status
+        with lock:
+            outcomes.append(result)
+
+    threads = [threading.Thread(target=start) for _ in range(burst)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    try:
+        started = [o for o in outcomes if not isinstance(o, int)]
+        assert len(outcomes) == burst
+        assert len(started) == max_active
+        assert sorted(o for o in outcomes if isinstance(o, int)) == [429] * (burst - max_active)
+        assert sum(1 for r in manager.list() if r["status"] == "running") == max_active
+    finally:
+        release.set()
+        for record in started:
+            record.thread.join(timeout=5)

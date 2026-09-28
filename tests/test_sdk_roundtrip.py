@@ -16,7 +16,7 @@ import pytest
 from anthropic import DefaultHttpxClient
 
 from insia_agents.backends.anthropic_backend import AnthropicBackend
-from insia_agents.backends.base import RefusalError
+from insia_agents.backends.base import APIConnectionFailed, RateLimitedError, RefusalError, ServerSideError
 from insia_agents.models import ChannelOutline, Plan, ResearchQuestion
 
 
@@ -159,3 +159,54 @@ def test_pause_turn_resume_through_real_sdk(settings, prompts_dir, brief, plan):
     assert ("research.query", {"question_id": "q1", "query": "소상공인 실태조사 2025"}) in emitted
     structure = json.loads(seen[2].content)["messages"][0]["content"]
     assert "https://kosis.kr/a" in structure
+
+
+def _partial_events() -> list[tuple[str, dict]]:
+    message = {"id": "msg_4", "type": "message", "role": "assistant", "model": "claude-opus-5", "content": [],
+               "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 5, "output_tokens": 1}}
+    return [
+        ("message_start", {"type": "message_start", "message": message}),
+        ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": '{"summary"'}}),
+    ]
+
+
+@pytest.mark.parametrize("error, kind", [
+    (httpx2.RemoteProtocolError("peer closed connection without sending complete message body"), "connection"),
+    (httpx2.ReadTimeout("The read operation timed out"), "timeout"),
+])
+def test_mid_stream_transport_error_is_typed(settings, prompts_dir, brief, error, kind):
+    """A drop after the SSE body started is not wrapped by the SDK; it must still
+    become a BackendError so the pipeline keeps the channel's earlier rounds."""
+    head = _sse(_partial_events())
+
+    class DroppingBody(httpx2.SyncByteStream):
+        def __iter__(self):
+            yield head
+            raise error
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=DroppingBody())
+
+    client = anthropic.Anthropic(api_key="sk-test-not-real", max_retries=0,
+                                 http_client=DefaultHttpxClient(transport=httpx2.MockTransport(handler)))
+    with pytest.raises(APIConnectionFailed) as info:
+        AnthropicBackend(settings, client=client).plan(brief)
+    assert info.value.kind == kind and info.value.retryable
+    assert info.value.__cause__ is error
+    assert "도중" in str(info.value)
+
+
+@pytest.mark.parametrize("etype, expected", [
+    ("overloaded_error", ServerSideError),
+    ("api_error", ServerSideError),
+    ("rate_limit_error", RateLimitedError),
+])
+def test_mid_stream_error_event_is_classified_by_type(settings, prompts_dir, brief, etype, expected):
+    """An SSE `error` event after HTTP 200 arrives as APIStatusError(status 200)."""
+    body = _sse(_partial_events() + [("error", {"type": "error", "error": {"type": etype, "message": "boom"}})])
+    backend = AnthropicBackend(settings, client=_client([body], []))
+    with pytest.raises(expected) as info:
+        backend.plan(brief)
+    assert info.value.retryable
+    assert "(200)" not in str(info.value) and "잠시 후 다시 실행해 주세요" in str(info.value)
