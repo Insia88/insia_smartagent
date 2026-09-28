@@ -29,6 +29,17 @@ class ResearchStore:
             return self.pack.model_copy(deep=True)
 
 
+def _drop_unknown_source_ids(raw: ResearchPack, existing: ResearchPack | None) -> ResearchPack:
+    """Keep only source ids the backend could have meant: its own new sources or
+    the snapshot it was given. Another channel may merge sources while this call
+    runs; without this, a dangling id in ``raw`` could bind to one of those."""
+    valid = {s.id for s in raw.sources} | ({s.id for s in existing.sources} if existing else set())
+    if all(sid in valid for f in raw.findings for sid in f.source_ids):
+        return raw
+    findings = [f.model_copy(update={"source_ids": [sid for sid in f.source_ids if sid in valid]}) for f in raw.findings]
+    return raw.model_copy(update={"findings": findings})
+
+
 def run(ctx: AgentContext, store: ResearchStore, questions: list[ResearchQuestion], *,
         followup: bool = False, channel: ChannelId | None = None) -> Step[ResearchPack]:
     """Research ``questions`` and merge into ``store``; returns the new items only."""
@@ -54,6 +65,7 @@ def run(ctx: AgentContext, store: ResearchStore, questions: list[ResearchQuestio
     existing = store.snapshot() if followup else None
     what = f"{channel_label(channel or '')} 추가 조사" if followup else "웹 리서치"
     raw = ctx.call(AGENT, what, ctx.backend.research, ctx.brief, questions, emit, existing=existing)
+    raw = _drop_unknown_source_ids(raw, existing)
     with store.lock:  # no yields while holding the lock (the mock runner is single-threaded)
         merged, added = merge_research(store.pack, raw)
         store.pack = merged
