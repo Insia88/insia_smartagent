@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from insia_agents.backends.mock_backend import template_draft, template_research
 from insia_agents.cli import main
 from insia_agents.models import Brief
+
+
+@pytest.fixture(autouse=True)
+def tmp_workspace(tmp_path, monkeypatch):
+    """`insia run` writes into the workspace by default: never the repo's workspace/."""
+    monkeypatch.setenv("INSIA_HOME", str(tmp_path / "ws"))
+    monkeypatch.delenv("INSIA_MAX_COST_USD", raising=False)
+    return tmp_path / "ws"
 
 
 def test_run_mock_writes_outputs_and_trace(tmp_path, capsys):

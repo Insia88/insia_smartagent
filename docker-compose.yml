@@ -1,0 +1,33 @@
+# INSIA 스마트에이전트 — docker compose (자세한 안내: docs/operations.md "설치 — Docker")
+#
+# 1) 이 폴더에 .env 파일을 만들어 값을 채워요 (.env는 git에 올리지 마세요):
+#      ANTHROPIC_API_KEY=sk-ant-...
+#      INSIA_ACCESS_TOKEN=<python -c "import secrets; print(secrets.token_urlsafe(32))" 로 만든 값>
+#      INSIA_MAX_COST_USD=5
+# 2) Linux라면 처음 한 번: mkdir -p workspace && sudo chown 10001:10001 workspace
+# 3) docker compose up -d --build  →  http://127.0.0.1:8765 에서 토큰으로 로그인
+#
+# 매일 아침 초안 만들기(호스트의 cron): docker compose exec -T insia insia run-due --limit 3
+services:
+  insia:
+    build:
+      context: .
+      args:
+        WITH_RENDER: "${INSIA_WITH_RENDER:-0}"  # 1 = 카드뉴스 PNG용 Chromium·한글 글꼴 포함 (이미지가 커져요)
+    image: insia-smartagent:latest
+    restart: unless-stopped
+    environment:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"  # 비우면 mock(데모) 모드
+      INSIA_ACCESS_TOKEN: "${INSIA_ACCESS_TOKEN:?INSIA_ACCESS_TOKEN을 .env에 설정해 주세요 (docs/operations.md 보안)}"
+      INSIA_MAX_COST_USD: "${INSIA_MAX_COST_USD:-5}"  # 실행 1번의 예산 상한(달러), 0 = 상한 없음
+      INSIA_MODEL: "${INSIA_MODEL:-}"  # 비우면 기본 모델
+      INSIA_PUBLIC_HOSTS: "${INSIA_PUBLIC_HOSTS:-}"  # HTTPS 리버스 프록시 뒤에서 쓸 도메인 (예: insia.example.com)
+      INSIA_TRUST_PROXY: "${INSIA_TRUST_PROXY:-0}"  # 프록시가 HTTPS를 처리하면 1 (로그인 쿠키에 Secure)
+    volumes:
+      - ./workspace:/data  # 워크스페이스: 이 폴더를 통째로 백업하면 돼요
+    ports:
+      # 기본은 이 컴퓨터에서만 접속할 수 있어요 (127.0.0.1).
+      # 인터넷에 열 때는 이 줄을 그대로 두고, 같은 서버의 HTTPS 리버스 프록시(Caddy·nginx 등)가
+      # 127.0.0.1:8765로 전달하게 한 뒤 .env에 INSIA_PUBLIC_HOSTS=도메인, INSIA_TRUST_PROXY=1을 적어요.
+      # "8765:8765"처럼 모든 주소에 직접 여는 것은 권하지 않아요 (토큰이 HTTPS 없이 오가요).
+      - "127.0.0.1:8765:8765"

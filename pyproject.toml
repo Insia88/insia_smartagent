@@ -25,6 +25,7 @@ dependencies = [
 dev = ["pytest>=8"]
 export = ["python-docx>=1.1"]
 render = ["playwright>=1.40"]
+docs = ["pypdf>=4.0", "python-docx>=1.1", "PyYAML>=6.0"]  # insia docs add (pdf/docx), profile import (yaml)
 
 [project.scripts]
 insia = "insia_agents.cli:main"
