@@ -52,7 +52,8 @@ def run(ctx: AgentContext, store: ResearchStore, questions: list[ResearchQuestio
     # other channels need store.snapshot() meanwhile. merge_research renumbers against whatever
     # the pack holds by the time the call returns, so ids stay continuous.
     existing = store.snapshot() if followup else None
-    raw = ctx.backend.research(ctx.brief, questions, emit, existing=existing)
+    what = f"{channel_label(channel or '')} 추가 조사" if followup else "웹 리서치"
+    raw = ctx.call(AGENT, what, ctx.backend.research, ctx.brief, questions, emit, existing=existing)
     with store.lock:  # no yields while holding the lock (the mock runner is single-threaded)
         merged, added = merge_research(store.pack, raw)
         store.pack = merged

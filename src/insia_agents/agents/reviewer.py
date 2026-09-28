@@ -15,10 +15,11 @@ def review(ctx: AgentContext, research: ResearchPack, draft: Draft) -> Step[Revi
     yield ctx.pace("handoff")
     ctx.status(AGENT, "reviewing", f"{label} R{draft.round} 초안을 검수하는 중이에요")
     ctx.bus.emit("review.started", AGENT, {"channel": draft.channel, "round": draft.round})
-    checks = check_format(draft, ctx.brief)
-    raw = ctx.backend.review(ctx.brief, research, draft, checks)
+    profile = ctx.profile
+    checks = check_format(draft, ctx.brief, profile)
+    raw = ctx.call(AGENT, f"{label} 검수", ctx.backend.review, ctx.brief, research, draft, checks)
     yield ctx.pace("review", draft.channel, draft.round)
-    final = finalize_review(raw, draft, ctx.brief, pass_score=ctx.settings.pass_score)
+    final = finalize_review(raw, draft, ctx.brief, pass_score=ctx.settings.pass_score, profile=profile)
     verdicts = {"supported": 0, "unsupported": 0, "needs_source": 0}
     for fact in final.fact_checks:
         verdicts[fact.verdict] = verdicts.get(fact.verdict, 0) + 1
@@ -48,14 +49,20 @@ def top_issue(result: Review) -> str:
     return f"점수 {result.score}점으로 통과 기준 미달"
 
 
-def request_revision(ctx: AgentContext, result: Review) -> Step[None]:
-    ctx.bus.emit("revision.requested", AGENT, {
+def request_revision(ctx: AgentContext, result: Review, instructions: str = "") -> Step[None]:
+    """``revision.requested`` + feedback handoff. Human ``instructions`` (item jobs) lead the request."""
+    data = {
         "channel": result.channel,
         "round": result.round,
-        "issues": len(result.issues),
-        "top_issue": top_issue(result),
-    })
-    ctx.handoff(AGENT, "orchestrator", "feedback", f"{channel_label(result.channel)} 수정 요청 {len(result.issues)}건", result.channel)
+        "issues": len(result.issues) + (1 if instructions.strip() else 0),
+        "top_issue": instructions.strip()[:200] if instructions.strip() else top_issue(result),
+    }
+    if instructions.strip():
+        data["instructions"] = instructions.strip()
+    ctx.bus.emit("revision.requested", AGENT, data)
+    label = channel_label(result.channel)
+    text = f"{label} 수정 요청 {data['issues']}건" + (" (사람 지시 포함)" if instructions.strip() else "")
+    ctx.handoff(AGENT, "orchestrator", "feedback", text, result.channel)
     ctx.status(AGENT, "waiting", "수정본을 기다리는 중이에요")
     yield ctx.pace("handoff")
 

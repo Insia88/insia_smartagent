@@ -13,8 +13,8 @@
 </head>
 <body>
 <!-- BUILD:BODY-START -->
-<a class="skip-link" href="#stage">무대로 건너뛰기</a>
-<div class="app">
+<a class="skip-link" href="#main">본문으로 건너뛰기</a>
+<div class="app" id="app" data-view="studio">
   <header class="topbar">
     <div class="brand">
       <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true" focusable="false">
@@ -30,6 +30,26 @@
       <span class="mode-badge" id="modeBadge" data-mode="demo" title="데모 재생">DEMO</span>
     </div>
 
+    <nav class="appnav" id="appnav" aria-label="화면 이동">
+      <a href="#/studio" data-view="studio" aria-current="page">스튜디오</a>
+      <a href="#/library" data-view="library">보관함<span class="nav-count" id="navCountLibrary" hidden></span></a>
+      <a href="#/calendar" data-view="calendar">캘린더</a>
+      <a href="#/brand" data-view="brand">브랜드·자료</a>
+      <a href="#/usage" data-view="usage">사용량</a>
+    </nav>
+
+    <div class="top-actions">
+      <button type="button" class="icon-btn" id="btnTheme" aria-label="밝은 테마로 바꾸기" title="테마 바꾸기">
+        <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4.2" fill="currentColor"/><g stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6"/></g></svg>
+        <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z" fill="currentColor"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+  <section class="view view-studio" id="view-studio" data-view="studio" aria-labelledby="studioTitle">
+  <h2 class="sr-only" id="studioTitle" tabindex="-1">스튜디오</h2>
+  <div class="studio-bar">
     <div class="transport" role="group" aria-label="재생 제어">
       <button type="button" class="icon-btn" id="btnRestart" aria-label="처음부터 다시 재생" title="처음부터">
         <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 12a8 8 0 1 0 2.4-5.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M4 3.5V8h4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -49,15 +69,9 @@
         <output class="scrub-time" id="timeLabel" for="scrubber">00:00 / 00:00</output>
       </div>
     </div>
-
-    <div class="top-actions">
-      <button type="button" class="btn btn--primary" id="btnNewRun" hidden>새 실행</button>
-      <button type="button" class="icon-btn" id="btnTheme" aria-label="밝은 테마로 바꾸기" title="테마 바꾸기">
-        <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4.2" fill="currentColor"/><g stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6"/></g></svg>
-        <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z" fill="currentColor"/></svg>
-      </button>
-    </div>
-  </header>
+    <button type="button" class="btn btn--primary" id="btnNewRun" hidden>새 실행</button>
+  </div>
+  <div class="job-banner" id="jobBanner" role="status" hidden></div>
 
   <section class="summary" id="summary" aria-label="실행 요약">
     <div class="summary-brief">
@@ -73,7 +87,7 @@
     <div class="summary-results" id="summaryResults" hidden></div>
   </section>
 
-  <main class="layout">
+  <div class="layout">
     <section class="col-stage" id="stage" aria-label="에이전트 무대" tabindex="-1">
       <div class="monitor" id="monitor">
         <div class="monitor-hud">
@@ -138,8 +152,17 @@
         <ol class="log" id="timeline" aria-live="polite" aria-relevant="additions"></ol>
       </section>
     </aside>
+  </div>
+  </section>
+
+  <section class="view" id="view-library" data-view="library" aria-labelledby="libraryTitle" hidden></section>
+  <section class="view" id="view-calendar" data-view="calendar" aria-labelledby="calendarTitle" hidden></section>
+  <section class="view" id="view-brand" data-view="brand" aria-labelledby="brandTitle" hidden></section>
+  <section class="view" id="view-usage" data-view="usage" aria-labelledby="usageTitle" hidden></section>
+  <section class="view" id="view-login" data-view="login" aria-labelledby="loginTitle" hidden></section>
   </main>
 </div>
+<p class="toast" id="toast" role="status" aria-live="polite"></p>
 
 <dialog class="drawer" id="drawer" aria-labelledby="drawerTitle">
   <div class="drawer-inner">
@@ -234,5 +257,11 @@
 </dialog>
 <!-- BUILD:BODY-END -->
 <script src="app.js"></script>
+<script src="js/core.js"></script>
+<script src="js/library.js"></script>
+<script src="js/calendar.js"></script>
+<script src="js/brand.js"></script>
+<script src="js/usage.js"></script>
+<script src="js/shell.js"></script>
 </body>
 </html>

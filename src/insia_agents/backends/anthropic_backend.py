@@ -24,6 +24,18 @@ the memo and the collected search results into a ``ResearchPack``. The split
 exists because structured outputs cannot be combined with citations, which
 web-search answers carry. Sources in that pack whose URL no search, fetch or
 memo produced are dropped (the second call has no tools to verify them).
+
+Run context (``backend.context``): the company profile goes into every
+plan/draft/revise/review/plan_calendar request, and the user's documents into
+the first research structuring call (as ``origin="user"`` sources with fixed
+ids, text capped at ``settings.max_document_chars`` with a notice when cut).
+Both travel in the *user* message: the system blocks (agent prompt + channel
+guide, each with a cache breakpoint) stay byte-identical across runs and
+workspaces, so they keep hitting the prompt cache; the profile block carries
+its own breakpoint (reused by a channel's draft → revise and review rounds).
+
+Usage: ``on_usage`` receives a priced ``UsageRecord`` after every API
+response, ``pause_turn`` continuations and refusals included.
 """
 
 from __future__ import annotations
@@ -31,13 +43,18 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Callable, Iterable
+from urllib.parse import unquote
 
 from pydantic import BaseModel, ValidationError
 
 from ..channels import CHANNELS
 from ..config import Settings
-from ..models import Brief, ChannelId, Draft, FormatCheck, Plan, ResearchPack, ResearchQuestion, Review
-from ..prompt_loader import agent_prompt, channel_guide
+from ..costs import env_key, load_prices, price_for, usage_from_response
+from ..models import (Brief, ChannelId, ContentItem, ContentPlan, Draft, FormatCheck, Plan, Profile, ResearchPack,
+                      ResearchQuestion, Review, Source)
+from ..planner import cap_counts, normalize_counts, normalize_plan, slot_days, weekday_label
+from ..prompt_loader import (PLANNER_PROMPT, agent_prompt, budget_documents, channel_guide, is_user_url,
+                             render_documents, render_profile, user_sources)
 from ..schema import json_format
 from .base import (
     APICallError,
@@ -52,7 +69,9 @@ from .base import (
     RateLimitedError,
     RefusalError,
     RequestRejectedError,
+    RunContext,
     ServerSideError,
+    UsageFn,
     next_ids,
 )
 
@@ -67,7 +86,9 @@ MAX_TOKENS = {
     "draft": 32000,
     "draft_bizplan": 64000,
     "review": 32000,
+    "plan_calendar": 16000,
 }
+HISTORY_IN_PROMPT = 60  # past items shown to the planner
 
 CREDENTIALS_HINT = "API 자격 증명을 찾을 수 없어요. ANTHROPIC_API_KEY를 설정하거나 `ant auth login`을 실행해 주세요."
 
@@ -78,14 +99,38 @@ SEARCH_INSTRUCTION = (
     "출처(제목, URL, 발행 기관, 발행일, tier 판단과 이유), 교차 확인 결과, 찾지 못한 것을 적습니다. "
     "JSON은 다음 단계에서 만들므로 지금은 메모만 쓰세요."
 )
+SEARCH_USER_MATERIALS = (
+    " user_materials는 사용자가 올린 회사 자료 목록이며 정리 단계에서 출처로 들어갑니다. "
+    "자료에 있을 회사 내부 사실은 웹에서 다시 찾지 말고 시장·통계·정책·경쟁 같은 외부 근거에 집중하세요."
+)
 STRUCTURE_INSTRUCTION = (
     "검색 도구 없이, 아래 조사 메모와 검색·열람 결과만으로 ResearchPack JSON을 만드세요. "
-    "여기에 없는 URL·수치·기관명은 넣지 마세요. 근거가 없는 질문은 gaps로 보내세요."
+    "여기에 없는 URL·수치·기관명은 넣지 마세요. 근거가 없는 질문은 gaps로 보내세요. "
+    "웹 출처의 origin은 \"web\"입니다."
+)
+STRUCTURE_USER_MATERIALS = (
+    " '사용자 제공 자료' 블록의 자료는 user_sources에 출처 id가 이미 정해져 있습니다(sources에 다시 쓰지 않아도 됩니다). "
+    "자료에서 질문에 답하는 사실을 finding으로 뽑을 때는 그 id를 source_ids에 쓰고, 외부 검증 전인 자체 주장이므로 "
+    "confidence는 medium 이하로, note에 '사용자 제공 자료(외부 검증 전)'라고 쓰세요. 새 웹 출처 id는 id_start부터 씁니다."
 )
 PLAN_INSTRUCTION = "브리프를 읽고 Plan JSON을 만드세요. 요청된 channels만 outlines에 넣으세요."
+PLAN_CONTEXT = (
+    " 회사 프로필이나 user_materials로 이미 답이 있는 회사 내부 사실은 리서치 질문으로 만들지 말고, "
+    "외부 근거(시장·통계·정책·경쟁)가 필요한 질문에 집중하세요."
+)
 DRAFT_INSTRUCTION = "채널 가이드의 출력 형식을 그대로 따라 첫 초안(round 0) Draft JSON을 만드세요."
 REVIEW_INSTRUCTION = "초안을 독립적으로 검수해 Review JSON을 만드세요. format_checks는 입력값을 그대로 넣으세요."
 REVISE_INSTRUCTION = "검수 결과의 critical·major 이슈와 실패한 형식 검사를 모두 반영한 수정본 Draft JSON을 만드세요."
+REVISE_HUMAN = (
+    " 맨 아래 '사람의 수정 지시'를 가장 먼저 반영하고 change_log 첫 줄에 '[사람 지시] 무엇을 어떻게 고쳤는지'를 쓰세요. "
+    "지시가 절대 규칙(리서치·프로필에 없는 사실, 금지 표현, 블라인드 규정)과 부딪히면 규칙을 지키고 '[미반영] 이유'를 남기세요."
+)
+HUMAN_INSTRUCTIONS_TITLE = "사람의 수정 지시"
+CALENDAR_INSTRUCTION = (
+    "회사 프로필, 주제(theme), 지난 게시물(history)을 보고 기간 안의 콘텐츠 계획 ContentPlan JSON을 만드세요. "
+    "채널별 개수(counts)를 정확히 지키고, 날짜는 available_days 중에서만 고르며, 같은 채널은 하루에 한 편만 둡니다. "
+    "history와 같은 주제·관점은 반복하지 마세요."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -327,29 +372,41 @@ def collect_research_notes(messages: Iterable[Any]) -> dict[str, Any]:
     }
 
 
-_URL_RE = re.compile(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
+# Any run of non-space characters after the scheme (Korean paths included), up
+# to quotes, angle brackets and closing CJK brackets.
+_URL_RE = re.compile(r"https?://[^\s<>\"'）」』\]]+")
+_ASCII_URL_RE = re.compile(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
+_TRAILING = ".,;:!?)]}'。、，"
 
 
 def url_key(url: str) -> str:
     """Lenient URL identity for grounding checks: ignores scheme, ``www.``,
-    fragment, trailing slash and case."""
-    key = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", url.strip().lower())
+    fragment, trailing slash, case and percent-encoding (``%EC%86%8C`` and
+    ``소`` are the same URL)."""
+    key = unquote(url.strip()).lower()
+    key = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", key)
     key = key.removeprefix("www.").split("#", 1)[0]
     return key.rstrip("/")
 
 
 def _literal_url_keys(text: str) -> set[str]:
+    """Keys for URLs written in prose. Each match is added as written, without
+    trailing punctuation, and cut at its first non-URL-safe character (a URL
+    glued to a Korean particle, e.g. ``…/a에서``)."""
     keys: set[str] = set()
-    for match in _URL_RE.findall(text or ""):
-        keys.add(url_key(match))
-        keys.add(url_key(match.rstrip(".,;:!?)]}'")))  # prose / markdown-link punctuation
+    for pattern in (_URL_RE, _ASCII_URL_RE):
+        for match in pattern.findall(text or ""):
+            keys.add(url_key(match))
+            keys.add(url_key(match.rstrip(_TRAILING)))  # prose / markdown-link punctuation
+    keys.discard("")
     return keys
 
 
 def grounded_url_keys(messages: Iterable[Any]) -> set[str]:
     """Every URL the tool call actually saw: all search results (not only the
-    first 80 sent to the structuring call), fetched pages, citations, URLs in
-    the memo text and in dynamic-filtering code output."""
+    first 80 sent to the structuring call), fetched pages and the URLs asked
+    for (a redirect can change the result URL), citations, URLs in the memo
+    text and in dynamic-filtering code output."""
     keys: set[str] = set()
     for message in messages:
         for block in _get(message, "content", None) or []:
@@ -359,6 +416,10 @@ def grounded_url_keys(messages: Iterable[Any]) -> set[str]:
                 for citation in _get(block, "citations", None) or []:
                     if _get(citation, "url"):
                         keys.add(url_key(_get(citation, "url")))
+            elif kind == "server_tool_use" and _get(block, "name") == "web_fetch":
+                requested = _get(_get(block, "input", None) or {}, "url")
+                if isinstance(requested, str) and requested.strip():
+                    keys.add(url_key(requested))
             elif kind == "web_search_tool_result":
                 content = _get(block, "content")
                 for item in content if isinstance(content, list) else []:
@@ -389,6 +450,49 @@ def drop_ungrounded_sources(pack: ResearchPack, allowed: set[str]) -> tuple[Rese
     findings = [f.model_copy(update={"source_ids": [sid for sid in f.source_ids if sid not in dropped_ids]})
                 for f in pack.findings]
     return pack.model_copy(update={"sources": kept, "findings": findings}), [s.url for s in dropped]
+
+
+def _source_number(source_id: str) -> int:
+    match = re.fullmatch(r"s(\d+)", source_id.strip().lower())
+    return int(match.group(1)) if match else 0
+
+
+def attach_user_sources(pack: ResearchPack, user: list[Source]) -> ResearchPack:
+    """Put the canonical user-material sources into a structured pack.
+
+    ``user`` sources have fixed ids (sent to the model as ``user_sources``);
+    the model's own copy of one (same ``user://`` URL) is replaced by the
+    canonical source and its findings re-pointed. A model source that reuses a
+    reserved id gets a fresh id (findings follow it: they cite the model's own
+    list). ``origin`` is set from the URL scheme for every source.
+    """
+    canonical = {s.url.strip().lower(): s for s in user}
+    reserved = {s.id for s in user}
+    next_free = max([_source_number(s.id) for s in [*user, *pack.sources]] + [0]) + 1
+    id_map: dict[str, str] = {}
+    others: list[Source] = []
+    used = set(reserved)
+    for src in pack.sources:
+        match = canonical.get(src.url.strip().lower())
+        if match is not None:
+            id_map[src.id] = match.id
+            continue
+        new_id = src.id
+        if new_id in used:
+            new_id = f"s{next_free}"
+            next_free += 1
+            id_map[src.id] = new_id
+        used.add(new_id)
+        others.append(src.model_copy(update={"id": new_id, "origin": "user" if is_user_url(src.url) else "web"}))
+    findings = []
+    for fin in pack.findings:
+        ids: list[str] = []
+        for sid in fin.source_ids:
+            mapped = id_map.get(sid, sid)
+            if mapped not in ids:
+                ids.append(mapped)
+        findings.append(fin.model_copy(update={"source_ids": ids}))
+    return ResearchPack(findings=findings, sources=[*user, *others], gaps=list(pack.gaps))
 
 
 # ---------------------------------------------------------------------------

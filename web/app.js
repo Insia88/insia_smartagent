@@ -297,9 +297,15 @@
           status: 'completed', duration: typeof d.duration_s === 'number' ? d.duration_s : Number(ev.t) || 0,
           scores: d.scores || {}, passed: d.passed || {}, outputDir: d.output_dir || '', errors: errs
         });
-        // a channel that raised never gets channel.completed; don't leave it "in progress"
+        // a channel that raised never gets channel.completed; don't leave it "in progress".
+        // Item jobs (재검수) end with a review and no channel.completed: keep that verdict.
         s.channelOrder.forEach(function (c) {
-          if (s.channels[c] && !s.channels[c].final) {
+          var cur = s.channels[c];
+          if (!cur || cur.final) return;
+          var lastReview = last(cur.reviews);
+          if (!errs[c] && lastReview) {
+            upd(c, function () { return { state: lastReview.passed ? 'passed' : 'failed', score: lastReview.score, passed: !!lastReview.passed }; });
+          } else {
             upd(c, function () { return { state: 'error', error: String(errs[c] || '작업이 끝나지 않았어요') }; });
           }
         });
@@ -475,6 +481,9 @@
   var dom = { agents: {}, cards: {}, wires: {}, packets: [] };
   var drawerChannel = null, drawerTab = 'content', drawerReviewRound = null, drawerRef = null, lastTrigger = null;
   var liveSource = null;
+  var liveEnd = null;           // onEnd callback of the run being streamed
+  var liveRunId = '';
+  var stageHidden = false;      // the studio view is not on screen (another tab of the app is open)
   var stageReady = false;
 
   function assetUrl(p) {
@@ -526,19 +535,39 @@
     }).catch(function () { return null; });
   }
 
+  /** Resolves to the health JSON, {authRequired: true} when the server wants a token (401), or null (demo). */
   function detectServer() {
     // file:// pages and the published artifact (trace embedded by build_artifact.py) never have the API
     if (!/^https?:$/.test(location.protocol) || document.getElementById('insia-trace')) return Promise.resolve(null);
     var ctrl = window.AbortController ? new AbortController() : null;
     var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 1500);
-    return fetch('/api/health', { cache: 'no-store', headers: { Accept: 'application/json' }, signal: ctrl ? ctrl.signal : undefined })
+    return fetch('/api/health', { cache: 'no-store', credentials: 'same-origin', headers: { Accept: 'application/json' }, signal: ctrl ? ctrl.signal : undefined })
       .then(function (r) {
         clearTimeout(timer);
         var ct = r.headers.get('content-type') || '';
+        if (r.status === 401 && ct.indexOf('json') >= 0) return { authRequired: true };
         if (!r.ok || ct.indexOf('json') < 0) return null;
         return r.json().then(function (j) { return j && typeof j.mode === 'string' ? j : null; });
       })
       .catch(function () { clearTimeout(timer); return null; });
+  }
+
+  /** Switch the header between demo and live once the API answered (boot, or after login). */
+  function setServer(info) {
+    serverInfo = info && !info.authRequired ? info : null;
+    var badge = $('modeBadge');
+    if (serverInfo) {
+      badge.textContent = 'LIVE';
+      badge.dataset.mode = 'live';
+      badge.title = '서버 연결됨 · ' + (serverInfo.mode || '') + (serverInfo.model ? ' · ' + serverInfo.model : '');
+    } else {
+      badge.textContent = info && info.authRequired ? 'LOCKED' : 'DEMO';
+      badge.dataset.mode = info && info.authRequired ? 'locked' : 'demo';
+      badge.title = info && info.authRequired ? '접근 토큰이 필요한 서버예요' : '데모 재생 (서버 없이 기록을 재생해요)';
+    }
+    $('btnNewRun').hidden = !serverInfo;
+    summaryKey = '';
+    dirty = true;
   }
 
   // ------------------------------------------------------------------ build DOM
@@ -929,8 +958,16 @@
     }).then(enterLive);
   }
 
-  function enterLive(runId) {
+  /**
+   * Stream a server run into the stage. opts.onEnd(state, lastEvent) fires once when the run
+   * completes, fails or is lost; opts.title replaces the summary tag's run label.
+   */
+  function enterLive(runId, opts) {
+    opts = opts || {};
     if (liveSource) { try { liveSource.close(); } catch (e) { /* ignore */ } }
+    var prevEnd = liveEnd;
+    liveEnd = null;
+    if (prevEnd) { try { prevEnd(null, { type: 'replaced' }); } catch (e) { /* ignore */ } }
     clearPackets();
     player.mode = 'live';
     player.playing = false;
@@ -941,13 +978,20 @@
     player.liveArrival = performance.now();
     state = initialState();
     sourceKind = 'live';
-    traceMeta = { title: '실시간 실행 ' + runId };
+    traceMeta = { title: opts.title || ('실시간 실행 ' + runId) };
+    liveRunId = runId;
     forceRender = true;
     dirty = true;
     var seen = {};
     var warned = false;
     var es = new EventSource('/api/runs/' + encodeURIComponent(runId) + '/events');
     liveSource = es;
+    liveEnd = typeof opts.onEnd === 'function' ? opts.onEnd : null;
+    function finish(ev) {
+      var cb = liveSource === null && liveEnd ? liveEnd : null;
+      liveEnd = null;
+      if (cb) { try { cb(state, ev); } catch (err) { if (window.console) console.warn('작업 종료 처리 실패', err); } }
+    }
     es.onmessage = function (msg) {
       var ev;
       try { ev = JSON.parse(msg.data); } catch (e) { return; }
@@ -969,6 +1013,7 @@
         player.mode = 'replay';
         player.playing = false;
         dirty = true;
+        finish(ev);
       }
     };
     es.onerror = function () {
@@ -985,6 +1030,7 @@
         safeApply(lost);
         effects(lost);
         dirty = true;
+        finish(lost);
         return;
       }
       if (!warned) {
@@ -1038,7 +1084,7 @@
   function setAgentMotion(id, on) {
     var d = dom.agents[id];
     var v = d.video;
-    var canVideo = v && !v.dataset.failed && v.dataset.src && !reduceMotion.matches && !document.hidden;
+    var canVideo = v && !v.dataset.failed && v.dataset.src && !reduceMotion.matches && !document.hidden && !stageHidden;
     if (on && canVideo) {
       if (!v.getAttribute('src')) v.src = v.dataset.src;
       if (v.paused) {
@@ -1568,13 +1614,26 @@
         });
       })));
     }
-    if (r.summary) pane.appendChild(el('p', { class: 'review-summary', text: r.summary }));
+    appendChildren(pane, reviewDetails(r));
+  }
+
+  var VERDICT_LABEL = { supported: '근거 있음', unsupported: '근거와 다름', needs_source: '출처 필요' };
+
+  /**
+   * Review body shared by the stage drawer and the 보관함 detail: summary, rubric, issues,
+   * code format checks, fact checks and follow-up research questions. `r` is either a
+   * review.completed event payload (fact_checks = counts) or a stored Review (fact_checks = list).
+   * Returns an array of nodes; every model string goes through textContent.
+   */
+  function reviewDetails(r) {
+    var out = [];
+    if (r.summary) out.push(el('p', { class: 'review-summary', text: r.summary }));
 
     var rubric = r.rubric || [];
     if (rubric.length) {
       var total = rubric.reduce(function (a, x) { return a + (x.score || 0); }, 0);
       var totalMax = rubric.reduce(function (a, x) { return a + (x.max || 0); }, 0);
-      pane.appendChild(el('div', null, [
+      out.push(el('div', null, [
         el('h3', { class: 'sub-title', text: '루브릭' }),
         el('div', { class: 'table-wrap' }, el('table', { class: 'rubric' }, [
           el('thead', null, el('tr', null, [el('th', { scope: 'col', text: '항목' }), el('th', { scope: 'col', text: '점수' }), el('th', { scope: 'col', text: '코멘트' })])),
@@ -1592,7 +1651,7 @@
     }
 
     var issues = r.issues || [];
-    pane.appendChild(el('div', null, [
+    out.push(el('div', null, [
       el('h3', { class: 'sub-title', text: '이슈 ' + issues.length + '건' }),
       issues.length ? el('ul', { class: 'issues' }, issues.map(function (x) {
         return el('li', { class: 'issue', 'data-sev': x.severity }, [
@@ -1604,38 +1663,57 @@
     ]));
 
     var checks = r.format_checks || [];
-    if (checks.length) {
-      pane.appendChild(el('div', null, [
-        el('h3', { class: 'sub-title', text: '형식 검사 (코드 자동 채점)' }),
-        el('ul', { class: 'checks-list' }, checks.map(function (c) {
-          return el('li', null, [
-            el('span', { class: c.passed ? 'ok' : 'no', text: c.passed ? '✓' : '✕', 'aria-label': c.passed ? '통과' : '미통과' }),
-            el('span', { text: c.label }),
-            el('span', { class: 'val', text: c.value + ' / 기준 ' + c.expected })
-          ]);
-        }))
-      ]));
-    }
+    if (checks.length) out.push(formatChecksBlock(checks, '형식 검사 (코드 자동 채점)'));
+
     var fc = r.fact_checks;
     if (fc && typeof fc === 'object' && !Array.isArray(fc)) {
-      pane.appendChild(el('div', null, [
+      out.push(el('div', null, [
         el('h3', { class: 'sub-title', text: '사실 확인' }),
         el('div', { class: 'facts' }, [stat('근거 있음', fc.supported || 0), stat('근거와 다름', fc.unsupported || 0), stat('출처 필요', fc.needs_source || 0)])
       ]));
     } else if (Array.isArray(fc) && fc.length) {
       var cnt = { supported: 0, unsupported: 0, needs_source: 0 };
       fc.forEach(function (x) { cnt[x.verdict] = (cnt[x.verdict] || 0) + 1; });
-      pane.appendChild(el('div', null, [
+      // problems first: unsupported, then needs_source, then supported
+      var order = { unsupported: 0, needs_source: 1, supported: 2 };
+      var sorted = fc.slice().sort(function (a, b) { return (order[a.verdict] || 0) - (order[b.verdict] || 0); });
+      out.push(el('div', null, [
         el('h3', { class: 'sub-title', text: '사실 확인' }),
-        el('div', { class: 'facts' }, [stat('근거 있음', cnt.supported), stat('근거와 다름', cnt.unsupported), stat('출처 필요', cnt.needs_source)])
+        el('div', { class: 'facts' }, [stat('근거 있음', cnt.supported), stat('근거와 다름', cnt.unsupported), stat('출처 필요', cnt.needs_source)]),
+        el('details', { class: 'fact-list' }, [
+          el('summary', { text: '주장별 확인 결과 ' + fc.length + '건 보기' }),
+          el('ul', null, sorted.map(function (x) {
+            return el('li', { 'data-verdict': x.verdict }, [
+              el('span', { class: 'verdict', text: VERDICT_LABEL[x.verdict] || x.verdict }),
+              el('span', { class: 'claim', text: x.claim }),
+              (x.source_ids && x.source_ids.length) || x.note
+                ? el('span', { class: 'fact-note', text: [(x.source_ids || []).join(', '), x.note || ''].filter(Boolean).join(' · ') })
+                : null
+            ]);
+          }))
+        ])
       ]));
     }
     if (r.needs_research && r.needs_research.length) {
-      pane.appendChild(el('div', null, [
+      out.push(el('div', null, [
         el('h3', { class: 'sub-title', text: '리서치에 넘긴 추가 질문' }),
         el('ul', { class: 'gaps' }, r.needs_research.map(function (q) { return el('li', { text: q }); }))
       ]));
     }
+    return out;
+  }
+
+  function formatChecksBlock(checks, title) {
+    return el('div', null, [
+      el('h3', { class: 'sub-title', text: title }),
+      el('ul', { class: 'checks-list' }, checks.map(function (c) {
+        return el('li', null, [
+          el('span', { class: c.passed ? 'ok' : 'no', text: c.passed ? '✓' : '✕', 'aria-label': c.passed ? '통과' : '미통과' }),
+          el('span', { text: c.label }),
+          el('span', { class: 'val', text: c.value + ' / 기준 ' + c.expected })
+        ]);
+      }))
+    ]);
   }
 
   function renderHistoryPane(id, ch) {
@@ -1914,16 +1992,10 @@
       queueLayout();
       return Promise.all([detectServer(), loadTrace()]);
     }).then(function (res) {
-      serverInfo = res[0];
+      var info = res[0];
       var trace = res[1];
-      if (serverInfo) {
-        $('modeBadge').textContent = 'LIVE';
-        $('modeBadge').dataset.mode = 'live';
-        $('modeBadge').title = '서버 연결됨 · ' + (serverInfo.mode || '') + (serverInfo.model ? ' · ' + serverInfo.model : '');
-        $('btnNewRun').hidden = false;
-      } else {
-        $('modeBadge').title = '데모 재생 (서버 없이 기록을 재생해요)';
-      }
+      bootTrace = trace;
+      setServer(info);
       if (trace) {
         traceMeta = trace.meta || {};
         sourceKind = traceKind(trace);
@@ -1936,10 +2008,18 @@
       dirty = true;
       forceRender = true;
       queueLayout();
+      resolveReady({ server: info, trace: trace });
+    }).catch(function (err) {
+      if (window.console) console.error('초기화 오류', err);
+      resolveReady({ server: null, trace: null });
     });
   }
 
-  // Exposed for debugging and tests.
+  var bootTrace = null;
+  var resolveReady;
+  var ready = new Promise(function (resolve) { resolveReady = resolve; });
+
+  // Exposed for the workspace views (js/*.js), debugging and tests.
   window.INSIA = {
     applyEvent: applyEvent,
     initialState: initialState,
@@ -1949,7 +2029,35 @@
     seek: function (t) { seek(t); },
     play: play,
     pause: pause,
-    openDrawer: openDrawer
+    openDrawer: openDrawer,
+    /** Resolves once the manifest, the demo trace and the /api/health probe are settled: {server, trace}. */
+    ready: ready,
+    views: {},
+    util: {
+      $: $, el: el, esc: esc, appendChildren: appendChildren, fmtNum: fmtNum, fmtClock: fmtClock, fmtDuration: fmtDuration,
+      clip: clip, last: last, chName: chName, isChannel: isChannel, charsLabel: charsLabel, stat: stat,
+      storageGet: storageGet, storageSet: storageSet, assetUrl: assetUrl, fetchJson: fetchJson,
+      renderMarkdown: renderMarkdown, reviewDetails: reviewDetails, formatChecksBlock: formatChecksBlock, copyText: copyText,
+      CHANNEL_IDS: CHANNEL_IDS, CHANNEL_NAMES: CHANNEL_NAMES, SEVERITY_LABEL: SEVERITY_LABEL, TIER_LABEL: TIER_LABEL,
+      manifest: function () { return manifest; },
+      reduceMotion: function () { return !!reduceMotion.matches; }
+    },
+    studio: {
+      /** Stream a server run (pipeline or item job) into the stage; see enterLive. */
+      watchRun: function (runId, opts) { enterLive(runId, opts); },
+      liveRunId: function () { return liveSource ? liveRunId : ''; },
+      detectServer: detectServer,
+      setServer: setServer,
+      server: function () { return serverInfo; },
+      bootTrace: function () { return bootTrace; },
+      openBrief: function (trigger) { openBrief(trigger); },
+      /** The studio view was shown or hidden by the app shell (pause videos, re-measure wires). */
+      setVisible: function (on) {
+        stageHidden = !on;
+        AGENT_IDS.forEach(function (id) { if (dom.agents[id]) setAgentMotion(id, dom.agents[id].active); });
+        if (on) { queueLayout(); forceRender = true; dirty = true; }
+      }
+    }
   };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);

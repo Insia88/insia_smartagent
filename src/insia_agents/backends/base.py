@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, runtime_checkable
 
-from ..models import (Brief, ChannelId, Draft, Finding, FormatCheck, Plan, Profile, ResearchPack, ResearchQuestion,
-                      Review, Source, UsageRecord, UserDocument)
+from ..models import (Brief, ChannelId, ContentItem, ContentPlan, Draft, Finding, FormatCheck, Plan, Profile,
+                      ResearchPack, ResearchQuestion, Review, Source, UsageRecord, UserDocument)
 
 EmitFn = Callable[[str, dict[str, Any]], None]
 NoticeFn = Callable[[str, str, str], None]  # (agent, level, message)
@@ -29,10 +29,28 @@ class Backend(Protocol):
     """What the agent layer calls. Backends never emit lifecycle events
     themselves (the agent layer does, so live and mock streams match); the
     researcher may call ``emit`` for ``research.query`` / ``agent.status`` /
-    ``log`` while it works."""
+    ``log`` while it works.
+
+    Per-run inputs: set ``backend.context = RunContext(profile, documents,
+    today, instructions)`` before a run (both backends start with
+    ``RunContext(None, [], settings.today)``). The profile is rendered into the
+    plan/draft/revise/review/plan_calendar prompts; user documents become
+    ``origin="user"`` sources of the first research pack (capped at
+    ``settings.max_document_chars`` with a notice when cut).
+
+    Usage: when ``on_usage`` is set it receives a priced ``UsageRecord`` after
+    every API response (every ``pause_turn`` continuation too; mock mode sends
+    synthetic, free records). Records carry ``run_id=""`` — the callback owner
+    knows the run and fills it. An exception raised by the callback that is a
+    ``BackendError`` propagates (it stops the step); any other exception is
+    reported through ``on_notice`` and ignored, so a broken recorder never
+    fails a run.
+    """
 
     name: str  # "live" | "mock"
     model: str
+    context: RunContext
+    on_usage: UsageFn | None
 
     def plan(self, brief: Brief) -> Plan: ...
 
@@ -43,7 +61,19 @@ class Backend(Protocol):
 
     def review(self, brief: Brief, research: ResearchPack, draft: Draft, format_checks: list[FormatCheck]) -> Review: ...
 
-    def revise(self, brief: Brief, plan: Plan, research: ResearchPack, draft: Draft, review: Review) -> Draft: ...
+    def revise(self, brief: Brief, plan: Plan, research: ResearchPack, draft: Draft, review: Review,
+               instructions: str = "") -> Draft:
+        """``instructions``: human revision instructions ("사람의 수정 지시");
+        empty → ``context.instructions``."""
+        ...
+
+    def plan_calendar(self, profile: Profile, theme: str, start: str, end: str, counts: dict[str, int],
+                      history: list[ContentItem]) -> ContentPlan:
+        """Content calendar for ``start``..``end`` (YYYY-MM-DD, inclusive) with
+        ``counts[channel]`` posts per channel on weekdays, avoiding the topics
+        in ``history``. The result is already normalized (see
+        ``insia_agents.planner.normalize_plan``)."""
+        ...
 
 
 # ---------------------------------------------------------------------------

@@ -117,9 +117,14 @@ class EventBus:
     - ``subscribe`` yields every past event first, then live ones, and stops
       after a terminal event (``run.completed`` / ``run.failed``) or ``close()``.
     - An optional JSONL sink receives every event as it is emitted.
+    - ``start_seq`` / ``start_t`` (or ``continue_from``) continue the numbering
+      of an earlier stream of the same run (resume): the first event gets
+      ``seq = start_seq + 1`` and ``t >= start_t``; ``ts`` stays wall-clock
+      based (``started_at`` + time since this bus started).
     """
 
-    def __init__(self, run_id: str, clock: RealClock | SimClock | None = None, started_at: datetime | None = None) -> None:
+    def __init__(self, run_id: str, clock: RealClock | SimClock | None = None, started_at: datetime | None = None, *,
+                 start_seq: int = 0, start_t: float = 0.0) -> None:
         self.run_id = run_id
         self.clock = clock or RealClock()
         self.started_at = started_at or datetime.now(timezone.utc)
@@ -128,6 +133,8 @@ class EventBus:
         self._closed = False
         self._sink = None
         self._listeners: list[Callable[[dict[str, Any]], None]] = []
+        self._seq_offset = max(0, int(start_seq))
+        self._t_offset = max(0.0, float(start_t))
 
     # -- emitting ----------------------------------------------------------
     def emit(self, type: str, agent: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -137,13 +144,13 @@ class EventBus:
         with self._cond:
             if self._closed:
                 raise RuntimeError("event bus is closed")
-            t = round(max(0.0, self.clock.now()), 3)
+            t = round(self._t_offset + max(0.0, self.clock.now()), 3)
             if self._events and t < self._events[-1]["t"]:
                 t = self._events[-1]["t"]  # keep t non-decreasing across threads
             event = {
-                "seq": len(self._events) + 1,
+                "seq": self._seq_offset + len(self._events) + 1,
                 "t": t,
-                "ts": _iso(self.started_at + timedelta(seconds=t)),
+                "ts": _iso(self.started_at + timedelta(seconds=max(0.0, t - self._t_offset))),
                 "run_id": self.run_id,
                 "type": type,
                 "agent": agent,
@@ -183,7 +190,23 @@ class EventBus:
 
     def last_seq(self) -> int:
         with self._cond:
-            return len(self._events)
+            return self._seq_offset + len(self._events)
+
+    @property
+    def first_seq(self) -> int:
+        """``seq`` of the first event this bus emits (1 unless it continues an earlier stream)."""
+        return self._seq_offset + 1
+
+    def continue_from(self, seq: int, t: float = 0.0) -> None:
+        """Continue an earlier stream of this run: next ``seq`` is ``seq + 1``, ``t`` starts at ``t``.
+
+        Only allowed before the first event is emitted.
+        """
+        with self._cond:
+            if self._events:
+                raise RuntimeError("continue_from() must be called before the first event")
+            self._seq_offset = max(0, int(seq))
+            self._t_offset = max(0.0, float(t))
 
     def subscribe(self, after_seq: int = 0, heartbeat: float | None = None) -> Iterator[dict[str, Any] | None]:
         """Replay events with ``seq > after_seq``, then follow live events.
@@ -191,7 +214,7 @@ class EventBus:
         With ``heartbeat`` set, yields ``None`` whenever no event arrived for
         that many seconds (the SSE handler turns it into a comment line).
         """
-        index = max(0, int(after_seq))
+        index = max(0, int(after_seq) - self._seq_offset)
         while True:
             with self._cond:
                 if index >= len(self._events) and not self._closed:
@@ -219,17 +242,27 @@ class EventBus:
 
     # -- sinks & listeners -------------------------------------------------
     def add_listener(self, fn: Callable[[dict[str, Any]], None]) -> None:
+        """Call ``fn(event)`` for every new event (under the bus lock; exceptions are ignored)."""
         with self._cond:
             self._listeners.append(fn)
 
-    def attach_sink(self, path: str | Path) -> Path:
-        """Write past events to ``path`` (JSONL) and append every new one."""
+    def remove_listener(self, fn: Callable[[dict[str, Any]], None]) -> None:
+        with self._cond:
+            if fn in self._listeners:
+                self._listeners.remove(fn)
+
+    def attach_sink(self, path: str | Path, *, append: bool = False) -> Path:
+        """Write past events to ``path`` (JSONL) and append every new one.
+
+        ``append=True`` keeps what the file already holds (a resumed run adds
+        to the events of its first attempt).
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._cond:
             if self._sink is not None:
                 self._sink.close()
-            self._sink = path.open("w", encoding="utf-8")
+            self._sink = path.open("a" if append else "w", encoding="utf-8")
             for event in self._events:
                 self._sink.write(json.dumps(event, ensure_ascii=False) + "\n")
             self._sink.flush()

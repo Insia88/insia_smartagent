@@ -3,10 +3,12 @@
 
 Output: ``dist/artifact/``
   index.html   page content WITHOUT <!doctype>/<html>/<head>/<body> (the publisher
-               adds the skeleton). Keeps <title> and the Google Fonts <link>s,
-               inlines web/styles.css and web/app.js, and embeds the manifest and
-               the demo trace as JSON <script> blocks so the page works even
-               where fetch() of sibling files is unavailable.
+               adds the skeleton). Starts with <meta charset="utf-8"> (so a plain
+               static server shows the Korean correctly), keeps <title> and the
+               Google Fonts <link>s, inlines web/styles.css and every
+               <script src> that web/index.html loads (app.js, js/*.js) in order,
+               and embeds the manifest and the demo trace as JSON <script> blocks
+               so the page works even where fetch() of sibling files is unavailable.
   demo/        demo-run.json (preferred) or sample-trace.json, copied as-is
   assets/      manifest.json + only the manifest-referenced files the page uses
                (.glb models become self-contained .gltf.json files, since
@@ -85,6 +87,21 @@ def section(html: str, name: str) -> str:
     if not m:
         raise SystemExit(f"web/index.html에 BUILD:{name} 표시가 없어요.")
     return m.group(1).strip()
+
+
+def page_scripts(html: str) -> list[str]:
+    """Local classic scripts loaded after BUILD:BODY-END, in document order."""
+    tail = html.split("BUILD:BODY-END", 1)[1]
+    srcs = re.findall(r"<script\b[^>]*\bsrc=\"([^\"]+)\"[^>]*>\s*</script>", tail, re.I)
+    if not srcs:
+        raise SystemExit("web/index.html 끝에서 <script src=...>를 찾지 못했어요.")
+    out = []
+    for src in srcs:
+        rel = safe_rel(src)
+        if rel is None or not (WEB / Path(*rel.parts)).is_file():
+            raise SystemExit(f"web/index.html이 불러오는 스크립트를 찾을 수 없어요: {src}")
+        out.append(str(rel))
+    return out
 
 
 def json_for_script(obj) -> str:
@@ -188,10 +205,13 @@ def main(argv: list[str] | None = None) -> int:
     head = section(html, "HEAD")
     body = section(html, "BODY")
     css = (WEB / "styles.css").read_text(encoding="utf-8")
-    js = (WEB / "app.js").read_text(encoding="utf-8")
-    for label, text, tag in (("styles.css", css, "</style"), ("app.js", js, "</script")):
-        if tag in text.lower():
-            raise SystemExit(f"{label} 안에 '{tag}'가 있어 인라인할 수 없어요.")
+    scripts = page_scripts(html)
+    sources = [(name, (WEB / name).read_text(encoding="utf-8")) for name in scripts]
+    for label, text, tag in [("styles.css", css, "</style")] + [(name, text, "</script") for name, text in sources]:
+        if tag in text.lower() or (tag == "</script" and "<!--" in text):
+            raise SystemExit(f"{label} 안에 '{tag}' 또는 '<!--'가 있어 인라인할 수 없어요.")
+    # one classic script, files in the order index.html loads them
+    js = "\n\n".join(f"/* ---- web/{name} ---- */\n{text.strip()}" for name, text in sources)
 
     manifest_path = WEB / "assets" / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {"version": 1, "agents": {}, "channels": {}, "hero": {}}
@@ -212,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def page_html(man: dict) -> str:
         parts = [
+            '<meta charset="utf-8">',
             head,
             "<style>\n" + css.strip() + "\n</style>",
             body,
@@ -284,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     grand = sum(p.stat().st_size for p in files)
     print(f"아티팩트 빌드: {out.relative_to(ROOT) if ROOT in out.parents else out}")
     print(f"  데모 기록: web/demo/{trace_path.name} ({len(trace['events'])}개 이벤트, 페이지에 내장)")
-    print(f"  index.html: {human((out / 'index.html').stat().st_size)}")
+    print(f"  index.html: {human((out / 'index.html').stat().st_size)} (인라인 스크립트: {', '.join(scripts)})")
     for label, size in used:
         print(f"  + {label} ({human(size)})")
     for label, why in dropped:
