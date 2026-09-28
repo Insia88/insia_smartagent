@@ -24,7 +24,7 @@
         <circle cx="31" cy="29" r="5.5" fill="#FF7A59"/>
       </svg>
       <div class="brand-text">
-        <h1 class="brand-name">INSIA 에이전트 스튜디오</h1>
+        <h1 class="brand-name"><span class="brand-word">INSIA</span> <span class="nowrap">에이전트 스튜디오</span></h1>
         <p class="brand-sub">총괄 · 리서치 · 검수, 세 카피바라가 일하는 모습</p>
       </div>
       <span class="mode-badge" id="modeBadge" data-mode="demo" title="데모 재생">DEMO</span>
@@ -38,10 +38,10 @@
         <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor"/><rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor"/></svg>
         <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7 4.5v15l12-7.5z" fill="currentColor"/></svg>
       </button>
-      <div class="speed" role="radiogroup" aria-label="재생 속도">
-        <button type="button" role="radio" aria-checked="false" data-speed="1">1×</button>
-        <button type="button" role="radio" aria-checked="true" data-speed="2">2×</button>
-        <button type="button" role="radio" aria-checked="false" data-speed="4">4×</button>
+      <div class="speed" role="group" aria-label="재생 속도">
+        <button type="button" aria-pressed="false" data-speed="1">1×</button>
+        <button type="button" aria-pressed="true" data-speed="2">2×</button>
+        <button type="button" aria-pressed="false" data-speed="4">4×</button>
       </div>
       <div class="scrub">
         <label class="sr-only" for="scrubber">재생 위치</label>
@@ -103,6 +103,7 @@
     </section>
 
     <aside class="col-left" aria-label="계획과 리서치">
+      <div class="col-scroll">
       <details class="panel plan-panel" id="planPanel" open>
         <summary class="panel-head">
           <h2 class="panel-title">작업 계획</h2>
@@ -122,15 +123,16 @@
           <p class="empty">리서치 에이전트가 찾은 출처와 근거가 여기에 쌓여요.</p>
         </div>
       </section>
+      </div>
     </aside>
 
     <aside class="col-right" aria-label="작업 로그">
       <section class="panel timeline-panel" aria-labelledby="timelineTitle">
         <div class="panel-head">
           <h2 class="panel-title" id="timelineTitle">작업 로그</h2>
-          <div class="seg" role="radiogroup" aria-label="로그 보기">
-            <button type="button" role="radio" aria-checked="true" data-filter="all">전체</button>
-            <button type="button" role="radio" aria-checked="false" data-filter="key">핵심만</button>
+          <div class="seg" role="group" aria-label="로그 보기" data-role="log-filter">
+            <button type="button" aria-pressed="true" data-filter="all">전체</button>
+            <button type="button" aria-pressed="false" data-filter="key">핵심만</button>
           </div>
         </div>
         <ol class="log" id="timeline" aria-live="polite" aria-relevant="additions"></ol>
