@@ -20,7 +20,7 @@
     revise: '수정', plan_calendar: '캘린더 계획', calendar: '캘린더 계획'
   };
 
-  var KIND_LABEL = { review: '재검수', revise: '수정 요청', edit: '사람 수정', slot: '캘린더 초안', plan: '캘린더 계획', resume: '이어서 실행', other: '기타' };
+  var KIND_LABEL = { review: '재검수', revise: '수정 요청', edit: '사람 수정', slot: '캘린더 초안', plan: '캘린더 계획', resume: '이어서 실행', other: '캘린더 계획 등' };
 
   var S = { container: null, month: null, data: null, error: null, loading: false, focusDay: -1, ro: null, lastWidth: 0 };
 
@@ -144,7 +144,15 @@
 
   function usageBody(data, isCurrent, monthLabel) {
     var runs = (data.runs || []).slice().sort(function (a, b) { return runDate(b) < runDate(a) ? -1 : runDate(b) > runDate(a) ? 1 : 0; });
+    // rows without a run id are calls outside a run (e.g. 캘린더 계획); they cost money but are not runs
+    var realRuns = runs.filter(function (r) { return r.run_id; });
     var total = usd(data.total_usd != null ? data.total_usd : runs.reduce(function (a, r) { return a + usd(r.usd != null ? r.usd : r.cost_usd); }, 0));
+    var calls = Number(data.calls) || runs.reduce(function (a, r) { return a + (Number(r.calls) || 0); }, 0);
+    var allMock = realRuns.length > 0 && realRuns.every(function (r) { return r.mode === 'mock'; });
+    var zeroNote = !total && (calls || realRuns.length) ? ui.notice('info', [
+      el('b', { text: allMock || (ws.health && ws.health.mode === 'mock') ? '모의 실행은 비용이 들지 않아요. ' : '이 달에는 비용이 든 호출이 없어요. ' }),
+      '그래서 금액이 모두 $0.00이에요. 토큰 수는 모의 실행이 글 길이로 어림한 값이라 실제 API 사용량과 달라요. ANTHROPIC_API_KEY를 설정하고 실제 API로 실행하면 호출마다 비용이 쌓여요.'
+    ], 'usage-zero') : null;
     var inTok = runs.reduce(function (a, r) { return a + (Number(r.input_tokens) || 0); }, 0);
     var outTok = runs.reduce(function (a, r) { return a + (Number(r.output_tokens) || 0); }, 0);
     var searches = runs.reduce(function (a, r) { return a + (Number(r.web_search_requests) || 0); }, 0);
@@ -156,7 +164,7 @@
         el('p', { class: 'hero-figure', text: ws.fmtUsd(total) }),
         el('p', { class: 'kpi-foot', text: isCurrent ? D.monthDay(S.month) + '부터 오늘까지 · USD' : monthLabel + ' 전체 · USD' })
       ]),
-      kpi('실행', U.fmtNum(runs.length) + '개', runs.length ? '실행당 평균 ' + ws.fmtUsd(total / runs.length) : '이 달에는 실행이 없어요'),
+      kpi('실행', U.fmtNum(realRuns.length) + '개', realRuns.length ? '실행당 평균 ' + ws.fmtUsd(total / realRuns.length) + (allMock ? ' · 모두 모의 실행' : '') : '이 달에는 실행이 없어요'),
       kpi('토큰', ws.fmtCompact(inTok + outTok), '입력 ' + ws.fmtCompact(inTok) + ' · 출력 ' + ws.fmtCompact(outTok)),
       kpi('웹 검색', U.fmtNum(searches) + '회', '리서치 에이전트의 검색 요청'),
       el('section', { class: 'card kpi kpi--budget' }, [
@@ -194,7 +202,8 @@
       var v = data.by_task[k];
       return { task: k, usd: usd(v), input: v && v.input_tokens, output: v && v.output_tokens };
     }).sort(function (a, b) { return b.usd - a.usd; }) : [];
-    var taskTotal = tasks.reduce(function (a, t) { return a + t.usd; }, 0) || 1;
+    var taskSum = tasks.reduce(function (a, t) { return a + t.usd; }, 0);
+    var taskTotal = taskSum || 1;
     var taskCard = el('section', { class: 'card', 'aria-labelledby': 'taskTitle' }, [
       el('h3', { class: 'card-title', id: 'taskTitle', text: '작업별 비용' }),
       tasks.length ? el('div', { class: 'table-wrap' }, el('table', { class: 'data-table' }, [
@@ -205,9 +214,9 @@
         el('tbody', null, tasks.map(function (t) {
           var pct = Math.round(100 * t.usd / taskTotal);
           return el('tr', null, [
-            el('td', null, [TASK_LABEL[t.task] || t.task, el('span', { class: 'share', 'aria-hidden': 'true' }, el('i', { style: 'width:' + pct + '%' }))]),
+            el('td', null, [TASK_LABEL[t.task] || t.task, taskSum ? el('span', { class: 'share', 'aria-hidden': 'true' }, el('i', { style: 'width:' + pct + '%' })) : null]),
             el('td', { class: 'num', text: ws.fmtUsd(t.usd, 2) }),
-            el('td', { class: 'num', text: pct + '%' }),
+            el('td', { class: 'num', text: taskSum ? pct + '%' : '—' }),
             el('td', { class: 'num', text: t.input != null ? U.fmtNum(Number(t.input)) : '—' }),
             el('td', { class: 'num', text: t.output != null ? U.fmtNum(Number(t.output)) : '—' })
           ]);
@@ -229,6 +238,7 @@
             el('td', null, [
               el('span', { class: 'mono', text: r.run_id || '실행 밖 호출' }),
               r.kind && r.kind !== 'pipeline' ? el('span', { class: 'run-kind', text: KIND_LABEL[r.kind] || r.kind }) : null,
+              r.mode === 'mock' ? el('span', { class: 'run-kind', 'data-mode': 'mock', text: '모의' }) : null,
               r.topic ? el('span', { class: 'run-topic', text: r.topic }) : null
             ]),
             el('td', { class: 'nowrap', text: ws.date.dateTime(runDate(r)) }),
@@ -243,6 +253,7 @@
     ]);
 
     return [
+      zeroNote,
       kpis,
       chart,
       el('div', { class: 'usage-tables' }, [taskCard, runCard]),
@@ -326,6 +337,9 @@
         s.appendChild(svg('text', { class: 'tick', x: cx, y: mt + ph + 16, 'text-anchor': 'middle' }, String(dayNum)));
       }
     });
+    if (!max) {
+      s.appendChild(svg('text', { class: 'chart-empty', x: ml + pw / 2, y: mt + ph / 2, 'text-anchor': 'middle' }, '이 달에는 비용이 든 날이 없어요'));
+    }
     // axis titles
     s.appendChild(svg('text', { class: 'axis-title', x: ml + pw / 2, y: H - 4, 'text-anchor': 'middle' }, (+S.month.slice(5, 7)) + '월 날짜 (일)'));
     s.appendChild(svg('text', { class: 'axis-title', x: 0, y: 12, 'text-anchor': 'start' }, '비용 (USD)'));

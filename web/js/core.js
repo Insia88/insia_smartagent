@@ -289,12 +289,37 @@
   function chk(id, label, passed, value, expected) { return { id: id, label: label, passed: !!passed, value: String(value), expected: expected }; }
   function inRange(v, lo, hi) { return v >= lo && v <= hi; }
 
+  function normSpace(t) { return String(t || '').replace(/\s/g, '').toLowerCase(); }
+  /** channels.profile_checks: banned words (all), required phrases (SNS only; title + body, not the tag list), blind names (bizplan). */
+  function profileChecks(channel, draft, profile) {
+    var out = [];
+    if (!profile) return out;
+    var flat = normSpace(String(draft.title || '') + '\n' + String(draft.content || ''));
+    var banned = (profile.banned_words || []).map(function (w) { return String(w).trim(); }).filter(Boolean);
+    if (banned.length) {
+      var hits = banned.filter(function (w) { var n = normSpace(w); return n && flat.indexOf(n) >= 0; });
+      out.push(chk('banned_words', '금지 표현 없음', !hits.length, hits.length ? hits.join(', ') : '없음', '프로필의 금지 표현을 쓰지 않음'));
+    }
+    if (channel !== 'bizplan') {
+      var required = (profile.required_phrases || []).map(function (w) { return String(w).trim(); }).filter(Boolean);
+      if (required.length) {
+        var missing = required.filter(function (w) { return flat.indexOf(normSpace(w)) < 0; });
+        out.push(chk('required_phrases', '필수 문구 포함', !missing.length, missing.length ? '누락: ' + missing.join(', ') : '모두 포함', '프로필의 필수 문구를 넣음'));
+      }
+    } else {
+      var names = (profile.team || []).map(function (m) { return String((m && m.name) || '').trim(); }).filter(function (n) { return n.length >= 2; });
+      var exposed = names.filter(function (n) { return flat.indexOf(normSpace(n)) >= 0; });
+      out.push(chk('blind_names', '블라인드(실명 미노출)', !exposed.length, exposed.length ? '실명 ' + exposed.length + '개 노출' : '노출 없음', '팀원 실명은 ○○로 가림'));
+    }
+    return out;
+  }
+
   /**
-   * Same checks and units as channels.check_format (without the profile checks, which the
-   * server adds on save): 공백 제외 for bizplan/naver_blog content, 공백 포함 for linkedin
-   * and the instagram caption. Returns FormatCheck-shaped objects.
+   * Same checks and units as channels.check_format: 공백 제외 for bizplan/naver_blog content,
+   * 공백 포함 for linkedin and the instagram caption, plus the company-profile brand checks
+   * when `profile` is given. Returns FormatCheck-shaped objects.
    */
-  function measure(channel, draft, brief) {
+  function measure(channel, draft, brief, profile) {
     var content = String(draft.content || '');
     var tags = (draft.hashtags || []).filter(function (x) { return String(x).trim(); });
     var L = LIMITS[channel];
@@ -343,9 +368,31 @@
       out.push(chk('hook_length', '캡션 첫 줄 길이', ch > 0 && ch <= L.maxHook, ch + '자', L.maxHook + '자 이하'));
       out.push(chk('hashtags', '해시태그 수', inRange(tags.length, L.minTags, L.maxTags), tags.length + '개', L.minTags + '~' + L.maxTags + '개'));
     }
-    return out;
+    return out.concat(profileChecks(channel, draft, profile));
   }
   ws.measure = measure;
+
+  // ------------------------------------------------------------------ company profile (cached for the editor's brand checks)
+  var profileCache = null;
+  /** Resolves with the saved Profile, or null when it cannot be loaded (checks are then skipped). */
+  ws.getProfile = function () {
+    if (ws.mode !== 'live') return Promise.resolve(null);
+    if (!profileCache) {
+      profileCache = api('GET', '/api/profile').then(function (r) { return ws.unwrap(r, 'profile') || null; }, function () { profileCache = null; return null; });
+    }
+    return profileCache;
+  };
+  ws.setProfile = function (p) { profileCache = Promise.resolve(p || null); };
+
+  /** Options for item jobs: in mock mode reuse the playback speed chosen in the studio brief form. */
+  ws.jobOptions = function () {
+    var opts = {};
+    if (ws.health && ws.health.mode === 'mock') {
+      var sp = parseFloat(U.storageGet('insia.mockSpeed'));
+      if (!isNaN(sp) && (sp === 0 || (sp >= 0.1 && sp <= 100))) opts.speed = sp;
+    }
+    return opts;
+  };
   ws.text = { charsWithSpace: charsWithSpace, charsNoSpace: charsNoSpace, firstLines: firstLines, section: section };
 
   /** "#a #b, c" → ["#a", "#b", "#c"] (duplicates dropped, order kept). */
@@ -420,15 +467,36 @@
   ws.watchJob = function (runId, opts) {
     opts = opts || {};
     var banner = document.getElementById('jobBanner');
+    var stop = el('button', {
+      type: 'button', class: 'btn btn--small btn--ghost', 'data-key': 'job-stop', text: '멈추기', onclick: function () {
+        stop.disabled = true;
+        stop.textContent = '멈추는 중…';
+        ws.post('/api/runs/' + encodeURIComponent(runId) + '/cancel', {}).catch(function (ex) {
+          stop.disabled = false;
+          stop.textContent = '멈추기';
+          if (!ex.auth) toast('멈추지 못했어요: ' + ex.message, 'error');
+        });
+      }
+    });
     showBanner(banner, 'running', [
       el('span', { class: 'jb-dot', 'aria-hidden': 'true' }),
       el('b', { text: opts.label || '작업' }), ' 진행 중이에요. 에이전트가 일하는 모습을 무대에서 볼 수 있어요.',
-      opts.itemId ? el('a', { class: 'btn btn--small', href: '#/library/' + encodeURIComponent(opts.itemId), text: '보관함으로 돌아가기' }) : null
+      opts.itemId ? el('a', { class: 'btn btn--small', href: '#/library/' + encodeURIComponent(opts.itemId), text: '보관함으로 돌아가기' }) : null,
+      stop
     ]);
     I.studio.watchRun(runId, {
+      job: true,
       title: opts.label || ('작업 ' + runId),
       onEnd: function (state, ev) {
-        if (ev && ev.type === 'replaced') return;
+        if (ev && ev.type === 'replaced') {
+          // the stage switched to another run; the job keeps running on the server
+          if (banner) banner.hidden = true;
+          toast((opts.label || '작업') + '은 서버에서 계속 진행돼요. 끝나면 보관함에서 결과를 볼 수 있어요.', 'info');
+          jobListeners.forEach(function (fn) {
+            try { fn({ runId: runId, itemId: opts.itemId || '', slotId: opts.slotId || '', ok: false, replaced: true, state: null, event: ev }); } catch (e) { if (window.console) console.warn(e); }
+          });
+          return;
+        }
         var ok = ev && ev.type === 'run.completed';
         var itemId = opts.itemId || findItemId(runId);
         var chans = state ? state.channelOrder : [];
@@ -463,6 +531,7 @@
     if (ws.mode !== 'auth') {
       ws.mode = 'auth';
       I.studio.setServer({ authRequired: true });
+      if (ws.syncAuthUi) ws.syncAuthUi();
     }
     if (ws.route.view !== 'login') ws.go('login', '', { back: ws.route });
   };

@@ -304,12 +304,12 @@
         C.planSummary = (plan.summary || resp.summary || '') + (slots.length ? ' (게시 ' + slots.length + '개)' : '');
         C.planNotices = Array.isArray(plan.notices) ? plan.notices : [];
         C.mode = 'week';
-        C.anchor = D.weekStart(s);
+        // show the week of the first planned post (planning on a weekend puts everything in the next week)
+        var dates = slots.map(function (x) { return x && x.date; }).filter(function (x) { return /^\d{4}-\d{2}-\d{2}$/.test(x || ''); }).sort();
+        C.anchor = D.weekStart(dates[0] || s);
         C.slots = null;
         render(false);
-        load().then(function () {
-          if (s !== C.anchor) { /* the plan starts mid-week: the next week holds the rest */ }
-        });
+        load();
         ui.toast('이번 주 계획을 세웠어요.', 'success');
       }, function (ex) {
         C.planBusy = false;
@@ -467,7 +467,7 @@
     C.dialogBusy = true;
     C.dialogError = '';
     renderDialog();
-    ws.post('/api/calendar/' + encodeURIComponent(s.id) + '/generate', {}).then(function (resp) {
+    ws.post('/api/calendar/' + encodeURIComponent(s.id) + '/generate', { options: ws.jobOptions() }).then(function (resp) {
       C.dialogBusy = false;
       var runId = resp && resp.run_id;
       if (!runId) throw new Error('서버가 작업 번호(run_id)를 보내지 않았어요.');

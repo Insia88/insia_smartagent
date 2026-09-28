@@ -18,10 +18,10 @@
   var el = U.el;
 
   var EXPORTS = {
-    bizplan: [['docx', 'Word 문서', '.docx · 표·개조식 서식 포함'], ['md', '마크다운', '.md']],
-    naver_blog: [['html', '스마트에디터용 HTML', '.html · 붙여넣기용'], ['md', '마크다운', '.md']],
-    linkedin: [['txt', '붙여넣기용 텍스트', '.txt · 해시태그 포함'], ['md', '마크다운', '.md']],
-    instagram: [['zip', '카드 이미지 + 캡션', '.zip · 1080×1350'], ['txt', '캡션 텍스트', '.txt'], ['md', '마크다운', '.md']]
+    bizplan: [['docx', 'Word 문서', '.docx · 표·개조식 서식 포함'], ['md', '마크다운', '.md'], ['txt', '텍스트', '.txt'], ['zip', '묶음 파일', '.zip · 형식별 파일 모음']],
+    naver_blog: [['html', '스마트에디터용 HTML', '.html · 붙여넣기용'], ['md', '마크다운', '.md'], ['txt', '텍스트', '.txt'], ['docx', 'Word 문서', '.docx'], ['zip', '묶음 파일', '.zip · 형식별 파일 모음']],
+    linkedin: [['txt', '붙여넣기용 텍스트', '.txt · 해시태그 포함'], ['md', '마크다운', '.md'], ['docx', 'Word 문서', '.docx'], ['zip', '묶음 파일', '.zip · 형식별 파일 모음']],
+    instagram: [['zip', '카드 이미지 + 캡션', '.zip · 1080×1350'], ['txt', '캡션 텍스트', '.txt'], ['md', '마크다운', '.md'], ['docx', 'Word 문서', '.docx']]
   };
   var DRAFT_KEY = 'insia.unsaved.';
 
@@ -43,7 +43,8 @@
     busy: false,
     saveResult: null,     // {version, checks}
     diff: null,           // {from, to}
-    jobs: {}              // itemId -> {runId, label}
+    jobs: {},             // itemId -> {runId, label}
+    profile: null         // company profile for the editor's brand checks (live only)
   };
 
   // ------------------------------------------------------------------ data
@@ -258,7 +259,10 @@
   // ------------------------------------------------------------------ detail
   function refreshDetail(focus) {
     var id = S.detailId;
-    return loadDetail(id).then(function (d) {
+    // the profile feeds the brand checks of the editor and of the unreviewed-version preview
+    return Promise.all([loadDetail(id), isDemo() ? null : ws.getProfile()]).then(function (res) {
+      var d = res[0];
+      if (res[1]) S.profile = res[1];
       if (S.detailId !== id) return;
       S.detail = d;
       S.detailError = null;
@@ -297,6 +301,8 @@
     var item = S.detail.item;
     var v = viewedVersion();
     var latest = latestVersion();
+    // the "saved v4" notice is stale once a job or another edit made a newer version
+    if (S.saveResult && latest && latest.version !== S.saveResult.version) S.saveResult = null;
     var head = el('header', { class: 'detail-head', style: '--ch:' + ws.channelColor(item.channel) }, [
       ui.channelIcon(item.channel, 'detail-icon'),
       el('div', { class: 'detail-heading' }, [
@@ -439,7 +445,7 @@
     function update() {
       queued = false;
       var cur = current();
-      var checks = ws.measure(ch, cur, S.detail.brief);
+      var checks = ws.measure(ch, cur, S.detail.brief, S.profile);
       meters.textContent = '';
       checks.forEach(function (c) {
         meters.appendChild(el('li', { 'data-ok': String(c.passed) }, [
@@ -539,6 +545,8 @@
     });
     // first paint of counters (after the nodes are in the DOM is not required)
     update();
+    // brand checks (금지 표현 · 필수 문구 · 블라인드) need the saved profile; repaint once it arrives
+    ws.getProfile().then(function (prof) { if (prof !== S.profile) { S.profile = prof; if (document.contains(meters)) queue(); } });
     return form;
   }
 
@@ -591,6 +599,7 @@
     return el('section', { class: 'card actions-card', 'aria-labelledby': 'actTitle' }, [
       el('h3', { class: 'card-title', id: 'actTitle', text: '검토와 게시' }),
       el('p', { class: 'card-sub', text: S.editing ? '편집 중에는 승인·게시·재검수를 할 수 없어요. 먼저 저장하거나 편집을 취소해 주세요.' : stateLine }),
+      item.note ? el('p', { class: 'item-note' }, [el('b', { text: '메모 ' }), item.note]) : null,
       buttons.length ? el('div', { class: 'action-row' }, buttons) : null,
       S.editing ? null : actionPanel(item, latest, passed)
     ]);
@@ -622,7 +631,13 @@
         el('div', { class: 'form-foot' }, [
           cancel,
           el('button', { type: 'button', class: 'btn', text: '재검수 먼저', disabled: S.busy || !!S.jobs[item.id], onclick: startReview }),
-          el('button', { type: 'button', class: 'btn btn--danger', text: '그래도 승인', disabled: S.busy, onclick: function () { setStatus({ status: 'approved', force: true }, '검수 미통과 상태로 승인했어요.'); } })
+          el('button', {
+            type: 'button', class: 'btn btn--danger', text: '그래도 승인', disabled: S.busy, onclick: function () {
+              // the note is the record that approval skipped the review gate
+              var note = '그래도 승인 · ' + ws.date.today() + ' · v' + (latest ? latest.version : '?') + ' ' + (r ? r.score + '점 미통과' : '검수 전');
+              setStatus({ status: 'approved', force: true, note: note }, '검수를 통과하지 않은 채로 승인했어요. 이 기록은 메모에 남겨 뒀어요.');
+            }
+          })
         ])
       ];
     } else if (key === 'revise') {
@@ -709,7 +724,7 @@
     var id = S.detailId;
     S.busy = true;
     renderDetail(false);
-    ws.post('/api/items/' + encodeURIComponent(id) + '/review', {}).then(function (resp) {
+    ws.post('/api/items/' + encodeURIComponent(id) + '/review', { options: ws.jobOptions() }).then(function (resp) {
       S.busy = false;
       S.panel = '';
       var runId = resp && resp.run_id;
@@ -729,7 +744,7 @@
   function startRevise(text) {
     var id = S.detailId;
     S.busy = true;
-    ws.post('/api/items/' + encodeURIComponent(id) + '/revise', { instructions: text }).then(function (resp) {
+    ws.post('/api/items/' + encodeURIComponent(id) + '/revise', { instructions: text, options: ws.jobOptions() }).then(function (resp) {
       S.busy = false;
       S.panel = '';
       var runId = resp && resp.run_id;
@@ -745,15 +760,32 @@
     });
   }
 
+  /**
+   * Export links. The server's detail lists the channel's formats (recommended first) with
+   * availability and hints (python-docx missing, PNG → slides.html); the local table only adds
+   * friendlier descriptions and is the fallback for an older server.
+   */
   function exportCard(item) {
-    var formats = EXPORTS[item.channel] || [['md', '마크다운', '.md']];
+    var local = {};
+    (EXPORTS[item.channel] || []).forEach(function (f) { local[f[0]] = f; });
+    var base = '/api/items/' + encodeURIComponent(item.id) + '/export?format=';
+    var list = (S.detail && Array.isArray(S.detail.exports) && S.detail.exports.length) ? S.detail.exports.map(function (e) {
+      var f = local[e.format];
+      return { format: e.format, label: f ? f[1] : (e.label || e.format), sub: f ? f[2] : '.' + e.format, available: e.available !== false, hint: e.hint || '', url: e.url || base + e.format };
+    }) : (EXPORTS[item.channel] || [['md', '마크다운', '.md']]).map(function (f) {
+      return { format: f[0], label: f[1], sub: f[2], available: true, hint: '', url: base + f[0] };
+    });
+    // same-origin API path only (the download attribute and the token cookie need it)
+    list.forEach(function (x) { if (!/^\/api\/items\//.test(x.url)) x.url = base + x.format; });
     return el('section', { class: 'card export-card', 'aria-labelledby': 'expTitle' }, [
       el('h3', { class: 'card-title', id: 'expTitle', text: '내보내기' }),
       el('p', { class: 'card-sub', text: '최신 버전을 파일로 받아요. 게시 전에 사람이 한 번 더 읽어 주세요.' }),
-      el('div', { class: 'export-list' }, formats.map(function (f) {
-        return el('a', {
-          class: 'export-link', href: '/api/items/' + encodeURIComponent(item.id) + '/export?format=' + f[0], download: ''
-        }, [el('b', { text: f[1] }), el('span', { text: f[2] })]);
+      el('div', { class: 'export-list' }, list.map(function (x, i) {
+        var inner = [el('b', { text: x.label + (i === 0 ? ' · 추천' : '') }), el('span', { text: x.sub })];
+        if (!x.available) {
+          return el('div', { class: 'export-link', 'data-disabled': 'true', 'aria-disabled': 'true' }, inner.concat([el('small', { class: 'export-hint', text: x.hint || '이 서버에서는 만들 수 없어요.' })]));
+        }
+        return el('a', { class: 'export-link', href: x.url, download: '', 'data-format': x.format }, x.hint ? inner.concat([el('small', { class: 'export-hint', text: x.hint })]) : inner);
       }))
     ]);
   }
@@ -765,7 +797,7 @@
     if (r) {
       body = U.reviewDetails(r);
     } else {
-      var preview = v && v.draft && v.draft.content ? ws.measure(item.channel, v.draft, S.detail.brief) : [];
+      var preview = v && v.draft && v.draft.content ? ws.measure(item.channel, v.draft, S.detail.brief, isDemo() ? null : S.profile) : [];
       body = [
         el('p', { class: 'empty', text: v ? '이 버전(v' + v.version + ')은 아직 검수하지 않았어요.' + (isDemo() ? '' : ' 재검수하면 루브릭 점수와 사실 확인을 받아요.') : '검수 기록이 없어요.' }),
         preview.length ? U.formatChecksBlock(preview, '형식 미리 확인 (브라우저 계산 · 참고용)') : null

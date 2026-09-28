@@ -62,7 +62,12 @@
     });
     if (prev && prev.view !== view && I.views[prev.view] && I.views[prev.view].hide) I.views[prev.view].hide();
     I.studio.setVisible(view === 'studio');
-    if (view === 'studio' && deferredPlay) { deferredPlay = false; I.play(); }
+    if (view === 'studio' && deferredPlay) {
+      deferredPlay = false;
+      // only the demo recording auto-plays; a server run the stage switched to meanwhile stays put
+      var src = I.studio.source ? I.studio.source() : 'recorded';
+      if (src === 'sample' || src === 'recorded') I.play();
+    }
     var container = document.getElementById('view-' + view);
     if (view === 'login') renderLogin(container);
     else if (view !== 'studio' && I.views[view]) I.views[view].show(container, param, { focus: focus, prev: prev });
@@ -131,10 +136,43 @@
     I.studio.setServer(info);
     Object.keys(I.views).forEach(function (k) { if (I.views[k].reset) I.views[k].reset(); });
     if (I.views.library && I.views.library.prefetch) I.views.library.prefetch();
+    syncAuthUi();
+    if (ws.runs) ws.runs.attach();
+  }
+
+  /** Header controls that depend on the server mode: 로그아웃 (token mode), 실행 기록, run bar. */
+  function syncAuthUi() {
+    var out = document.getElementById('btnLogout');
+    if (out) out.hidden = !(ws.mode === 'live' && ws.health && ws.health.token_required);
+    if (ws.runs) ws.runs.sync();
+  }
+  ws.syncAuthUi = syncAuthUi;
+
+  function logout() {
+    var btn = document.getElementById('btnLogout');
+    if (btn) btn.disabled = true;
+    fetch('/api/logout', {
+      method: 'POST', mode: 'same-origin', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: '{}'
+    }).catch(function () { return null; }).then(function () {
+      if (btn) btn.disabled = false;
+      ws.health = null;
+      ws.authMessage = '';
+      ws.mode = 'auth';
+      I.studio.setServer({ authRequired: true });
+      Object.keys(I.views).forEach(function (k) { if (I.views[k].reset) I.views[k].reset(); });
+      var badge = document.getElementById('navCountLibrary');
+      if (badge) badge.hidden = true;
+      syncAuthUi();
+      ws.ui.toast('로그아웃했어요. 이 브라우저의 로그인 쿠키를 지웠어요.', 'info');
+      go('login', '', { back: { view: 'library', param: '' } });
+    });
   }
 
   // ------------------------------------------------------------------ boot
   function start() {
+    var out = document.getElementById('btnLogout');
+    if (out) out.addEventListener('click', logout);
     Array.prototype.forEach.call(document.querySelectorAll('#appnav a'), function (a) {
       a.addEventListener('click', function (e) {
         if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -154,6 +192,8 @@
       booted = true;
       var r = parseHash();
       if (ws.mode === 'live' && I.views.library && I.views.library.prefetch) I.views.library.prefetch();
+      syncAuthUi();
+      if (ws.mode === 'live' && ws.runs) ws.runs.attach();
       // opened straight into another screen: start the stage replay when the studio is first shown
       if (r && r.view !== 'studio' && I.player.playing) { I.pause(); deferredPlay = true; }
       if (ws.mode === 'auth') {

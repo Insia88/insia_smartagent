@@ -358,6 +358,7 @@
     ws.put('/api/profile', p).then(function (resp) {
       var saved = Object.assign(blankProfile(), ws.unwrap(resp, 'profile') || p);
       B.profile = saved;
+      if (ws.setProfile) ws.setProfile(saved);  // the 보관함 editor's brand checks use the new rules
       B.form = clone(saved);
       B.saving = false;
       // same clock as the rest of the app (KST, from the server's updated_at)
@@ -520,7 +521,8 @@
       }
       return readText(file).then(function (text) {
         if (!text.trim()) { B.docMsgs.push({ kind: 'warn', text: name + ': 내용이 비어 있어요.' }); return; }
-        var title = name.replace(/\.[^.]+$/, '');
+        var heading = /^\s*#\s+(.+?)\s*#*\s*$/m.exec(text);
+        var title = (ext === 'md' || ext === 'markdown') && heading ? heading[1].slice(0, 120) : name.replace(/\.[^.]+$/, '');
         return ws.post('/api/documents', { title: title, text: text, kind: ext === 'md' || ext === 'markdown' ? 'markdown' : 'text', filename: name }).then(function (resp) {
           var doc = ws.unwrap(resp, 'document');
           B.docMsgs.push({ kind: 'success', text: name + ': 추가했어요 (' + (doc && doc.id ? '자료 번호 ' + doc.id + ' · ' : '') + U.fmtNum(text.length) + '자).' });

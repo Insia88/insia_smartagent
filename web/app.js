@@ -479,7 +479,7 @@
   var dirty = true;
   var forceRender = true;
   var traceMeta = null;
-  var sourceKind = 'none';      // sample | recorded | live | none
+  var sourceKind = 'none';      // sample | recorded | live | history | none
   var serverInfo = null;
   var player = { events: [], idx: 0, t: 0, duration: 0, speed: 2, playing: false, mode: 'replay', lastFrame: 0, liveArrival: 0 };
   var dom = { agents: {}, cards: {}, wires: {}, packets: [] };
@@ -956,22 +956,46 @@
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body)
     }).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (j) {
-        if (!r.ok || !j.run_id) throw new Error(j.error || j.detail || ('서버 응답 ' + r.status));
+        if (!r.ok || !j.run_id) {
+          var err = new Error(j.error || j.detail || ('서버 응답 ' + r.status));
+          err.status = r.status;
+          throw err;
+        }
         return j.run_id;
       });
     }).then(enterLive);
   }
 
+  // A burst of events (instant mock runs, catching up after a reconnect or when attaching mid-run)
+  // would launch dozens of packets at once: allow a few per short window, like advanceTo's budget.
+  var fxWindow = { start: 0, n: 0 };
+  function fxAllowed() {
+    var now = performance.now();
+    if (now - fxWindow.start > 400) { fxWindow.start = now; fxWindow.n = 0; }
+    return fxWindow.n++ < 6;
+  }
+
+  // listeners told when the stage starts or stops following a server run (js/runs.js, core.js)
+  var liveListeners = [];
+  function notifyLive(info) {
+    liveListeners.forEach(function (fn) { try { fn(info); } catch (err) { if (window.console) console.warn(err); } });
+  }
+
   /**
    * Stream a server run into the stage. opts.onEnd(state, lastEvent) fires once when the run
    * completes, fails or is lost; opts.title replaces the summary tag's run label.
+   * opts.history: the run already finished — the stored events arrive in one burst, so no packet
+   * animations; the stage ends on the final state and the transport replays it like a recording.
+   * opts.job: an item job tracked by the job banner (core.js).
    */
   function enterLive(runId, opts) {
     opts = opts || {};
     if (liveSource) { try { liveSource.close(); } catch (e) { /* ignore */ } }
     var prevEnd = liveEnd;
+    var prevRun = liveRunId;
     liveEnd = null;
     if (prevEnd) { try { prevEnd(null, { type: 'replaced' }); } catch (e) { /* ignore */ } }
+    if (prevRun && liveSource) notifyLive({ type: 'end', runId: prevRun, state: null, event: { type: 'replaced' } });
     clearPackets();
     player.mode = 'live';
     player.playing = false;
@@ -981,8 +1005,9 @@
     player.duration = 0;
     player.liveArrival = performance.now();
     state = initialState();
-    sourceKind = 'live';
-    traceMeta = { title: opts.title || ('실시간 실행 ' + runId) };
+    var history = !!opts.history;
+    sourceKind = history ? 'history' : 'live';
+    traceMeta = { title: opts.title || ((history ? '지난 실행 ' : '실시간 실행 ') + runId) };
     liveRunId = runId;
     forceRender = true;
     dirty = true;
@@ -991,10 +1016,12 @@
     var es = new EventSource('/api/runs/' + encodeURIComponent(runId) + '/events');
     liveSource = es;
     liveEnd = typeof opts.onEnd === 'function' ? opts.onEnd : null;
+    notifyLive({ type: 'start', runId: runId, opts: opts });
     function finish(ev) {
       var cb = liveSource === null && liveEnd ? liveEnd : null;
       liveEnd = null;
       if (cb) { try { cb(state, ev); } catch (err) { if (window.console) console.warn('작업 종료 처리 실패', err); } }
+      notifyLive({ type: 'end', runId: runId, state: state, event: ev, opts: opts });
     }
     es.onmessage = function (msg) {
       var ev;
@@ -1009,13 +1036,18 @@
       player.duration = player.t;
       player.liveArrival = performance.now();
       safeApply(ev);
-      effects(ev);
+      if (!history && fxAllowed()) effects(ev);
       dirty = true;
       if (ev.type === 'run.completed' || ev.type === 'run.failed') {
         es.close();
         liveSource = null;
         player.mode = 'replay';
         player.playing = false;
+        // replay controls work on the finished stream like on a recording
+        player.events.sort(function (a, b) { return a.t - b.t || a.seq - b.seq; });
+        player.duration = player.events.length ? player.events[player.events.length - 1].t : 0;
+        player.t = player.duration;
+        player.idx = player.events.length;
         dirty = true;
         finish(ev);
       }
@@ -1369,7 +1401,7 @@
     summaryKey = key;
 
     var tag = $('sourceTag');
-    var tagText = { sample: '샘플 트레이스 · 예시 데이터', recorded: '기록된 실행 재생', live: '실시간 실행', none: '기록 없음' }[sourceKind] || '';
+    var tagText = { sample: '샘플 트레이스 · 예시 데이터', recorded: '기록된 실행 재생', live: '실시간 실행', history: '지난 실행 다시 보기', none: '기록 없음' }[sourceKind] || '';
     tag.textContent = tagText;
     tag.dataset.kind = sourceKind;
     $('summaryTopic').textContent = brief.topic || (sourceKind === 'none' ? '재생할 기록을 찾지 못했어요' : '브리프를 기다리는 중이에요');
@@ -1390,7 +1422,7 @@
       });
     }
     // the call-to-action only matters before the first live run; afterwards the header's 새 실행 button is enough
-    $('summaryLive').hidden = !serverInfo || sourceKind === 'live';
+    $('summaryLive').hidden = !serverInfo || sourceKind === 'live' || sourceKind === 'history';
 
     var prog = $('summaryProgress');
     prog.textContent = '';
@@ -1813,11 +1845,22 @@
     $('briefError').hidden = true;
     if (!briefPrefilled) {
       briefPrefilled = true;
+      var savedSpeed = storageGet('insia.mockSpeed');
+      if (savedSpeed !== null && savedSpeed !== '' && !isNaN(parseFloat(savedSpeed))) $('f-speed').value = savedSpeed;
       fillBrief((state.run && state.run.brief) || (traceMeta && traceMeta.brief) || null);
       fetchJson('/api/sample-brief').then(function (b) {
         var brief = b && (b.brief || b);
         if (brief && brief.topic && !$('f-topic').dataset.touched) fillBrief(brief);
       }).catch(function () { /* keep the prefilled values */ });
+    }
+    $('briefProfileNote').hidden = !(serverInfo && serverInfo.profile_complete === false);
+    // live needs an API key on the server; say so instead of letting the request fail
+    var liveOpt = document.querySelector('#f-mode option[value="live"]');
+    if (liveOpt) {
+      var noKey = !!(serverInfo && serverInfo.live_available === false);
+      liveOpt.disabled = noKey;
+      liveOpt.textContent = noKey ? '실제 API (서버에 API 키가 없어요)' : '실제 API';
+      if (noKey && $('f-mode').value === 'live') $('f-mode').value = '';
     }
     if (!dlg.open) dlg.showModal();
     $('f-topic').focus();
@@ -1844,7 +1887,10 @@
     var mode = $('f-mode').value;
     if (mode) options.mode = mode;
     var speed = parseFloat($('f-speed').value);
-    if (!isNaN(speed)) options.speed = speed;
+    if (!isNaN(speed)) {
+      options.speed = speed;
+      storageSet('insia.mockSpeed', String(speed));  // item jobs (재검수 · 수정 요청 · 슬롯 초안) reuse it in mock mode
+    }
     var rounds = parseInt($('f-rounds').value, 10);
     if (!isNaN(rounds)) options.max_rounds = rounds;
     var pass = parseInt($('f-pass').value, 10);
@@ -1866,8 +1912,11 @@
     startLiveRun(body).then(function () {
       $('briefDialog').close();
     }).catch(function (ex) {
-      err.textContent = '실행을 시작하지 못했어요: ' + (ex && ex.message ? ex.message : '알 수 없는 오류') + '. 서버 로그를 확인해 주세요.';
+      // 4xx messages already say what to fix; only server errors point at the log
+      var msg = (ex && ex.message ? ex.message : '알 수 없는 오류').replace(/[.。]\s*$/, '');
+      err.textContent = '실행을 시작하지 못했어요: ' + msg + (ex && ex.status && ex.status < 500 ? '.' : '. 서버 로그를 확인해 주세요.');
       err.hidden = false;
+      if (ex && ex.status === 401 && window.INSIA.ws && window.INSIA.ws.requireLogin) { $('briefDialog').close(); window.INSIA.ws.requireLogin(ex.message); }
     }).then(function () {
       submit.disabled = false;
       submit.textContent = '실행 시작';
@@ -1959,6 +2008,7 @@
     $('btnNewRun').addEventListener('click', function (e) { openBrief(e.currentTarget); });
     $('btnOpenBrief').addEventListener('click', function (e) { openBrief(e.currentTarget); });
     $('briefClose').addEventListener('click', function () { $('briefDialog').close(); });
+    $('briefProfileLink').addEventListener('click', function () { lastTrigger = null; $('briefDialog').close(); });
     $('briefCancel').addEventListener('click', function () { $('briefDialog').close(); });
     $('briefForm').addEventListener('submit', submitBrief);
     $('f-topic').addEventListener('input', function () { $('f-topic').dataset.touched = '1'; });
@@ -2049,7 +2099,11 @@
     studio: {
       /** Stream a server run (pipeline or item job) into the stage; see enterLive. */
       watchRun: function (runId, opts) { enterLive(runId, opts); },
+      /** fn({type: 'start'|'end', runId, opts, state, event}) whenever the stage starts or stops following a run. */
+      onLive: function (fn) { liveListeners.push(fn); },
       liveRunId: function () { return liveSource ? liveRunId : ''; },
+      /** What the stage shows: sample | recorded (demo recordings) | live | history | none. */
+      source: function () { return sourceKind; },
       detectServer: detectServer,
       setServer: setServer,
       server: function () { return serverInfo; },

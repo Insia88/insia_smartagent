@@ -559,6 +559,7 @@ class RunManager:
                 row["status"] = "running"
             if status and row["status"] != status:
                 continue
+            row["resumable"] = record is None and self._list_resumable(row)
             out.append(row)
         return out[:limit]
 
@@ -584,6 +585,17 @@ class RunManager:
         data["resumable"] = (not active) and self._resumable(data)
         data["events_url"] = f"/api/runs/{run_id}/events"
         return data
+
+    @staticmethod
+    def _list_resumable(row: dict[str, Any]) -> bool:
+        """``resumable`` for a list row (no ``progress``): a stopped pipeline/slot run, or a
+        completed one with a channel that produced no item (it failed)."""
+        if row.get("kind") not in RESUMABLE_KINDS or row.get("status") == "running":
+            return False
+        if row.get("status") != "completed":
+            return True
+        done = row.get("items") or {}
+        return any(ch not in done for ch in row.get("channels") or [])
 
     @staticmethod
     def _resumable(run: dict[str, Any]) -> bool:
@@ -1070,8 +1082,9 @@ class InsiaServer(ThreadingHTTPServer):
                  quiet: bool = True, *, token: str | None = None, public_hosts: Sequence[str] = (),
                  trust_proxy: bool = False) -> None:
         self.bind_host = str(address[0]).strip("[]").lower()
-        super().__init__(address, InsiaHandler)
+        # Set before binding: a failed bind (port in use) calls server_close(), which needs it.
         self.manager = manager
+        super().__init__(address, InsiaHandler)
         self.web_root = web_root.resolve() if web_root is not None and web_root.is_dir() else None
         self.heartbeat = heartbeat
         self.quiet = quiet
@@ -1846,6 +1859,7 @@ class InsiaHandler(BaseHTTPRequestHandler):
             run = manager.workspace.get_run(entry["run_id"]) if entry.get("run_id") else None
             entry["started_at"] = run["created_at"] if run else entry.get("first_at")
             entry["status"] = run["status"] if run else None
+            entry["mode"] = run["mode"] if run else None
         summary["budget_usd"] = float(manager.settings.max_cost_usd or 0.0)
         summary["currency"] = "USD"
         self._send_json(200, summary)

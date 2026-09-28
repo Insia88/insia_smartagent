@@ -305,10 +305,11 @@ location / {
            "created_at": "2026-09-28T10:10:39.199Z", "updated_at": "2026-09-28T10:10:39.217Z",
            "finished_at": "2026-09-28T10:10:39.217Z", "cost_usd": 0.0, "error": null, "events": 49,
            "items": {"linkedin": "it_20260928-101039-7073_linkedin"}, "scores": {"linkedin": 86},
-           "active": false}]}
+           "active": false, "resumable": false}]}
 ```
 
 - `active`: 이 서버 프로세스에서 지금 돌고 있는지. `status`가 `running`인데 `active: false`면 다른 곳(CLI)에서 돌고 있거나 비정상 종료된 실행입니다.
+- `resumable`: [이어서 실행](#post-apirunsidresume)할 수 있는지. `pipeline`/`slot` 실행이 `interrupted`·`failed`·`cancelled`로 멈췄거나, `completed`인데 결과 콘텐츠가 없는 채널이 있으면 `true`입니다. 대시보드 스튜디오의 **실행 기록**과 실행 바가 이 값으로 "이어서 실행" 버튼을 보여 줍니다.
 - `items`: 채널 → 콘텐츠 id, `scores`: 채널 → 점수. 작업(review/revise)의 대상 콘텐츠는 `parent_item_id`.
 
 ### `GET /api/runs/<id>`
@@ -601,7 +602,7 @@ X-Insia-Notes: PNG%20%EB%8C%80%EC%8B%A0%20slides.html%EC%9D%84%20%EB%84%A3%EC%97
  "runs": [{"run_id": "20260928-101039-7073", "kind": "pipeline", "topic": "예시 주제", "usd": 0.84, "calls": 12,
            "input_tokens": 17817, "output_tokens": 9952, "cache_read_tokens": 0, "cache_write_tokens": 0,
            "web_search_requests": 4, "first_at": "2026-09-28T10:10:39.000Z", "last_at": "2026-09-28T10:10:39.000Z",
-           "started_at": "2026-09-28T10:10:39.199Z", "status": "completed"}],
+           "started_at": "2026-09-28T10:10:39.199Z", "status": "completed", "mode": "live"}],
  "by_task": {"plan": {"usd": 0.05, "calls": 2, "input_tokens": 165, "output_tokens": 979},
              "plan_calendar": {"usd": 0.01, "calls": 1, "input_tokens": 233, "output_tokens": 138}},
  "by_day": [{"date": "2026-09-28", "usd": 1.2345, "calls": 13}],
@@ -610,7 +611,7 @@ X-Insia-Notes: PNG%20%EB%8C%80%EC%8B%A0%20slides.html%EC%9D%84%20%EB%84%A3%EC%97
 
 - 금액은 USD, 모델별 토큰 단가(`src/insia_agents/costs.py`, `prices.json`, `INSIA_PRICE_*`)로 계산한 **추정치**입니다. mock 모드는 0원입니다.
 - `runs`는 최근순, `by_day`는 오래된 날짜부터(한국 날짜). 캘린더 계획처럼 실행 id가 없는 호출은 `run_id: ""`, `kind: "other"`로 묶입니다.
-- `started_at`: 실행이 시작된 시각(실행 기록이 없으면 `first_at`), `status`: 그 실행의 현재 상태.
+- `started_at`: 실행이 시작된 시각(실행 기록이 없으면 `first_at`), `status`: 그 실행의 현재 상태, `mode`: `live`·`mock`(실행 기록이 없으면 `null`). 대시보드는 모두 `mock`이면 "모의 실행은 비용이 들지 않아요"라고 알려 줍니다.
 - `budget_usd`: 실행 1회 예산 상한(`0`이면 없음).
 
 ---

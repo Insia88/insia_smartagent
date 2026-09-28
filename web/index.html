@@ -39,6 +39,7 @@
     </nav>
 
     <div class="top-actions">
+      <button type="button" class="btn btn--small btn--ghost" id="btnLogout" hidden>로그아웃</button>
       <button type="button" class="icon-btn" id="btnTheme" aria-label="밝은 테마로 바꾸기" title="테마 바꾸기">
         <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4.2" fill="currentColor"/><g stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6"/></g></svg>
         <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z" fill="currentColor"/></svg>
@@ -69,9 +70,13 @@
         <output class="scrub-time" id="timeLabel" for="scrubber">00:00 / 00:00</output>
       </div>
     </div>
-    <button type="button" class="btn btn--primary" id="btnNewRun" hidden>새 실행</button>
+    <div class="studio-actions">
+      <button type="button" class="btn" id="btnRuns" hidden>실행 기록</button>
+      <button type="button" class="btn btn--primary" id="btnNewRun" hidden>새 실행</button>
+    </div>
   </div>
   <div class="job-banner" id="jobBanner" role="status" hidden></div>
+  <div class="job-banner run-bar" id="runBar" role="status" aria-label="지금 무대의 실행" hidden></div>
 
   <section class="summary" id="summary" aria-label="실행 요약">
     <div class="summary-brief">
@@ -234,6 +239,7 @@
       <label class="field" for="f-pass"><span>통과 점수</span>
         <input id="f-pass" name="pass_score" type="number" min="50" max="100" step="1" value="80"></label>
     </div>
+    <p class="brief-note" id="briefProfileNote" hidden>회사 프로필이 아직 다 채워지지 않았어요. <a href="#/brand" id="briefProfileLink">브랜드·자료</a>에서 회사·고객·팀·톤을 적어 두면 모든 초안이 같은 사실과 브랜드 규칙을 따라요.</p>
     <p class="form-error" id="briefError" role="alert" hidden></p>
     <footer class="sheet-foot">
       <button type="button" class="btn" id="briefCancel">취소</button>
@@ -262,6 +268,7 @@
 <script src="js/calendar.js"></script>
 <script src="js/brand.js"></script>
 <script src="js/usage.js"></script>
+<script src="js/runs.js"></script>
 <script src="js/shell.js"></script>
 </body>
 </html>

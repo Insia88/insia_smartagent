@@ -216,7 +216,7 @@ def test_run_is_persisted_listed_and_linked_to_items(srv):
     assert detail["plan"] and detail["research"] and detail["resumable"] is False
     assert detail["options"]["doc_ids"] == []
     runs = ok(srv, "GET", "/api/runs?kind=pipeline&status=completed")["runs"]
-    assert runs[0]["run_id"] == run_id and runs[0]["active"] is False
+    assert runs[0]["run_id"] == run_id and runs[0]["active"] is False and runs[0]["resumable"] is False
     assert ok(srv, "GET", "/api/runs?status=failed")["runs"] == []
     resp, _ = request(srv, "GET", "/api/runs?status=bogus")
     assert resp.status == 400
@@ -274,6 +274,8 @@ def test_resume_interrupted_run_keeps_run_id_and_streams_across_the_interruption
     assert srv.manager.interrupted_on_start == 1
     detail = ok(srv, "GET", f"/api/runs/{run_id}")
     assert detail["status"] == "interrupted" and detail["resumable"] is True
+    listed = ok(srv, "GET", "/api/runs")["runs"]
+    assert [(r["run_id"], r["status"], r["resumable"]) for r in listed] == [(run_id, "interrupted", True)]  # the studio's 이어서 실행
     stored = read_sse(srv, f"/api/runs/{run_id}/events")
     assert [e["type"] for e in stored] == ["run.started", "run.failed"]
     assert stored[-1]["data"]["interrupted"] is True
@@ -624,6 +626,7 @@ def test_usage_summary_with_budget(servers, settings):
     assert usage["budget_usd"] == 3.5 and usage["currency"] == "USD" and usage["total_usd"] == 0
     entry = next(r for r in usage["runs"] if r["run_id"] == run_id)
     assert entry["calls"] > 0 and entry["started_at"] and entry["status"] == "completed"
+    assert entry["mode"] == "mock"  # the dashboard explains why mock runs cost $0
     assert usage["by_day"] and usage["by_task"]
     assert ok(srv, "GET", "/api/health")["budget_usd"] == 3.5
     resp, data = request(srv, "GET", "/api/usage?since=last-week")
@@ -772,3 +775,25 @@ def test_run_manager_keeps_legacy_constructor(settings):
         assert manager.max_live == manager.max_mock == 3 and manager.list() == []
     finally:
         manager.shutdown()
+
+
+def test_resumable_flag_in_run_list_for_stopped_and_partial_runs(srv):
+    ws = srv.manager.workspace
+    brief = Brief(topic="목록의 이어서 실행", channels=["linkedin", "instagram"])
+    ws.create_run("20260928-000001-aaaa", brief, kind="pipeline", mode="mock", model="mock")
+    ws.update_run("20260928-000001-aaaa", status="cancelled")
+    ws.create_run("20260928-000002-bbbb", brief, kind="review", mode="mock", model="mock")
+    ws.update_run("20260928-000002-bbbb", status="failed")
+    ws.create_run("20260928-000003-cccc", brief, kind="pipeline", mode="mock", model="mock")
+    ws.update_run("20260928-000003-cccc", status="completed")  # finished without any channel item
+    rows = {r["run_id"]: r["resumable"] for r in ok(srv, "GET", "/api/runs")["runs"]}
+    assert rows == {"20260928-000001-aaaa": True, "20260928-000002-bbbb": False, "20260928-000003-cccc": True}
+    assert ok(srv, "GET", "/api/runs/20260928-000003-cccc")["resumable"] is True
+
+
+def test_port_in_use_raises_oserror_without_a_cleanup_traceback(srv, settings, caplog):
+    other = replace(settings, home=settings.home.parent / "other-workspace")
+    with caplog.at_level("ERROR", logger="insia_agents.server"):
+        with pytest.raises(OSError):
+            make_server(other, host="127.0.0.1", port=srv.server_address[1])
+    assert not [r for r in caplog.records if "작업 정리" in r.getMessage()]
