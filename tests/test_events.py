@@ -110,3 +110,39 @@ def test_jsonl_sink_and_trace(tmp_path):
     assert trace["version"] == 1 and trace["meta"]["title"] == "t" and len(trace["events"]) == 2
     (tmp_path / "trace.json").write_text(json.dumps(trace), encoding="utf-8")
     assert load_trace(tmp_path / "trace.json")["events"][1]["type"] == "run.failed"
+
+
+def test_continue_from_keeps_one_numbering(tmp_path):
+    clock = SimClock(0)
+    bus = EventBus("r", clock=clock, start_seq=5, start_t=12.5)
+    assert bus.first_seq == 6
+    first = bus.emit("run.started", "system", {})
+    assert first["seq"] == 6 and first["t"] == 12.5
+    clock.advance(2)
+    assert bus.emit("log", "system", {"level": "info", "message": "x"})["t"] == 14.5
+    assert bus.last_seq() == 7 and len(bus) == 2
+    stream = bus.subscribe(after_seq=6, heartbeat=0.01)
+    assert next(stream)["seq"] == 7  # after_seq is a global seq, not an index into this bus
+    bus.close()
+    assert list(stream) == []
+    with pytest.raises(RuntimeError):
+        bus.continue_from(10, 0.0)  # only before the first event
+    fresh = EventBus("r2", clock=SimClock(0))
+    fresh.continue_from(3, 1.0)
+    assert fresh.emit("log", "system", {})["seq"] == 4
+
+
+def test_remove_listener_and_append_sink(tmp_path):
+    seen = []
+    bus = EventBus("r", clock=SimClock(0))
+    bus.add_listener(seen.append)
+    bus.emit("log", "system", {"message": "1"})
+    bus.remove_listener(seen.append)
+    bus.remove_listener(seen.append)  # removing twice is harmless
+    bus.emit("log", "system", {"message": "2"})
+    assert [e["seq"] for e in seen] == [1]
+    path = tmp_path / "events.jsonl"
+    path.write_text('{"seq": 0}\n', encoding="utf-8")
+    bus.attach_sink(path, append=True)
+    bus.detach_sink()
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 3  # kept the old line, added both events

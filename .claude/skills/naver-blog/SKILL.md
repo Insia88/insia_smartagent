@@ -22,6 +22,7 @@ argument-hint: "[주제 또는 brief.json 경로] [메인 키워드(선택)]"
 - 글이면 Brief를 채운다. `keywords[0]`이 메인 키워드다. 사용자가 키워드를 주지 않았으면 주제에서 검색량이 있을 법한 2~4어절 표현을 고르고 `plan.md`에 가정으로 적는다.
 - 주제를 알 수 없을 때만 질문한다(최대 3개): ① 주제 ② 메인 키워드 ③ 읽을 사람과 글을 읽고 할 행동(문의, 이웃추가 등).
 - `outputs/<YYYY-MM-DD>-<slug>/brief.json` 저장.
+- 이어서 `.claude/skills/content-studio/SKILL.md` 1-1단계대로 워크스페이스의 회사 프로필(`profile.json`)과 사용자 자료(`documents.json`)를 가져온다. 명령이 실패하면 핵심 사실 3가지만 묻고 진행한다. 프로필이 있으면 브랜드 톤, 기본 CTA·문의처(마무리), 기본 해시태그(태그 목록 앞쪽), 필수 문구를 쓰고 금지 표현은 쓰지 않는다.
 
 ## 2. 계획과 리서치
 
@@ -44,18 +45,21 @@ python -m insia_agents check <run>/drafts/naver_blog.r0.json
 # 설치 전이면: PYTHONPATH=src python -m insia_agents check <run>/drafts/naver_blog.r0.json
 ```
 
-제목 키워드 검사는 브리프가 있어야 돌므로, 점수 확정 단계(`finalize_review`, content-studio 5단계 명령)에서 최종 확인한다.
+`check`는 가까운 `brief.json`을 자동으로 찾는다(또는 `--brief <run>/brief.json`). `profile.json`이 있으면 금지 표현·필수 문구·블라인드 검사까지 도는 content-studio 4단계의 프로필 포함 명령을 쓴다.
+
+제목 키워드 검사도 이 단계에서 이미 돈다(`check`가 가까운 `brief.json`을 찾아 `keywords[0]`을 확인함). 점수 확정 단계(`finalize_review`, content-studio 5단계 명령)에서 한 번 더 확인된다.
 
 ## 4. 검수와 수정 (최대 2회)
 
-1. `reviewer`에게 채널 `naver_blog`, round, 초안·`research.json`·`brief.json`·가이드 경로를 넘긴다. Review JSON을 `reviews/naver_blog.r<N>.json`에 저장하고 `finalize_review`로 확정한다.
+1. `reviewer`에게 채널 `naver_blog`, round, 초안·`research.json`·`brief.json`·(있으면) `profile.json`·가이드 경로를 넘긴다. Review JSON을 `reviews/naver_blog.r<N>.json`에 저장하고 `finalize_review`로 확정한다.
 2. 통과 = 80점 이상 + critical 0개. 미통과면 critical·major를 모두 고치고 `round + 1`로 저장, `change_log`에 이슈별 한 줄.
 3. 2회 뒤에도 미통과면 최고 점수 round를 최종본으로, 미통과로 표시한다.
 
 ## 5. 최종 패키지와 보고
 
 - `final/naver_blog.md`(제목, 본문, 태그), `final/summary.md`(요약 표, 모든 출처, 확인 사항, 승인 체크리스트).
-- 사용자에게: `| 채널 | 점수 | 라운드 | 통과 여부 |` 표, 실행 폴더 경로, 채울 것 3가지 이내, 승인 체크리스트.
+- `python -m insia_agents import-run <run>`으로 워크스페이스 보관함에 가져온다(로컬 저장, 게시 아님). 실패하면 오류를 한 줄로 전하고 나중에 같은 명령으로 가져올 수 있다고 안내한다.
+- 사용자에게: `| 채널 | 점수 | 라운드 | 통과 여부 |` 표, 실행 폴더 경로, 보관함 가져오기 결과, 채울 것 3가지 이내, 승인 체크리스트.
 
 사람 최종 승인 체크리스트 (블로그)
 - [ ] `[대표 경험 추가]` 같은 자리표시를 실제 경험으로 채우거나 지웠다

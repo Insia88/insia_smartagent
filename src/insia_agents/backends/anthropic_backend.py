@@ -500,6 +500,21 @@ def attach_user_sources(pack: ResearchPack, user: list[Source]) -> ResearchPack:
 # ---------------------------------------------------------------------------
 
 
+def _text_block(text: str, *, cache: bool = False) -> dict[str, Any]:
+    block: dict[str, Any] = {"type": "text", "text": text}
+    if cache:
+        block["cache_control"] = {"type": "ephemeral"}
+    return block
+
+
+def _history_rows(history: list[ContentItem]) -> list[dict[str, str]]:
+    rows = []
+    for item in history[:HISTORY_IN_PROMPT]:
+        when = (item.published_at or item.scheduled_at or item.updated_at or item.created_at or "")[:10]
+        rows.append({"date": when, "channel": item.channel, "status": item.status, "title": item.title})
+    return rows
+
+
 class AnthropicBackend:
     name = "live"
 
@@ -507,6 +522,9 @@ class AnthropicBackend:
         self.settings = settings
         self.model = settings.model
         self.on_notice: NoticeFn | None = None
+        self.on_usage: UsageFn | None = None
+        self.context = RunContext(today=settings.today)
+        self._unpriced: set[str] = set()
         if client is None:
             import anthropic
 
@@ -518,29 +536,48 @@ class AnthropicBackend:
                 ) from exc
         self._client = client
 
+    @property
+    def today(self) -> str:
+        return (self.context.today if self.context is not None else "") or self.settings.today
+
     # -- request construction -------------------------------------------------
     def system_blocks(self, role: str, channel: ChannelId | None = None) -> list[dict[str, Any]]:
-        blocks: list[dict[str, Any]] = [{"type": "text", "text": agent_prompt(role), "cache_control": {"type": "ephemeral"}}]
+        """Stable, cached system prompt: agent prompt (+ channel guide). Never
+        contains per-run data, so it hits the cache across runs."""
+        blocks: list[dict[str, Any]] = [_text_block(agent_prompt(role), cache=True)]
         if channel is not None:
             label = CHANNELS[channel].label
-            blocks.append({"type": "text", "text": f"# 채널 가이드 — {label} (`{channel}`)\n\n{channel_guide(channel)}",
-                           "cache_control": {"type": "ephemeral"}})
+            blocks.append(_text_block(f"# 채널 가이드 — {label} (`{channel}`)\n\n{channel_guide(channel)}", cache=True))
         return blocks
 
+    def profile_blocks(self, channel: ChannelId | None = None, *, profile: Profile | None = None,
+                       include_names: bool | None = None, include_contact: bool = True) -> list[dict[str, Any]]:
+        """The company-profile block (first user-content block, own cache
+        breakpoint) or ``[]`` when there is no profile."""
+        if profile is None and self.context is not None:
+            profile = self.context.profile
+        text = render_profile(profile, channel=channel, include_names=include_names, include_contact=include_contact)
+        return [_text_block(text, cache=True)] if text else []
+
     def compose(self, task: str, payload: dict[str, Any], instruction: str) -> str:
-        body = {"task": task, "today": self.settings.today, **payload}
+        body = {"task": task, "today": self.today, **payload}
         return f"작업: {task}\n\n{instruction}\n\n입력(JSON):\n```json\n{json.dumps(body, ensure_ascii=False, indent=1)}\n```"
 
     def build_request(self, *, role: str, system: list[dict[str, Any]], user_text: str, max_tokens: int,
-                      schema_model: type[BaseModel] | None = None, tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                      schema_model: type[BaseModel] | None = None, tools: list[dict[str, Any]] | None = None,
+                      context: list[dict[str, Any]] | None = None, after: list[dict[str, Any]] | None = None,
+                      ) -> dict[str, Any]:
+        """One request. User content = ``context`` blocks (profile, documents)
+        + the task text + ``after`` blocks (human instructions)."""
         output_config: dict[str, Any] = {"effort": self.settings.effort[role]}
         if schema_model is not None:
             output_config["format"] = json_format(schema_model)
+        content = [*(context or []), _text_block(user_text), *(after or [])]
         request: dict[str, Any] = {
             "model": self.model,
             "max_tokens": max_tokens,
             "system": system,
-            "messages": [{"role": "user", "content": user_text}],
+            "messages": [{"role": "user", "content": content}],
             "thinking": {"type": "adaptive"},
             "output_config": output_config,
         }
@@ -565,7 +602,27 @@ class AnthropicBackend:
             except Exception:
                 pass
 
-    def stream_call(self, request: dict[str, Any], *, agent: str, on_event: Callable[[Any], None] | None = None,
+    def _record_usage(self, message: Any, *, agent: str, task: str) -> None:
+        """Price one response and hand it to ``on_usage`` (see ``Backend``)."""
+        if self.on_usage is None:
+            return
+        prices, web = load_prices(home=self.settings.home)
+        record = usage_from_response(message, agent=agent, task=task, model=self.model,
+                                     prices=prices, web_search_per_1k=web)
+        if price_for(record.model, prices=prices) is None and record.model not in self._unpriced:
+            self._unpriced.add(record.model)
+            self._notice("system", "warn",
+                         f"{record.model} 모델의 가격 정보가 없어 비용을 0달러로 기록해요. 워크스페이스의 prices.json이나 "
+                         f"INSIA_PRICE_{env_key(record.model)}_INPUT·_OUTPUT 환경 변수로 가격을 넣어 주세요.")
+        try:
+            self.on_usage(record)
+        except BackendError:
+            raise
+        except Exception as exc:  # a broken recorder must not fail the run
+            self._notice("system", "warn", f"사용량 기록 중 오류가 나서 이번 호출 비용을 저장하지 못했어요: {exc}")
+
+    def stream_call(self, request: dict[str, Any], *, agent: str, task: str = "",
+                    on_event: Callable[[Any], None] | None = None,
                     after_turn: Callable[[Any], None] | None = None) -> list[Any]:
         """Run one logical call; returns every assistant turn (``pause_turn`` resumes included)."""
         import anthropic
@@ -595,6 +652,7 @@ class AnthropicBackend:
                 if "authentication" in str(exc).lower():  # the SDK raises this when no credentials resolve
                     raise AuthError(CREDENTIALS_HINT, kind="credentials") from exc
                 raise
+            self._record_usage(message, agent=agent, task=task or agent)  # billed even when refused or truncated
             turns.append(message)
             stop = _get(message, "stop_reason")
             if stop == "refusal":  # check before reading any content
@@ -623,18 +681,29 @@ class AnthropicBackend:
         if any(_type(it) == "fallback_message" for it in (iterations or [])):
             self._notice(agent, "warn", f"안전 분류기가 요청을 거절해 {_get(message, 'model', '대체 모델')} 모델이 대신 응답했어요")
 
-    def structured_call(self, request: dict[str, Any], model_cls: type[BaseModel], *, agent: str) -> BaseModel:
-        turns = self.stream_call(request, agent=agent)
+    def structured_call(self, request: dict[str, Any], model_cls: type[BaseModel], *, agent: str,
+                        task: str = "") -> BaseModel:
+        turns = self.stream_call(request, agent=agent, task=task)
         return parse_json_output(message_text(turns), model_cls)
 
     # -- Backend protocol ---------------------------------------------------------
+    def _documents_overview(self) -> list[dict[str, Any]]:
+        docs = self.context.documents if self.context is not None else []
+        return [{"doc_id": d.id, "title": d.title, "chars": len(d.text or "")} for d in docs if (d.text or "").strip()][:30]
+
     def plan(self, brief: Brief) -> Plan:
+        payload: dict[str, Any] = {"brief": brief.model_dump(mode="json")}
+        overview = self._documents_overview()
+        if overview:
+            payload["user_materials"] = overview
+        context = self.profile_blocks(None, include_names="bizplan" not in brief.channels)
+        instruction = PLAN_INSTRUCTION + (PLAN_CONTEXT if context or overview else "")
         request = self.build_request(
             role="orchestrator", system=self.system_blocks("orchestrator"),
-            user_text=self.compose("plan", {"brief": brief.model_dump(mode="json")}, PLAN_INSTRUCTION),
+            user_text=self.compose("plan", payload, instruction), context=context,
             schema_model=Plan, max_tokens=MAX_TOKENS["plan"],
         )
-        plan = self.structured_call(request, Plan, agent="orchestrator")
+        plan = self.structured_call(request, Plan, agent="orchestrator", task="plan")
         assert isinstance(plan, Plan)
         wanted = set(brief.channels)
         return plan.model_copy(update={"outlines": [o for o in plan.outlines if o.channel in wanted]})
@@ -642,29 +711,49 @@ class AnthropicBackend:
     def research(self, brief: Brief, questions: list[ResearchQuestion], emit: EmitFn,
                  existing: ResearchPack | None = None) -> ResearchPack:
         system = self.system_blocks("researcher")
+        context = self.profile_blocks(None, include_names=False, include_contact=False)
         payload: dict[str, Any] = {"brief": brief.model_dump(mode="json"), "questions": [q.model_dump(mode="json") for q in questions]}
-        if existing is not None:
+        next_s, next_f = next_ids(existing)
+        excerpts, mine = [], []
+        if existing is None:  # user materials enter the first pack only; follow-ups reuse their ids
+            excerpts, notice = budget_documents(list(self.context.documents) if self.context else [],
+                                                self.settings.max_document_chars)
+            if notice:
+                self._notice("researcher", "warn", notice)
+            mine = user_sources(excerpts, next_s, self.today)
+            if mine:
+                payload["user_materials"] = [{"source_id": s.id, "doc_id": e.document.id, "title": s.title,
+                                              "chars_sent": len(e.text)} for s, e in zip(mine, excerpts)]
+        else:
             payload["followup"] = True
             payload["existing_sources"] = [{"id": s.id, "url": s.url, "title": s.title} for s in existing.sources]
         search_request = self.build_request(
-            role="researcher", system=system, user_text=self.compose("research", payload, SEARCH_INSTRUCTION),
+            role="researcher", system=system, context=context,
+            user_text=self.compose("research", payload, SEARCH_INSTRUCTION + (SEARCH_USER_MATERIALS if mine else "")),
             tools=self.research_tools(), max_tokens=MAX_TOKENS["search"],
         )
         watcher = _SearchWatcher(questions, emit)
-        turns = self.stream_call(search_request, agent="researcher", on_event=watcher,
+        turns = self.stream_call(search_request, agent="researcher", task="research", on_event=watcher,
                                  after_turn=lambda m: watcher.scan(_get(m, "content", [])))
 
         emit("agent.status", {"status": "writing", "message": "조사 메모를 리서치 팩으로 정리하는 중이에요"})
-        next_s, next_f = next_ids(existing)
         notes = collect_research_notes(turns)
-        structure_payload = {**payload, "notes": notes, "id_start": {"source": f"s{next_s}", "finding": f"f{next_f}"}}
+        structure_payload: dict[str, Any] = {**payload, "notes": notes,
+                                             "id_start": {"source": f"s{next_s + len(mine)}", "finding": f"f{next_f}"}}
+        if mine:
+            structure_payload["user_sources"] = [s.model_dump(mode="json") for s in mine]
+        documents = render_documents(excerpts, mine)
         structure_request = self.build_request(
-            role="researcher", system=system, user_text=self.compose("research_pack", structure_payload, STRUCTURE_INSTRUCTION),
+            role="researcher", system=system,
+            context=[*context, *([_text_block(documents)] if documents else [])],
+            user_text=self.compose("research_pack", structure_payload,
+                                   STRUCTURE_INSTRUCTION + (STRUCTURE_USER_MATERIALS if mine else "")),
             schema_model=ResearchPack, max_tokens=MAX_TOKENS["structure"],
         )
-        pack = self.structured_call(structure_request, ResearchPack, agent="researcher")
+        pack = self.structured_call(structure_request, ResearchPack, agent="researcher", task="research")
         assert isinstance(pack, ResearchPack)
-        allowed = grounded_url_keys(turns)
+        pack = attach_user_sources(pack, mine)
+        allowed = grounded_url_keys(turns) | {url_key(s.url) for s in mine}
         if existing is not None:
             allowed |= {url_key(s.url) for s in existing.sources}
         pack, dropped = drop_ungrounded_sources(pack, allowed)
@@ -680,11 +769,11 @@ class AnthropicBackend:
         payload = {"channel": channel, "round": 0, "brief": brief.model_dump(mode="json"),
                    "plan": plan.model_dump(mode="json"), "research": research.model_dump(mode="json")}
         request = self.build_request(
-            role="orchestrator", system=self.system_blocks("orchestrator", channel),
+            role="orchestrator", system=self.system_blocks("orchestrator", channel), context=self.profile_blocks(channel),
             user_text=self.compose("draft", payload, DRAFT_INSTRUCTION),
             schema_model=Draft, max_tokens=self._draft_tokens(channel),
         )
-        draft = self.structured_call(request, Draft, agent="orchestrator")
+        draft = self.structured_call(request, Draft, agent="orchestrator", task="draft")
         assert isinstance(draft, Draft)
         return draft.model_copy(update={"channel": channel, "round": 0})
 
@@ -692,23 +781,49 @@ class AnthropicBackend:
         payload = {"brief": brief.model_dump(mode="json"), "research": research.model_dump(mode="json"),
                    "draft": draft.model_dump(mode="json"), "format_checks": [c.model_dump(mode="json") for c in format_checks]}
         request = self.build_request(
-            role="reviewer", system=self.system_blocks("reviewer", draft.channel),
+            role="reviewer", system=self.system_blocks("reviewer", draft.channel), context=self.profile_blocks(draft.channel),
             user_text=self.compose("review", payload, REVIEW_INSTRUCTION),
             schema_model=Review, max_tokens=MAX_TOKENS["review"],
         )
-        review = self.structured_call(request, Review, agent="reviewer")
+        review = self.structured_call(request, Review, agent="reviewer", task="review")
         assert isinstance(review, Review)
         return review.model_copy(update={"channel": draft.channel, "round": draft.round, "format_checks": list(format_checks)})
 
-    def revise(self, brief: Brief, plan: Plan, research: ResearchPack, draft: Draft, review: Review) -> Draft:
+    def revise(self, brief: Brief, plan: Plan, research: ResearchPack, draft: Draft, review: Review,
+               instructions: str = "") -> Draft:
+        human = (instructions or (self.context.instructions if self.context is not None else "") or "").strip()
         payload = {"channel": draft.channel, "round": draft.round + 1, "brief": brief.model_dump(mode="json"),
                    "plan": plan.model_dump(mode="json"), "research": research.model_dump(mode="json"),
                    "draft": draft.model_dump(mode="json"), "review": review.model_dump(mode="json")}
+        after = [_text_block(f"# {HUMAN_INSTRUCTIONS_TITLE}\n\n{human}")] if human else []
         request = self.build_request(
             role="orchestrator", system=self.system_blocks("orchestrator", draft.channel),
-            user_text=self.compose("revise", payload, REVISE_INSTRUCTION),
+            context=self.profile_blocks(draft.channel), after=after,
+            user_text=self.compose("revise", payload, REVISE_INSTRUCTION + (REVISE_HUMAN if human else "")),
             schema_model=Draft, max_tokens=self._draft_tokens(draft.channel),
         )
-        revised = self.structured_call(request, Draft, agent="orchestrator")
+        revised = self.structured_call(request, Draft, agent="orchestrator", task="revise")
         assert isinstance(revised, Draft)
         return revised.model_copy(update={"channel": draft.channel, "round": draft.round + 1})
+
+    def plan_calendar(self, profile: Profile, theme: str, start: str, end: str, counts: dict[str, int],
+                      history: list[ContentItem]) -> ContentPlan:
+        days = slot_days(start, end)
+        capped, _ = cap_counts(normalize_counts(counts), len(days))
+        payload = {
+            "theme": theme.strip(),
+            "start": start,
+            "end": end,
+            "counts": dict(capped),
+            "available_days": [{"date": d, "weekday": weekday_label(d)} for d in days],
+            "history": _history_rows(history),
+        }
+        request = self.build_request(
+            role="orchestrator", system=[_text_block(agent_prompt(PLANNER_PROMPT), cache=True)],
+            context=self.profile_blocks(None, profile=profile or Profile(), include_names=False),
+            user_text=self.compose("plan_calendar", payload, CALENDAR_INSTRUCTION),
+            schema_model=ContentPlan, max_tokens=MAX_TOKENS["plan_calendar"],
+        )
+        plan = self.structured_call(request, ContentPlan, agent="orchestrator", task="plan_calendar")
+        assert isinstance(plan, ContentPlan)
+        return normalize_plan(plan, start, end, capped)

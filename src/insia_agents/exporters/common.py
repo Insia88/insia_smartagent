@@ -360,10 +360,11 @@ class Segment:
 
 _BOLD = re.compile(r"\*\*(.+?)\*\*")
 # URLs, or bracketed fill-in placeholders such as [대표자 성명] / [확인 필요: …] / [○].
-# Citations like [s12] and markdown links [text](url) are not placeholders.
+# Citations like [s12], document labels like [별첨 1] and markdown links
+# [text](url) are not placeholders.
 _INLINE = re.compile(
     r"(?P<url>https?://[^\s<>\"'「」]+)"
-    r"|(?P<ph>\[(?!s\d+\])[^\[\]\n]{1,80}\](?!\())"
+    r"|(?P<ph>\[(?!s\d+\])(?!\s*(?:별첨|붙임|첨부|참고|표|그림)\s*\d)[^\[\]\n]{1,80}\](?!\())"
 )
 _URL_TRAIL = ".,;:!?)」』]>"
 

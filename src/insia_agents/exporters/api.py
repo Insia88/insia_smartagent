@@ -242,28 +242,38 @@ def _run_profile(workspace: Any, run: dict) -> Profile | None:
 
 
 def _run_details(workspace: Any, run_id: str, run: dict) -> list[ContentItemDetail]:
+    """The run's content items: ``run["items"]`` ({channel: item id}, from
+    ``Workspace.get_run``), items listed with this ``run_id``, the pipeline ids
+    ``it_<run_id>_<channel>`` and, for item jobs, ``parent_item_id``."""
     ids: list[str] = []
+
+    def add(item_id: Any) -> None:
+        if isinstance(item_id, str) and item_id and item_id not in ids:
+            ids.append(item_id)
+
+    linked = run.get("items")
+    if isinstance(linked, dict):
+        for item_id in linked.values():
+            add(item_id)
     try:
-        items = workspace.list_items(limit=10_000)
-    except TypeError:
+        items = workspace.list_items(limit=5000)
+    except (TypeError, ValueError):
         items = workspace.list_items()
     for item in items or []:
         item = _as_dict(item)
-        item_id = item.get("id") if isinstance(item, dict) else getattr(item, "id", "")
-        item_run = item.get("run_id") if isinstance(item, dict) else getattr(item, "run_id", "")
-        if item_id and item_run == run_id and item_id not in ids:
-            ids.append(item_id)
+        if isinstance(item, dict) and item.get("run_id") == run_id:
+            add(item.get("id"))
     for channel in ALL_CHANNELS:
-        candidate = f"it_{run_id}_{channel}"
-        if candidate not in ids:
-            ids.append(candidate)
-    parent = run.get("parent_item_id") or ""
-    if parent and parent not in ids:
-        ids.append(parent)
+        add(f"it_{run_id}_{channel}")
+    add(run.get("parent_item_id"))
 
     details: list[ContentItemDetail] = []
     for item_id in ids:
-        detail = _model(ContentItemDetail, workspace.get_item(item_id))
+        try:
+            found = workspace.get_item(item_id)
+        except (LookupError, ValueError):  # e.g. a not-found error instead of None
+            continue
+        detail = _model(ContentItemDetail, found)
         if detail is not None and detail.versions:
             details.append(detail)
     order = {channel: index for index, channel in enumerate(ALL_CHANNELS)}

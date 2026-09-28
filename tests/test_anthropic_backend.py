@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -65,6 +66,13 @@ def pack() -> ResearchPack:
     )
 
 
+def user_text(call: dict) -> str:
+    """All text of the first user message (content is a list of text blocks)."""
+    content = call["messages"][0]["content"]
+    assert isinstance(content, list) and all(b["type"] == "text" for b in content)
+    return "\n".join(b["text"] for b in content)
+
+
 def _assert_common(call: dict, *, effort: str, schema_model=None) -> None:
     assert call["model"] == "claude-opus-5"
     assert call["thinking"] == {"type": "adaptive"}
@@ -81,7 +89,9 @@ def _assert_common(call: dict, *, effort: str, schema_model=None) -> None:
     assert all(k not in call for k in ("temperature", "top_p", "top_k", "budget_tokens"))
     # prompt caching on the stable system prompt
     assert call["system"][-1]["cache_control"] == {"type": "ephemeral"}
-    assert "today" in call["messages"][0]["content"]
+    assert '"today": "2026-09-28"' in user_text(call)
+    # per-run context never goes into the cached system prompt
+    assert all("회사 프로필" not in b["text"] and "사용자 제공 자료" not in b["text"] for b in call["system"])
 
 
 def test_plan_request_shape(settings, prompts_dir, brief, plan):
@@ -148,8 +158,8 @@ def test_research_uses_server_tools_then_structured_call(settings, prompts_dir, 
     # conversion: tool-less structured output built from the collected notes
     _assert_common(convert, effort="medium", schema_model=ResearchPack)
     assert "tools" not in convert
-    assert "https://www.mss.go.kr/a" in convert["messages"][0]["content"]
-    assert "실태조사 원문" in convert["messages"][0]["content"]
+    assert "https://www.mss.go.kr/a" in user_text(convert)
+    assert "실태조사 원문" in user_text(convert)
     # the search was surfaced once (stream event + final-message scan are de-duplicated)
     queries = [d for t, d in emitted if t == "research.query"]
     assert queries == [{"question_id": "q1", "query": "소상공인 사업체 수 2024"}]
@@ -160,9 +170,9 @@ def test_followup_research_passes_existing_ids(settings, prompts_dir, brief, pla
     client = FakeClient([message([text("메모")]), message([json_text(ResearchPack(findings=[], sources=[], gaps=["없음"]))])])
     backend = AnthropicBackend(settings, client=client)
     backend.research(brief, plan.questions, lambda t, d: None, existing=pack)
-    content = client.calls[1]["messages"][0]["content"]
+    content = user_text(client.calls[1])
     assert '"source": "s2"' in content and '"finding": "f2"' in content
-    assert "https://www.mss.go.kr/a" in client.calls[0]["messages"][0]["content"]
+    assert "https://www.mss.go.kr/a" in user_text(client.calls[0])
 
 
 def test_draft_review_revise_shapes(settings, prompts_dir, brief, plan, pack):
@@ -354,3 +364,360 @@ def test_followup_research_keeps_existing_source_urls(settings, prompts_dir, bri
 def test_drop_ungrounded_sources_is_a_noop_when_all_grounded(pack):
     same, dropped = drop_ungrounded_sources(pack, {"mss.go.kr/a"})
     assert same is pack and dropped == []
+
+
+# ---------------------------------------------------------------------------
+# Run context: profile, user documents, human instructions
+# ---------------------------------------------------------------------------
+
+from insia_agents.backends.anthropic_backend import attach_user_sources, grounded_url_keys, url_key  # noqa: E402
+from insia_agents.backends.base import BackendError, RunContext  # noqa: E402
+from insia_agents.models import ContentItem, ContentPlan, PlannedSlot, Profile, TeamMember, UserDocument  # noqa: E402
+
+
+@pytest.fixture
+def profile() -> Profile:
+    return Profile(
+        company_name="인시아랩", service_name="INSIA", one_liner="1인 창업자를 위한 AI 콘텐츠 비서",
+        target_customers="1인 창업자", traction=["베타 사용자 120명(2026-08 기준)"],
+        team=[TeamMember(role="대표", name="김철수", background="마케팅 10년"),
+              TeamMember(role="개발", name="이영희", background="백엔드 7년")],
+        tone="친근한 전문가", banned_words=["완벽한"], required_phrases=["#광고아님"], default_hashtags=["#INSIA"],
+        cta="프로필 링크에서 무료 체험", contact="hello@insia.kr", linkedin_url="https://linkedin.com/company/insia",
+        brand_colors=["#6D5EF5"],
+    )
+
+
+def usage_message(content, *, stop_reason="end_turn", model="claude-opus-5", input_tokens=1000, output_tokens=500,
+                  cache_read=0, cache_write=0, searches=0):
+    return SimpleNamespace(
+        content=content, stop_reason=stop_reason, model=model, stop_details=None, _request_id="req_u",
+        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens, cache_read_input_tokens=cache_read,
+                              cache_creation_input_tokens=cache_write, iterations=None,
+                              server_tool_use=SimpleNamespace(web_search_requests=searches)),
+    )
+
+
+def blocks(call: dict) -> list[dict]:
+    return call["messages"][0]["content"]
+
+
+def breakpoints(call: dict) -> int:
+    marked = [b for b in call["system"] if "cache_control" in b]
+    for message_ in call["messages"]:
+        content = message_["content"]
+        if isinstance(content, list):
+            marked += [b for b in content if isinstance(b, dict) and "cache_control" in b]
+    return len(marked)
+
+
+def test_research_with_profile_and_documents(settings, prompts_dir, brief, plan, profile):
+    long_text = "INSIA는 1인 창업자를 위한 서비스다. " * 200  # ~4,400 chars
+    docs = [UserDocument(id="u1", title="회사 소개서", text=long_text), UserDocument(id="u2", title="IR 메모", text="베타 사용자 120명.")]
+    memo = text("q1: 공식 통계 https://kosis.kr/a 확인")
+    structured = ResearchPack(
+        findings=[
+            Finding(id="f1", question_id="q1", claim="베타 사용자 120명", source_ids=["s1"], confidence="medium"),
+            Finding(id="f2", question_id="q1", claim="회사 설립 2026년", source_ids=["s9"], confidence="medium"),
+            Finding(id="f3", question_id="q1", claim="공식 통계", source_ids=["s2"], confidence="high"),
+        ],
+        sources=[
+            Source(id="s9", title="회사 소개서(모델 사본)", url="user://u1", tier=2),  # the model's copy of a user source
+            Source(id="s2", title="KOSIS", url="https://kosis.kr/a", tier=1, origin="user"),  # reuses a reserved id
+            Source(id="s4", title="지어낸 자료", url="user://u7", tier=1),  # a user document that does not exist
+        ],
+        gaps=[],
+    )
+    client = FakeClient([message([memo]), message([json_text(structured)])])
+    backend = AnthropicBackend(replace(settings, max_document_chars=1000), client=client)
+    backend.context = RunContext(profile=profile, documents=docs, today="2026-09-30")
+    notices = []
+    backend.on_notice = lambda agent, level, msg: notices.append((agent, level, msg))
+    pack = backend.research(brief, plan.questions, lambda t, d: None)
+
+    search, convert = client.calls
+    # cache: system blocks are byte-identical to a run without any context
+    assert search["system"] == backend.system_blocks("researcher") == convert["system"]
+    assert all(breakpoints(c) <= 4 for c in client.calls)
+    # search call: profile block (own breakpoint) + task text; only document titles, no names/contact
+    first, task = blocks(search)
+    assert first["text"].startswith("# 회사 프로필 (사용자 제공 사실)") and first["cache_control"] == {"type": "ephemeral"}
+    assert "김철수" not in first["text"] and "hello@insia.kr" not in first["text"] and "대표 — 마케팅 10년" in first["text"]
+    assert "cache_control" not in task and '"today": "2026-09-30"' in task["text"]
+    assert '"user_materials"' in task["text"] and "회사 소개서" in task["text"] and long_text[:200] not in task["text"]
+    # structuring call: profile, documents (no breakpoint: sent once), task
+    prof, docs_block, task2 = blocks(convert)
+    assert prof == first
+    assert "cache_control" not in docs_block and "cache_control" not in task2
+    assert '<document source_id="s1" doc_id="u1" title="회사 소개서">' in docs_block["text"]
+    assert '<document source_id="s2" doc_id="u2" title="IR 메모">' in docs_block["text"]
+    assert "앞 " in docs_block["text"] and "자만 보냈음" in docs_block["text"]
+    sent = sum(len(e) for e in re.findall(r'title="[^"]*">\n(.*?)\n</document>', docs_block["text"], re.S))
+    assert sent <= 1000
+    assert '"user_sources"' in task2["text"] and '"source": "s3"' in task2["text"]  # web ids start after user ids
+    # truncation is announced, never silent
+    assert any(agent == "researcher" and level == "warn" and "max_document_chars=1,000" in msg and "회사 소개서" in msg
+               for agent, level, msg in notices)
+    # canonical user sources first; the copy maps onto s1; the id clash is renamed; the invented doc is dropped
+    assert [(s.id, s.url, s.origin, s.tier, s.publisher) for s in pack.sources[:2]] == [
+        ("s1", "user://u1", "user", 1, "사용자 제공 자료"), ("s2", "user://u2", "user", 1, "사용자 제공 자료")]
+    kosis = next(s for s in pack.sources if s.url == "https://kosis.kr/a")
+    assert kosis.origin == "web" and kosis.id not in ("s1", "s2")
+    assert not any(s.url == "user://u7" for s in pack.sources)
+    assert [f.source_ids for f in pack.findings] == [["s1"], ["s1"], [kosis.id]]
+    assert any("user://u7" in msg for _, _, msg in notices)
+
+
+def test_followup_research_does_not_resend_documents(settings, prompts_dir, brief, plan, pack, profile):
+    docs = [UserDocument(id="u1", title="회사 소개서", text="자료 본문")]
+    client = FakeClient([message([text("메모")]), message([json_text(ResearchPack(findings=[], sources=[], gaps=[]))])])
+    backend = AnthropicBackend(settings, client=client)
+    backend.context = RunContext(profile=profile, documents=docs, today="2026-09-28")
+    backend.research(brief, plan.questions, lambda t, d: None, existing=pack)
+    assert all("자료 본문" not in user_text(c) and "user_materials" not in user_text(c) for c in client.calls)
+    assert len(blocks(client.calls[1])) == 2  # profile + task, no documents block
+
+
+def test_no_context_means_a_single_task_block(settings, prompts_dir, brief, plan):
+    client = FakeClient([message([json_text(plan)])])
+    AnthropicBackend(settings, client=client).plan(brief)
+    assert len(blocks(client.calls[0])) == 1 and "cache_control" not in blocks(client.calls[0])[0]
+
+
+def test_plan_lists_document_titles_only(settings, prompts_dir, brief, plan, profile):
+    client = FakeClient([message([json_text(plan)])])
+    backend = AnthropicBackend(settings, client=client)
+    backend.context = RunContext(profile=profile, documents=[UserDocument(id="u3", title="IR 자료", text="비밀 본문 " * 50)],
+                                 today="2026-09-28")
+    backend.plan(brief)  # brief includes bizplan → no team names
+    body = user_text(client.calls[0])
+    assert '"doc_id": "u3"' in body and "IR 자료" in body and "비밀 본문" not in body
+    assert "김철수" not in body and "회사 내부 사실은 리서치 질문으로 만들지 말고" in body
+
+
+def test_profile_block_follows_the_channel(settings, prompts_dir, brief, plan, pack, profile):
+    draft = Draft(channel="bizplan", round=0, title="t", content="# t")
+    review = Review(channel="linkedin", round=0, score=50, passed=False, rubric=[], issues=[], summary="s")
+    li = Draft(channel="linkedin", round=0, title="t", content="본문")
+    client = FakeClient([message([json_text(draft)]), message([json_text(review)]), message([json_text(li)]),
+                         message([json_text(li)])])
+    backend = AnthropicBackend(settings, client=client)
+    backend.context = RunContext(profile=profile, documents=[], today="2026-09-28", instructions="첫 문장을 더 짧게")
+    backend.draft(brief, plan, pack, "bizplan")
+    backend.review(brief, pack, li, [])
+    backend.revise(brief, plan, pack, li, review)                       # context.instructions
+    backend.revise(brief, plan, pack, li, review, instructions="표를 빼 주세요")  # kwarg wins
+
+    biz = blocks(client.calls[0])[0]["text"]
+    assert "김철수" not in biz and "이영희" not in biz and "실명·학교명·직장명은 쓰지 않음" in biz
+    assert "베타 사용자 120명(2026-08 기준)" in biz and "금지 표현" in biz
+    assert "기본 행동 유도" not in biz and "기본 해시태그" not in biz and "필수 문구" not in biz and "브랜드 색" not in biz
+    rev = blocks(client.calls[1])[0]["text"]
+    assert "대표 · 김철수" in rev and "프로필 링크에서 무료 체험" in rev and "#INSIA" in rev and "#광고아님" in rev
+    assert "링크드인 (본문에 링크를 넣지 않음)" in rev and "브랜드 색" not in rev
+    # reviewer and orchestrator share the same profile block bytes for a channel (cache reuse)
+    assert blocks(client.calls[2])[0] == blocks(client.calls[1])[0]
+    human = blocks(client.calls[2])[-1]["text"]
+    assert human == "# 사람의 수정 지시\n\n첫 문장을 더 짧게"
+    assert "[사람 지시]" in blocks(client.calls[2])[1]["text"]
+    assert blocks(client.calls[3])[-1]["text"].endswith("표를 빼 주세요")
+    assert all(breakpoints(c) <= 4 for c in client.calls)
+
+
+def test_revise_without_instructions_has_no_human_block(settings, prompts_dir, brief, plan, pack):
+    li = Draft(channel="linkedin", round=0, title="t", content="본문")
+    review = Review(channel="linkedin", round=0, score=50, passed=False, rubric=[], issues=[], summary="s")
+    client = FakeClient([message([json_text(li)])])
+    AnthropicBackend(settings, client=client).revise(brief, plan, pack, li, review)
+    assert "사람의 수정 지시" not in user_text(client.calls[0])
+
+
+# ---------------------------------------------------------------------------
+# Usage reporting
+# ---------------------------------------------------------------------------
+
+
+def test_usage_is_reported_after_every_response(settings, prompts_dir, brief, plan, pack):
+    search_use = SimpleNamespace(type="server_tool_use", id="srv_1", name="web_search", input={"query": "소상공인"})
+    paused = usage_message([search_use], stop_reason="pause_turn", input_tokens=2000, output_tokens=100, searches=3)
+    finished = usage_message([text("메모")], input_tokens=500, output_tokens=800, cache_read=4000, searches=1)
+    structured = usage_message([json_text(pack.model_copy(update={"sources": []}))], cache_write=3000)
+    client = FakeClient([paused, finished, structured])
+    records = []
+    backend = AnthropicBackend(settings, client=client)
+    backend.on_usage = records.append
+    backend.research(brief, plan.questions, lambda t, d: None)
+    assert [(r.agent, r.task) for r in records] == [("researcher", "research")] * 3
+    assert [r.web_search_requests for r in records] == [3, 1, 0]
+    assert records[1].cache_read_tokens == 4000 and records[2].cache_write_tokens == 3000
+    assert records[0].cost_usd == pytest.approx((2000 * 5 + 100 * 25) / 1e6 + 0.03)
+    assert all(r.run_id == "" and r.model == "claude-opus-5" for r in records)
+
+
+def test_usage_is_reported_for_refusals_too(settings, prompts_dir, brief):
+    records = []
+    backend = AnthropicBackend(settings, client=FakeClient([RefusedMessage()]))
+    backend.on_usage = records.append
+    with pytest.raises(RefusalError):
+        backend.plan(brief)
+    assert len(records) == 1 and records[0].task == "plan"
+
+
+def test_unknown_model_price_is_announced_once(settings, prompts_dir, brief, plan):
+    client = FakeClient([usage_message([json_text(plan)], model="claude-mystery"),
+                         usage_message([json_text(plan)], model="claude-mystery")])
+    backend = AnthropicBackend(replace(settings, model="claude-mystery"), client=client)
+    records, notices = [], []
+    backend.on_usage = records.append
+    backend.on_notice = lambda agent, level, msg: notices.append(msg)
+    backend.plan(brief)
+    backend.plan(brief)
+    assert [r.cost_usd for r in records] == [0.0, 0.0]
+    assert len([n for n in notices if "가격 정보가 없어" in n]) == 1
+    assert "INSIA_PRICE_CLAUDE_MYSTERY_INPUT" in notices[0]
+
+
+def test_a_broken_usage_recorder_never_fails_the_call(settings, prompts_dir, brief, plan):
+    backend = AnthropicBackend(settings, client=FakeClient([message([json_text(plan)])]))
+    notices = []
+    backend.on_notice = lambda agent, level, msg: notices.append(msg)
+
+    def broken(record):
+        raise OSError("disk full")
+
+    backend.on_usage = broken
+    assert backend.plan(brief) == plan
+    assert any("disk full" in n for n in notices)
+
+    def stop(record):
+        raise BackendError("예산 상한을 넘었어요")
+
+    backend = AnthropicBackend(settings, client=FakeClient([message([json_text(plan)])]))
+    backend.on_usage = stop
+    with pytest.raises(BackendError, match="예산"):
+        backend.plan(brief)
+
+
+# ---------------------------------------------------------------------------
+# Grounding: percent-encoding, Korean URLs, fetch redirects
+# ---------------------------------------------------------------------------
+
+
+def test_percent_encoded_and_korean_urls_are_the_same_source():
+    encoded = "https://ko.wikipedia.org/wiki/%EC%86%8C%EC%83%81%EA%B3%B5%EC%9D%B8"
+    assert url_key(encoded) == url_key("https://ko.wikipedia.org/wiki/소상공인") == "ko.wikipedia.org/wiki/소상공인"
+    search = message([SimpleNamespace(type="web_search_tool_result", tool_use_id="s", content=[
+        SimpleNamespace(type="web_search_result", url=encoded, title="소상공인", page_age="")])])
+    memo = message([text("참고: https://ko.wikipedia.org/wiki/소상공인에서 확인. 또 (https://www.mss.go.kr/통계/2025) 참고.")])
+    keys = grounded_url_keys([search, memo])
+    assert "ko.wikipedia.org/wiki/소상공인" in keys
+    assert "mss.go.kr/통계/2025" in keys  # Korean path kept, closing parenthesis stripped
+    pack = ResearchPack(findings=[Finding(id="f1", question_id="q1", claim="c", source_ids=["s1", "s2"], confidence="high")],
+                        sources=[Source(id="s1", title="위키", url="https://ko.wikipedia.org/wiki/소상공인", tier=3),
+                                 Source(id="s2", title="중기부", url="https://www.mss.go.kr/%ED%86%B5%EA%B3%84/2025", tier=1)],
+                        gaps=[])
+    kept, dropped = drop_ungrounded_sources(pack, keys)
+    assert dropped == [] and kept is pack
+
+
+def test_requested_fetch_url_counts_as_grounded_after_a_redirect():
+    fetch_use = SimpleNamespace(type="server_tool_use", id="f1", name="web_fetch", input={"url": "http://mss.go.kr/old"})
+    fetch_result = SimpleNamespace(type="web_fetch_tool_result", tool_use_id="f1", content=SimpleNamespace(
+        type="web_fetch_result", url="https://www.mss.go.kr/new", content=SimpleNamespace(type="document", title="t")))
+    keys = grounded_url_keys([message([fetch_use, fetch_result])])
+    assert {"mss.go.kr/old", "mss.go.kr/new"} <= keys
+
+
+def test_attach_user_sources_without_user_documents_sets_origins():
+    pack = ResearchPack(findings=[], gaps=[], sources=[
+        Source(id="s1", title="웹", url="https://a.example", tier=2, origin="user"),
+        Source(id="s2", title="자료", url="user://u1", tier=1)])
+    out = attach_user_sources(pack, [])
+    assert [(s.id, s.origin) for s in out.sources] == [("s1", "web"), ("s2", "user")]
+
+
+# ---------------------------------------------------------------------------
+# Content calendar
+# ---------------------------------------------------------------------------
+
+
+def test_plan_calendar_request_and_normalization(settings, prompts_dir, profile):
+    (prompts_dir / "agents" / "planner.md").write_text("# planner 테스트 프롬프트", encoding="utf-8")
+    raw = ContentPlan(summary="이번 주 전략", slots=[
+        PlannedSlot(date="2026-10-05", channel="naver_blog", topic="블로그 1", angle="체크리스트", keywords=["AI 마케팅", "AI 마케팅"], goal="검색 유입"),
+        PlannedSlot(date="2026-10-10", channel="naver_blog", topic="토요일 글", angle="사례", keywords=["k"], goal="g"),   # Saturday → moved
+        PlannedSlot(date="2026-10-12", channel="linkedin", topic="기간 밖", angle="a", keywords=["k"], goal="g"),       # outside
+        PlannedSlot(date="2026-10-06", channel="instagram", topic="요청 안 한 채널", angle="a", keywords=["k"], goal="g"),
+        PlannedSlot(date="2026-10-07", channel="linkedin", topic="링크드인 1", angle="관점", keywords=["k"], goal="g"),
+        PlannedSlot(date="2026-10-08", channel="linkedin", topic="링크드인 2 (초과)", angle="관점", keywords=["k"], goal="g"),
+    ])
+    client = FakeClient([message([json_text(raw)])])
+    backend = AnthropicBackend(settings, client=client)
+    history = [ContentItem(id="it_1", channel="naver_blog", title="지난주 블로그 글", status="published",
+                           published_at="2026-09-29T01:00:00Z")]
+    plan = backend.plan_calendar(profile, "AI 마케팅 자동화", "2026-10-05", "2026-10-11", {"blog": 2, "linkedin": 1}, history)
+
+    call = client.calls[0]
+    _assert_common(call, effort="high", schema_model=ContentPlan)
+    assert call["system"] == [{"type": "text", "text": "# planner 테스트 프롬프트", "cache_control": {"type": "ephemeral"}}]
+    prof, task = blocks(call)
+    assert prof["cache_control"] == {"type": "ephemeral"} and "김철수" not in prof["text"] and "INSIA" in prof["text"]
+    body = task["text"]
+    assert '"counts": {\n  "naver_blog": 2,\n  "linkedin": 1\n }' in body
+    assert '"date": "2026-10-09"' in body and '"weekday": "금"' in body and "2026-10-10" not in body.split("history")[0]
+    assert "지난주 블로그 글" in body and '"date": "2026-09-29"' in body
+    assert [(s.date, s.channel, s.topic) for s in plan.slots] == [
+        ("2026-10-05", "naver_blog", "블로그 1"), ("2026-10-07", "linkedin", "링크드인 1"), ("2026-10-09", "naver_blog", "토요일 글")]
+    assert plan.slots[0].keywords == ["AI 마케팅"] and plan.summary == "이번 주 전략"
+
+
+# ---------------------------------------------------------------------------
+# Context rendering helpers and packaged prompts
+# ---------------------------------------------------------------------------
+
+from insia_agents.prompt_loader import (  # noqa: E402
+    agent_prompt,
+    budget_documents,
+    check_prompts,
+    render_profile,
+    user_sources,
+)
+
+
+def test_budget_documents_shares_space_fairly_and_never_silently():
+    docs = [UserDocument(id="u1", title="긴 자료", text="가" * 5000), UserDocument(id="u2", title="짧은 자료", text="나" * 100),
+            UserDocument(id="u3", title="빈 자료", text=" \n "), UserDocument(id="u4", title="중간 자료", text="다" * 800)]
+    excerpts, notice = budget_documents(docs, 1000)
+    assert [(e.document.id, len(e.text), e.truncated) for e in excerpts] == [("u1", 450, True), ("u2", 100, False), ("u4", 450, True)]
+    assert sum(len(e.text) for e in excerpts) <= 1000
+    assert notice is not None and "5,900자 중 1,000자" in notice and "「긴 자료」 5,000자 → 450자" in notice
+    assert "빈 자료" not in notice
+    whole, none = budget_documents(docs, 60_000)
+    assert none is None and [len(e.text) for e in whole] == [5000, 100, 800]
+    skipped, why = budget_documents(docs, 0)
+    assert skipped == [] and "3개" in why and "INSIA_MAX_DOCUMENT_CHARS" in why
+    assert budget_documents([], 1000) == ([], None)
+    sources = user_sources(whole, 7, "2026-09-28")
+    assert [(s.id, s.url, s.origin, s.accessed) for s in sources] == [
+        ("s7", "user://u1", "user", "2026-09-28"), ("s8", "user://u2", "user", "2026-09-28"), ("s9", "user://u4", "user", "2026-09-28")]
+
+
+def test_render_profile_is_deterministic_and_skips_empty_fields(profile):
+    assert render_profile(None) == "" and render_profile(Profile()) == "" and render_profile(Profile(updated_at="2026")) == ""
+    assert render_profile(profile, channel="linkedin") == render_profile(profile.model_copy(), channel="linkedin")
+    minimal = render_profile(Profile(service_name="INSIA"), channel="naver_blog")
+    assert minimal.splitlines()[-1] == "- 서비스명: INSIA" and "브랜드 규칙" not in minimal
+    long = render_profile(Profile(description="설명 " * 2000), channel=None)
+    assert "…(이하 생략)" in long and len(long) < 2500
+
+
+def test_packaged_prompts_load_and_teach_the_context_rules():
+    assert check_prompts(planner=True) == []
+    orchestrator = agent_prompt("orchestrator")
+    assert "회사 프로필 (사용자 제공 사실)" in orchestrator and "(자사 자료)" in orchestrator
+    assert "(자사 자료: 자료 제목)" in orchestrator and "사람의 수정 지시" in orchestrator
+    assert "성명·학교명·직장명은 절대 쓰지 않는다" in orchestrator
+    assert "user_sources" in agent_prompt("researcher") and "medium`을 넘기지 않고" in agent_prompt("researcher")
+    assert "자사 프로필" in agent_prompt("reviewer") and "어긋나는 내용은 critical" in agent_prompt("reviewer")
+    planner = agent_prompt("planner")
+    assert "available_days" in planner and "history" in planner and "ContentPlan" in planner

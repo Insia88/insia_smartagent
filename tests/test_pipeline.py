@@ -339,3 +339,102 @@ def test_thread_runner_cancel_stops_at_next_step():
     with pytest.raises(RunCancelled):
         runner.run_parallel({"a": lane("a"), "b": lane("b")})
     assert ("a", 2) not in steps
+
+
+# ---------------------------------------------------------------------------
+# Retries, run context, channel.completed details
+# ---------------------------------------------------------------------------
+
+
+from insia_agents.backends.base import APICallError, RunContext  # noqa: E402
+from insia_agents.models import Profile  # noqa: E402
+
+
+class FlakyDraftBackend(MockBackend):
+    """Fails each channel's first draft call ``failures`` times."""
+
+    def __init__(self, settings, failures=1, retryable=True):
+        super().__init__(settings)
+        self.failures = failures
+        self.retryable = retryable
+        self.draft_calls: dict[str, int] = {}
+
+    def draft(self, brief, plan, research, channel):
+        self.draft_calls[channel] = self.draft_calls.get(channel, 0) + 1
+        if self.draft_calls[channel] <= self.failures:
+            raise APICallError("요청 한도를 넘었어요 (429).", kind="rate_limit", status_code=429, retryable=self.retryable)
+        return super().draft(brief, plan, research, channel)
+
+
+def test_non_retryable_error_is_not_retried(settings, brief):
+    backend = FlakyDraftBackend(settings, failures=1, retryable=False)
+    bus = EventBus("no-retry", clock=SimClock(0))
+    with pytest.raises(APICallError):  # every channel's draft failed once, for good
+        run_pipeline(brief, backend, bus, settings)
+    assert set(backend.draft_calls.values()) == {1}
+    assert not any(e["type"] == "log" and "다시 시도" in e["data"]["message"] for e in bus.events)
+
+
+def test_retries_exhausted_fail_the_step(settings, brief):
+    backend = FlakyDraftBackend(settings, failures=5)
+    bus = EventBus("exhausted", clock=SimClock(0))
+    with pytest.raises(APICallError):
+        run_pipeline(brief, backend, bus, settings)
+    assert set(backend.draft_calls.values()) == {3}  # first try + 2 retries
+    assert bus.events[-1]["type"] == "run.failed"
+
+
+def test_live_runner_retries_with_interruptible_wait(settings, brief, monkeypatch):
+    from insia_agents.agents import common
+
+    monkeypatch.setattr(common, "RETRY_DELAYS", (0.01, 0.02))
+
+    class FlakyThreaded(FlakyDraftBackend):
+        name = "live"
+
+    backend = FlakyThreaded(settings, failures=1)
+    bus = EventBus("threaded-retry", clock=RealClock())
+    result = run_pipeline(brief, backend, bus, settings, runner=ThreadRunner(4))
+    assert len(result.results) == 4 and set(backend.draft_calls.values()) == {2}
+    retries = [e for e in bus.events if e["type"] == "log" and "다시 시도" in e["data"]["message"]]
+    assert len(retries) == 4 and all(e["agent"] == "orchestrator" for e in retries)
+
+
+def test_run_context_profile_without_workspace(settings, brief):
+    profile = Profile(company_name="인시아", banned_words=["데모"])
+    backend = MockBackend(settings)
+    bus = EventBus("ctx", clock=SimClock(0))
+    run_pipeline(brief, backend, bus, settings, context=RunContext(profile=profile, documents=[], today="2026-09-28"))
+    assert backend.context.profile == profile
+    assert backend.on_usage is None  # restored after the run
+    checks = [c for e in bus.events if e["type"] == "review.completed" for c in e["data"]["format_checks"]]
+    assert any(c["id"] == "banned_words" and not c["passed"] for c in checks)
+
+
+def test_channel_completed_reports_the_final_round(settings, brief):
+    result, bus = execute_run(brief, replace(settings, pass_score=99))
+    for event in (e for e in bus.events if e["type"] == "channel.completed"):
+        channel_result = next(r for r in result.results if r.channel == event["data"]["channel"])
+        assert event["data"]["final_round"] == channel_result.final.round
+
+
+def test_usage_reports_are_summed_without_workspace(settings, brief):
+    from insia_agents.models import UsageRecord
+    from insia_agents.pipeline import BudgetExceeded
+
+    class Priced(MockBackend):
+        def plan(self, brief):
+            self.on_usage(UsageRecord(task="plan", model="claude-opus-5", input_tokens=10, cost_usd=2.0))
+            return super().plan(brief)
+
+    forwarded = []
+    backend = Priced(settings)
+    backend.on_usage = forwarded.append  # a caller's own callback keeps receiving records
+    bus = EventBus("no-ws-budget", clock=SimClock(0))
+    with pytest.raises(BudgetExceeded):
+        run_pipeline(brief, backend, bus, replace(settings, max_cost_usd=1.0))
+    # (the mock may add its own zero-cost synthetic records)
+    assert [r.cost_usd for r in forwarded if r.cost_usd] == [2.0]
+    assert forwarded and all(r.run_id == "no-ws-budget" for r in forwarded)
+    assert backend.on_usage == forwarded.append
+    assert bus.events[-1]["data"]["budget_exceeded"] is True and bus.events[-1]["data"]["completed_channels"] == []

@@ -284,9 +284,14 @@ def _statements(script: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _fmt(moment: datetime) -> str:
+    """The one stored timestamp format: UTC, milliseconds, ``Z`` (sorts correctly as text)."""
+    return moment.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def utc_now() -> str:
-    """Current time as ``YYYY-MM-DDTHH:MM:SSZ`` (UTC)."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    """Current time as ``YYYY-MM-DDTHH:MM:SS.mmmZ`` (UTC)."""
+    return _fmt(datetime.now(timezone.utc))
 
 
 def _parse_ts(value: str) -> datetime | None:
@@ -303,11 +308,9 @@ def _parse_ts(value: str) -> datetime | None:
 
 
 def _normalize_ts(value: str | None) -> str:
-    """Any ISO timestamp → UTC ``...Z`` with second precision; empty/invalid → now."""
+    """Any ISO timestamp → the stored UTC format; empty/invalid → now."""
     parsed = _parse_ts(value or "")
-    if parsed is None:
-        return utc_now()
-    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return utc_now() if parsed is None else _fmt(parsed)
 
 
 def kst_date(ts: str) -> str:
@@ -346,12 +349,11 @@ def _time_bound(value: str, *, end: bool) -> tuple[str, str]:
         day = date.fromisoformat(_check_date(text, "기간"))
         if end:
             day = day + timedelta(days=1)
-        start = datetime(day.year, day.month, day.day, tzinfo=KST).astimezone(timezone.utc)
-        return ("<" if end else ">="), start.isoformat(timespec="seconds").replace("+00:00", "Z")
+        return ("<" if end else ">="), _fmt(datetime(day.year, day.month, day.day, tzinfo=KST))
     parsed = _parse_ts(text)
     if parsed is None:
         raise WorkspaceError(f"기간은 YYYY-MM-DD 또는 ISO 날짜·시각이어야 해요 (받은 값: {value!r})")
-    return ("<=" if end else ">="), parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return ("<=" if end else ">="), _fmt(parsed)
 
 
 def _dumps(value: Any) -> str:
@@ -535,8 +537,11 @@ class Workspace:
                     f"이 워크스페이스는 더 새 버전의 INSIA로 만들어졌어요 (DB 버전 {current}, 지원 {len(MIGRATIONS)}). "
                     "INSIA를 업데이트한 뒤 다시 열어 주세요.")
             for index in range(current, len(MIGRATIONS)):
-                for statement in _statements(MIGRATIONS[index]):
-                    conn.execute(statement)
+                try:
+                    for statement in _statements(MIGRATIONS[index]):
+                        conn.execute(statement)
+                except sqlite3.Error as exc:
+                    raise WorkspaceError(f"워크스페이스 DB를 버전 {index + 1}로 올리지 못했어요 (변경은 모두 되돌렸어요): {exc}") from exc
                 conn.execute("UPDATE schema_version SET version = ?", (index + 1,))
         except BaseException:
             conn.execute("ROLLBACK")
@@ -677,6 +682,17 @@ class Workspace:
             if cursor.rowcount == 0:
                 raise NotFoundError(f"실행 {run_id}를 찾을 수 없어요")
 
+    def claim_run(self, run_id: str, expected_status: str) -> bool:
+        """Atomically set a run back to ``running`` if its status is still ``expected_status``.
+
+        Two resumes of the same run (a double click) cannot both win.
+        """
+        now = utc_now()
+        with self._tx() as conn:
+            cursor = conn.execute("UPDATE runs SET status = 'running', error = '', finished_at = '', updated_at = ? "
+                                  "WHERE id = ? AND status = ?", (now, run_id, expected_status))
+        return cursor.rowcount == 1
+
     def _run_summary(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         brief = _loads(row["brief"], {}) or {}
         items = conn.execute("SELECT id, channel, score FROM items WHERE run_id = ? ORDER BY rowid", (row["id"],)).fetchall()
@@ -781,7 +797,7 @@ class Workspace:
                     continue
                 seq = (last["seq"] if last else 0) + 1
                 t = float(last["t"]) if last else 0.0
-                event = {"seq": seq, "t": t, "ts": now.replace("Z", ".000Z"), "run_id": run_id, "type": "run.failed",
+                event = {"seq": seq, "t": t, "ts": now, "run_id": run_id, "type": "run.failed",
                          "agent": "system", "data": {"error": INTERRUPTED_MESSAGE, "interrupted": True}}
                 conn.execute("INSERT INTO events (run_id, seq, type, agent, t, ts, event) VALUES (?, ?, ?, ?, ?, ?, ?)",
                              (run_id, seq, "run.failed", "system", t, event["ts"], _dumps(event)))
@@ -1007,7 +1023,7 @@ class Workspace:
                 hint = " 먼저 승인해 주세요." if status in ("scheduled", "published") and old in ("draft", "needs_changes") else ""
                 raise InvalidTransitionError(f"'{STATUS_LABELS[old]}' 상태에서 '{STATUS_LABELS[status]}'(으)로 바꿀 수 없어요.{hint}")
             values: dict[str, Any] = {"status": status}
-            if status == "approved" and old != "approved":
+            if status == "approved" and old in ("draft", "needs_changes"):  # scheduled → approved keeps the approval
                 latest = conn.execute("SELECT version, review FROM versions WHERE item_id = ? ORDER BY version DESC LIMIT 1",
                                       (item_id,)).fetchone()
                 if latest is None:
@@ -1296,6 +1312,21 @@ class Workspace:
                 values["updated_at"] = utc_now()
                 assignments = ", ".join(f"{key} = ?" for key in values)
                 conn.execute(f"UPDATE slots SET {assignments} WHERE id = ?", (*values.values(), slot_id))
+            return self._slot(conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone())
+
+    def claim_slot(self, slot_id: str, run_id: str, *, force: bool = False) -> CalendarSlot:
+        """Atomically mark a slot ``generating`` for ``run_id`` (refuses a slot already
+        generating or drafted unless ``force``)."""
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"캘린더 슬롯 {slot_id}를 찾을 수 없어요")
+            if row["status"] == "generating" and not force:
+                raise WorkspaceError("이 슬롯은 이미 초안을 만드는 중이에요")
+            if row["status"] == "drafted" and row["item_id"] and not force:
+                raise WorkspaceError(f"이미 초안이 있어요 (보관함 {row['item_id']}). 다시 만들려면 force로 요청해 주세요.")
+            conn.execute("UPDATE slots SET status = 'generating', run_id = ?, updated_at = ? WHERE id = ?",
+                         (run_id, utc_now(), slot_id))
             return self._slot(conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone())
 
     def due_slots(self, until_date: str) -> list[CalendarSlot]:

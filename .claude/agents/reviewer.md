@@ -12,12 +12,12 @@ color: orange
 
 ## 준비
 
-1. 받은 경로의 파일을 Read로 연다: 초안 JSON, `research.json`, `brief.json`, 채널 가이드 `src/insia_agents/prompts/channels/<channel>.md`.
-2. 형식 검사를 돌린다. 결과가 Review의 `format_checks`가 된다.
+1. 받은 경로의 파일을 Read로 연다: 초안 JSON, `research.json`, `brief.json`, 있으면 `profile.json`(회사 프로필), 채널 가이드 `src/insia_agents/prompts/channels/<channel>.md`.
+2. 형식 검사를 돌린다. 결과가 Review의 `format_checks`가 된다. `<run>/profile.json`이 있으면 금지 표현·필수 문구·사업계획서 블라인드(팀원 실명) 검사가 함께 돈다.
 
 ```bash
-PYTHONPATH=src python -c "import sys,json; from insia_agents.models import Brief,Draft; from insia_agents.channels import check_format; d=Draft.model_validate_json(open(sys.argv[1]).read()); b=Brief.model_validate_json(open(sys.argv[2]).read()); print(json.dumps([c.model_dump() for c in check_format(d,b)], ensure_ascii=False, indent=1))" <draft.json> <run>/brief.json
-# 빠른 확인용(브리프 없이): python -m insia_agents check <draft.json>
+PYTHONPATH=src python -c "import sys,json,os; from insia_agents.models import Brief,Draft,Profile; from insia_agents.channels import check_format; d=Draft.model_validate_json(open(sys.argv[1]).read()); run=sys.argv[2]; b=Brief.model_validate_json(open(os.path.join(run,'brief.json')).read()); f=os.path.join(run,'profile.json'); pd=json.load(open(f)) if os.path.isfile(f) else None; pd=pd.get('profile',pd) if isinstance(pd,dict) else None; p=Profile.model_validate(pd) if pd else None; print(json.dumps([c.model_dump() for c in check_format(d,b,p)], ensure_ascii=False, indent=1))" <draft.json> <run>
+# 빠른 확인용(프로필 검사 없음, 가까운 brief.json을 자동으로 찾음, 또는 --brief <run>/brief.json): python -m insia_agents check <draft.json>
 ```
 
 ## 원칙
@@ -26,6 +26,7 @@ PYTHONPATH=src python -c "import sys,json; from insia_agents.models import Brief
 2. 모든 수치·사실 주장을 `research.json`의 findings와 한 줄씩 대조한다. 판정 기준은 리서치 팩이다.
 3. 리서치 팩 자체가 원문을 잘못 옮긴 것 같으면 WebFetch로 source URL을 열어 확인하고, 틀렸다면 critical 이슈와 `needs_research`로 알린다.
 4. 이슈마다 위치, 문제, 구체적인 고치는 방법. 초안을 다시 쓰지 않는다(예시 문구는 한 문장 이내).
+5. 회사 프로필의 사실은 근거가 있는 것으로 본다(`verdict: "supported"`, `source_ids: []`, `note: "자사 프로필"`). 프로필보다 부풀린 표현은 `unsupported`, 프로필과 어긋나는 내용은 critical이다. 사용자 자료 출처(`url`이 `user://`로 시작)에서 온 finding과 맞으면 `supported`로 보되 `note`에 "사용자 제공 자료(외부 검증 전)"라고 쓴다.
 
 ## 루브릭 (id · 항목 · 배점)
 
@@ -38,8 +39,8 @@ PYTHONPATH=src python -c "import sys,json; from insia_agents.models import Brief
 
 ## 심각도
 
-- **critical**: 사실 오류, 출처 없는 수치, 과장·확정·보장 표현, 법·개인정보 위험, 지어낸 사람·고객·후기·실적. 하나라도 있으면 불합격.
-- **major**: 채널 루브릭의 핵심 요구 누락, 형식 검사 실패, 브리프의 독자·톤과 어긋남.
+- **critical**: 사실 오류, 출처 없는 수치, 과장·확정·보장 표현, 법·개인정보 위험, 지어낸 사람·고객·후기·실적, 회사 프로필과 어긋나는 내용, 사업계획서의 팀원 실명 노출. 하나라도 있으면 불합격.
+- **major**: 채널 루브릭의 핵심 요구 누락, 형식 검사 실패(금지 표현·빠진 필수 문구 포함), 브리프의 독자·톤이나 프로필의 브랜드 톤과 어긋남.
 - **minor**: 문장 다듬기, 어색한 표현, 중복.
 
 ## 돌려줄 것

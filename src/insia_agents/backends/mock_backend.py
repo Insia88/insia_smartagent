@@ -12,6 +12,15 @@
 
 Durations are simulated (``sim_seconds``); the pipeline turns them into
 virtual time, so mock traces have realistic ``t`` values even at speed 0.
+
+Run context (``backend.context``) in template mode: profile values appear in
+the drafts (service name, target customers, facts marked "(자사 자료)", team
+roles without names in the business plan, CTA / required phrases / default
+hashtags in SNS posts; banned words are removed in revisions), and user
+documents become ``origin="user"`` sources with ``[데모]`` findings (first
+sentence of each document). The recorded replay ignores the context and says
+so. Every call reports synthetic usage (model ``mock``, cost 0) to
+``on_usage``. ``plan_calendar`` is deterministic.
 """
 
 from __future__ import annotations
@@ -23,15 +32,21 @@ from typing import Any
 
 from ..channels import CHANNELS, FORMAT_ITEM_ID, chars_no_space, chars_with_space, first_lines
 from ..config import Settings
+from ..costs import mock_usage
 from ..models import (
+    ALL_CHANNELS,
     Brief,
     ChannelId,
     ChannelOutline,
+    ContentItem,
+    ContentPlan,
     Draft,
     FactCheck,
     Finding,
     FormatCheck,
     Plan,
+    PlannedSlot,
+    Profile,
     ResearchPack,
     ResearchQuestion,
     Review,
@@ -39,7 +54,10 @@ from ..models import (
     RubricScore,
     Source,
 )
-from .base import EmitFn, NoticeFn
+from ..planner import (DEFAULT_GOALS, cap_counts, history_keys, normalize_counts, normalize_plan, repeats_history, slot_days,
+                       spread, topic_key)
+from ..prompt_loader import DocumentExcerpt, budget_documents, profile_is_empty, user_sources
+from .base import BackendError, EmitFn, NoticeFn, RunContext, UsageFn
 
 TEMPLATE_MODEL = "mock-template"
 
@@ -115,9 +133,11 @@ def hashtag(text: str) -> str:
     return f"#{cleaned}" if cleaned else ""
 
 
-def make_tags(brief: Brief, count: int, extra: list[str]) -> list[str]:
+def make_tags(brief: Brief, count: int, extra: list[str], first: list[str] | tuple[str, ...] = ()) -> list[str]:
+    """Up to ``count`` hashtags: ``first`` (e.g. the profile's default
+    hashtags), then the brief keywords, then ``extra``."""
     tags: list[str] = []
-    for word in [*brief.keywords, *extra]:
+    for word in [*first, *brief.keywords, *extra]:
         tag = hashtag(word)
         if tag and tag not in tags and len(tag) <= 20:
             tags.append(tag)
@@ -166,9 +186,13 @@ class _Ctx(dict):
         return "{" + key + "}"
 
 
-def brief_context(brief: Brief) -> dict[str, str]:
-    name = short_name(brief.topic)
-    audience = _clip(brief.audience or "1인 창업자와 소상공인", 30)
+def brief_context(brief: Brief, profile: Profile | None = None) -> dict[str, str]:
+    """Template variables. A company profile (when given) supplies the service
+    name and the target customers."""
+    service = _clip(profile.service_name, 24) if profile is not None and profile.service_name.strip() else ""
+    customers = profile.target_customers.strip() if profile is not None else ""
+    name = service or short_name(brief.topic)
+    audience = _clip(customers or brief.audience or "1인 창업자와 소상공인", 30)
     kw0 = brief.keywords[0].strip() if brief.keywords else name
     kw1 = brief.keywords[1].strip() if len(brief.keywords) > 1 else "업무 자동화"
     goal = _clip(brief.goal or f"{name} 소개와 사업화 준비", 60)
@@ -223,8 +247,8 @@ _FINDING_CLAIMS = [
 ]
 
 
-def template_plan(brief: Brief) -> Plan:
-    ctx = brief_context(brief)
+def template_plan(brief: Brief, profile: Profile | None = None) -> Plan:
+    ctx = brief_context(brief, profile)
     wanted = list(dict.fromkeys(brief.channels))
     questions = []
     for i, (question, why, channels, priority) in enumerate(_question_specs(ctx), start=1):
@@ -251,8 +275,8 @@ def template_plan(brief: Brief) -> Plan:
     )
 
 
-def template_research(brief: Brief, today: str) -> ResearchPack:
-    ctx = _Ctx(brief_context(brief))
+def template_research(brief: Brief, today: str, profile: Profile | None = None) -> ResearchPack:
+    ctx = _Ctx(brief_context(brief, profile))
     sources = [Source(id=f"s{i}", title=t, url=u, publisher=p, published="", tier=tier, accessed=today)  # type: ignore[arg-type]
                for i, (t, u, p, tier) in enumerate(_TEMPLATE_SOURCES, start=1)]
     source_for = [["s1"], ["s2", "s4"], ["s4"], ["s2", "s3"]]
@@ -266,6 +290,37 @@ def template_research(brief: Brief, today: str) -> ResearchPack:
         sources=sources,
         gaps=["[데모] 모든 수치는 ○○ 자리표시예요. live 모드에서 웹 검색으로 실제 값과 기준 시점을 채워요."],
     )
+
+
+def first_sentence(text: str, limit: int = 90) -> str:
+    """First sentence (or line) of a document, whitespace collapsed."""
+    flat = re.sub(r"\s+", " ", re.sub(r"^[#>*\-\s]+", "", text.strip(), flags=re.MULTILINE)).strip()
+    match = re.search(r"(.+?[.!?。]|.+?(?:다|요|임|함)\.?)(\s|$)", flat)
+    return _clip(match.group(1) if match else flat, limit)
+
+
+def _best_question(text: str, questions: list[ResearchQuestion]) -> str:
+    if not questions:
+        return "q1"
+    from .anthropic_backend import match_question  # pure helper; importing it does not load the SDK
+
+    return match_question(text, questions) or questions[0].id
+
+
+def template_user_research(excerpts: list[DocumentExcerpt], questions: list[ResearchQuestion],
+                           start_source: int, start_finding: int, today: str) -> ResearchPack:
+    """User documents as ``origin="user"`` sources plus one ``[데모]`` finding
+    each (the document's first sentence — mock mode reads no further)."""
+    sources = user_sources(excerpts, start_source, today)
+    findings = []
+    for i, (excerpt, source) in enumerate(zip(excerpts, sources)):
+        sentence = first_sentence(excerpt.text)
+        findings.append(Finding(
+            id=f"f{start_finding + i}", question_id=_best_question(f"{source.title} {sentence}", questions),
+            claim=f"[데모] 「{source.title}」(사용자 제공 자료)에 적힌 내용: {sentence}", source_ids=[source.id],
+            confidence="medium", note="사용자 제공 자료(외부 검증 전) — [데모] mock 모드는 자료의 첫 문장만 옮겨요",
+        ))
+    return ResearchPack(findings=findings, sources=sources, gaps=[])
 
 
 def template_followup(questions: list[ResearchQuestion], existing: ResearchPack | None, today: str) -> ResearchPack:
@@ -292,10 +347,10 @@ _BIZ_HEAD = """# {name} 사업계획서 (초안)
 | 항목 | 내용 |
 |---|---|
 | 창업 아이템명 | {name} |
-| 대표자 | [대표자 성명] |
+{company_row}| 대표자 | [대표자 성명] |
 | 목표 고객 | {audience} |
 | 신청 목적 | {goal} |
-| 사업 형태 | 월 구독형 서비스 (가정) |
+| 사업 형태 | {biz_model} |
 
 ## 창업 아이템 개요(요약)
 
@@ -319,7 +374,7 @@ _BIZ_HEAD = """# {name} 사업계획서 (초안)
 - 검수 점수와 수정 요청, 수정 이력을 한 화면에서 확인하는 기능
 - 최종본을 복사하거나 파일로 저장해 바로 활용하는 기능
 
-## 1. 문제 인식 (Problem)
+{profile_facts}## 1. 문제 인식 (Problem)
 
 ### 1-1. 창업 배경 및 필요성
 
@@ -466,9 +521,7 @@ _BIZ_TEAM = """
 
 | 구분 | 성명 | 담당 업무 | 보유 역량 |
 |---|---|---|---|
-| 대표 | [대표자 성명] | 사업 총괄, 고객 인터뷰 | [경력: ○○ 분야 ○년] |
-| 팀원 | [팀원 성명] | 서비스 개발 | [경력: ○○ 개발 ○년] |
-| 채용 예정 | [채용 예정] | 콘텐츠 품질 관리 | [요구 역량: ○○] |
+{team_rows}
 
 - 보유 인프라: [보유 장비·공간 기재]
 - 협력 기관: [협력 예정 기관명 — 확인 필요]
@@ -514,15 +567,15 @@ _BLOG_R0_BODY = """[이미지: 노트북 앞에서 할 일 목록을 정리하�
 
 도구가 만든 문장을 그대로 쓰기보다 소리 내어 읽어 보는 것도 방법이에요. 어색한 부분이 바로 들려서 내 말투로 고치기가 쉬워요. 우리 가게만의 이야기와 단골손님이 자주 묻는 질문을 한두 줄 더하면 글이 훨씬 살아나요.
 
-<<OPTIONAL>>**정리하면**
+{profile_para}<<OPTIONAL>>**정리하면**
 
 - 처음에는 반복되는 일 하나만 줄여 보세요
 - 도구가 만든 결과물의 수치는 출처와 기준 시점을 꼭 확인하세요
 - 줄어든 시간은 고객과 제품에 쓰세요
 
-도움이 되셨다면 이웃추가하고 다음 글도 받아 보세요. 궁금한 점은 댓글로 남겨 주시면 답해 드릴게요.
+도움이 되셨다면 이웃추가하고 다음 글도 받아 보세요. 궁금한 점은 댓글로 남겨 주시면 답해 드릴게요.{closing_extra}
 
-출처: 중소벤처기업부 정책·실태조사 자료(○○년 기준, 원문 확인 필요)"""
+출처: 중소벤처기업부 정책·실태조사 자료(○○년 기준, 원문 확인 필요){source_extra}"""
 
 _BLOG_R1_BODY = """[이미지: 노트북 앞에서 할 일 목록을 정리하는 1인 창업자]
 
@@ -562,15 +615,15 @@ _BLOG_R1_BODY = """[이미지: 노트북 앞에서 할 일 목록을 정리하�
 
 [이미지: 초안과 최종본을 나란히 비교한 화면]
 
-<<OPTIONAL>>## 정리하면
+{profile_para}<<OPTIONAL>>## 정리하면
 
 - 반복되는 일과 판단할 일을 먼저 나눠요
 - 가장 오래 걸리는 일 하나부터 줄여요
 - 수치는 출처와 기준 시점을 꼭 확인해요
 
-도움이 되셨다면 이웃추가하고 다음 글도 받아 보세요. 궁금한 점은 댓글로 남겨 주시면 답해 드릴게요.
+도움이 되셨다면 이웃추가하고 다음 글도 받아 보세요. 궁금한 점은 댓글로 남겨 주시면 답해 드릴게요.{closing_extra}
 
-출처: 중소벤처기업부 정책·실태조사 자료(○○년 기준, 원문 확인 필요)"""
+출처: 중소벤처기업부 정책·실태조사 자료(○○년 기준, 원문 확인 필요){source_extra}"""
 
 _BLOG_OPTIONAL = [
     "덧붙여, 기록한 시간은 한 달 뒤에 다시 비교해 보세요. 어떤 일을 맡겼을 때 가장 많이 줄었는지 보이면 다음에 맡길 일도 자연스럽게 정해져요.",
@@ -616,27 +669,117 @@ _LI_OPTIONAL = [
 _LI_CTA = "여러분은 콘텐츠 한 편에 몇 시간을 쓰고 계신가요? 댓글로 나눠 주세요."
 
 _IG_SLIDES = [
-    ("{kw0}, 혼자서도 됩니다", "{kw0}, 혼자서도 시작할 수 있어요", "짙은 남색 배경에 큰 제목, 오른쪽 아래에 노트북 일러스트", "제목 '{kw0}, 혼자서도 시작할 수 있어요'가 적힌 표지"),
+    ("{kw0}, 혼자서도 됩니다", "{kw0}, 혼자서도 시작할 수 있어요", "{cover_bg}에 큰 제목, 오른쪽 아래에 노트북 일러스트", "제목 '{kw0}, 혼자서도 시작할 수 있어요'가 적힌 표지"),
     ("이런 고민 있으신가요", "글 한 편에 반나절, 그래서 홍보가 밀려요", "시계와 쌓인 할 일 메모를 나란히 배치", "시계와 할 일 메모가 놓인 책상 그림"),
     ("왜 이렇게 오래 걸릴까", "채널마다 형식이 달라 같은 글을 여러 번 써요", "블로그·SNS 화면 세 개를 겹쳐 보여 주는 구성", "형식이 다른 세 개의 게시물 화면"),
     ("해결 1 — 시간 기록", "일주일만 시간을 기록해 보세요", "체크 표시가 있는 주간 표 한 장", "요일별 작업 시간을 적은 주간 표"),
     ("해결 2 — 하나만 맡기기", "가장 오래 걸린 일 하나만 맡겨요", "큰 화살표로 한 가지 업무를 도구 아이콘에 넘기는 장면", "한 가지 업무 카드를 도구 아이콘으로 옮기는 그림"),
     ("해결 3 — 직접 확인", "수치는 출처와 기준 시점을 확인해요", "돋보기와 출처 카드, 체크 도장", "돋보기로 출처 카드를 확인하는 모습"),
     ("오늘의 체크리스트", "기록하기 · 하나만 맡기기 · 직접 확인하기", "세 줄 체크리스트, 항목마다 아이콘", "세 가지 항목이 적힌 체크리스트"),
-    ("저장해 두세요", "저장해 두고 이번 주에 하나만 해 보세요", "저장 아이콘을 강조한 마무리 장면, 계정명 자리표시", "저장 아이콘이 강조된 마무리 화면"),
+    ("저장해 두세요", "저장해 두고 이번 주에 하나만 해 보세요", "저장 아이콘을 강조한 마무리 장면, 계정명 {ig_handle}", "저장 아이콘이 강조된 마무리 화면"),
 ]
 
 
 def _references(research: ResearchPack) -> str:
     lines = []
     for src in research.sources:
+        if src.origin == "user":
+            lines.append(f"- [{src.id}] 자사 자료, 「{src.title}」(사용자 제공, 외부 검증 전)")
+            continue
         when = src.published or "기준 시점 확인 필요"
         lines.append(f"- [{src.id}] {src.title}, {src.publisher} ({when}) {src.url}")
     return "\n".join(lines) or "- [s1] [참고자료 확인 필요]"
 
 
-def template_draft(brief: Brief, research: ResearchPack, channel: ChannelId, round: int) -> Draft:
-    ctx = _Ctx(brief_context(brief))
+def _items(values: list[str], count: int, limit: int) -> list[str]:
+    return [_clip(v, limit) for v in values if v.strip()][:count]
+
+
+def _banned_pattern(word: str) -> re.Pattern[str] | None:
+    chars = [c for c in word if not c.isspace()]
+    return re.compile(r"\s*".join(re.escape(c) for c in chars), re.IGNORECASE) if chars else None
+
+
+def scrub_banned(text: str, banned: list[str]) -> tuple[str, list[str]]:
+    """Replace each banned expression (spacing/case-insensitive, like the
+    code check) with ``○○``; returns the new text and the words removed."""
+    hits: list[str] = []
+    for word in banned:
+        pattern = _banned_pattern(word)
+        if pattern is not None and pattern.search(text):
+            text = pattern.sub("○○", text)
+            hits.append(word.strip())
+    return text, hits
+
+
+def _profile_context(profile: Profile | None, research: ResearchPack) -> dict[str, str]:
+    """Extra template variables from the company profile and user sources
+    (all empty strings without a profile, so the template reads as before)."""
+    p = profile if profile is not None and not profile_is_empty(profile) else None
+    user_srcs = [s for s in research.sources if s.origin == "user"]
+    extra = {"company_row": "", "biz_model": "월 구독형 서비스 (가정)", "profile_facts": "", "team_rows": _DEFAULT_TEAM_ROWS,
+             "profile_para": "", "closing_extra": "", "source_extra": "", "cover_bg": "짙은 남색 배경", "ig_handle": "자리표시"}
+    if user_srcs:
+        extra["source_extra"] = "".join(f"\n출처: 자사 자료 「{s.title}」(사용자 제공)" for s in user_srcs)
+    facts: list[str] = []
+    if p is not None:
+        if p.company_name.strip():
+            extra["company_row"] = f"| 기업명 | {_clip(p.company_name, 40)} (자사 자료) |\n"
+        if p.business_model.strip():
+            extra["biz_model"] = f"{_clip(p.business_model, 60)} (자사 자료)"
+        for label, value in (("한 줄 소개", p.one_liner), ("해결하려는 문제", p.problem), ("해결 방법", p.solution),
+                             ("가격", p.pricing)):
+            if value.strip():
+                facts.append(f"- {label}: {_clip(value, 120)} (자사 자료)")
+        facts += [f"- 차별점: {d} (자사 자료)" for d in _items(p.differentiators, 3, 80)]
+        facts += [f"- 실적·지표: {t} (자사 자료)" for t in _items(p.traction, 3, 80)]
+        members = [m for m in p.team if m.role.strip() or m.background.strip()][:6]
+        if members:
+            rows = []
+            for m in members:
+                role = _clip(m.role, 20) or "팀원"
+                label = "채용 예정" if m.hiring else role
+                if m.background.strip():
+                    ability = f"{_clip(m.background, 80)} (자사 자료)"
+                else:
+                    ability = "[요구 역량: ○○]" if m.hiring else "[경력: ○○ 분야 ○년]"
+                rows.append(f"| {label} | ○○○ | {role} | {ability} |")
+            extra["team_rows"] = "\n".join(rows)
+        name = _clip(p.service_name, 24) or "저희 서비스"
+        if p.one_liner.strip():
+            extra["profile_para"] = f"참고로 {josa(name, '을/를')} 한 줄로 소개하면 '{_clip(p.one_liner, 90)}'예요(자사 자료).\n\n"
+        closing = [_clip(p.cta, 100)] if p.cta.strip() else []
+        if p.contact.strip():
+            closing.append(f"문의: {_clip(p.contact, 60)}")
+        closing += _items(p.required_phrases, 3, 100)
+        if closing:
+            extra["closing_extra"] = "\n\n" + "\n".join(closing)
+        if p.brand_colors:
+            extra["cover_bg"] = f"브랜드 주 색({_clip(p.brand_colors[0], 12)}) 배경"
+        if p.instagram_handle.strip():
+            extra["ig_handle"] = _clip(p.instagram_handle, 30)
+    user_ids = {s.id for s in user_srcs}
+    for finding in [f for f in research.findings if f.source_ids and f.source_ids[0] in user_ids][:3]:
+        claim = _DEMO_PREFIX.sub("", finding.claim)
+        facts.append(f"- {claim} [{finding.source_ids[0]}]")
+    if facts:
+        extra["profile_facts"] = "### 자사 자료 기반 사실 (사용자 제공, 외부 검증 전)\n\n" + "\n".join(facts) + "\n\n"
+    return extra
+
+
+_DEMO_PREFIX = re.compile(r"^\[데모\]\s*")
+_DEFAULT_TEAM_ROWS = """| 대표 | [대표자 성명] | 사업 총괄, 고객 인터뷰 | [경력: ○○ 분야 ○년] |
+| 팀원 | [팀원 성명] | 서비스 개발 | [경력: ○○ 개발 ○년] |
+| 채용 예정 | [채용 예정] | 콘텐츠 품질 관리 | [요구 역량: ○○] |"""
+
+
+def template_draft(brief: Brief, research: ResearchPack, channel: ChannelId, round: int,
+                   profile: Profile | None = None) -> Draft:
+    ctx = _Ctx(brief_context(brief, profile), **_profile_context(profile, research))
+    has_profile = profile is not None and not profile_is_empty(profile)
+    default_tags = list(profile.default_hashtags) if has_profile and profile is not None else []
+    required = _items(profile.required_phrases, 3, 100) if has_profile and profile is not None else []
+    cta = _clip(profile.cta, 100) if has_profile and profile is not None and profile.cta.strip() else ""
     used = [f.id for f in research.findings]
     fixed = round >= 1
     change_log: list[str] = []
@@ -660,7 +803,8 @@ def template_draft(brief: Brief, research: ResearchPack, channel: ChannelId, rou
         kw = ctx["kw0"]
         candidates = [f"{kw} 혼자 시작하는 3단계 방법", f"{kw} 시작 가이드", f"{kw} 3단계", kw]
         title = next((c for c in candidates if len(c) <= 40), kw[:40])
-        hashtags = make_tags(brief, 8, ["1인창업", "소상공인", "콘텐츠마케팅", "블로그운영", "마케팅팁", "창업준비", "업무자동화", "데모"])
+        hashtags = make_tags(brief, 8, ["1인창업", "소상공인", "콘텐츠마케팅", "블로그운영", "마케팅팁", "창업준비", "업무자동화", "데모"],
+                             first=default_tags)
         if fixed:
             change_log = [
                 "[major] 형식: ## 소제목을 2개에서 5개로 늘림",
@@ -670,12 +814,22 @@ def template_draft(brief: Brief, research: ResearchPack, channel: ChannelId, rou
 
     elif channel == "linkedin":
         count = 4 if fixed else 7
-        hashtags = make_tags(brief, count, ["1인창업", "콘텐츠마케팅", "AI에이전트", "스타트업", "소상공인", "마케팅자동화", "창업", "데모"])
+        hashtags = make_tags(brief, count, ["1인창업", "콘텐츠마케팅", "AI에이전트", "스타트업", "소상공인", "마케팅자동화", "창업", "데모"],
+                             first=default_tags)
         hook = _LI_R1_HOOK if fixed else _LI_R0
         tag_line = " ".join(hashtags)
         head = "\n".join(line.format_map(ctx) for line in hook)
         body = [p.format_map(ctx) for p in _LI_BODY]
-        tail = [_LI_CTA, tag_line]
+        if has_profile and profile is not None:
+            about: list[str] = []
+            if profile.one_liner.strip():
+                about.append(f"참고로 {ctx['name_eul']} 한 줄로 소개하면 '{_clip(profile.one_liner, 90)}'입니다.")
+            traction = _items(profile.traction, 2, 60)
+            if traction:
+                about.append(f"지금까지의 진행 상황은 {', '.join(traction)}입니다(자사 집계).")
+            if about:
+                body.insert(4, " ".join(about))
+        tail = [*([cta] if cta else []), *required, _LI_CTA, tag_line]
 
         def measure(text: str) -> int:
             return chars_with_space(text + "\n\n" + "\n\n".join(tail))
@@ -691,13 +845,16 @@ def template_draft(brief: Brief, research: ResearchPack, channel: ChannelId, rou
             ]
 
     elif channel == "instagram":
-        hashtags = make_tags(brief, 5, ["1인창업", "소상공인", "콘텐츠마케팅", "마케팅팁", "업무자동화", "데모"])
+        hashtags = make_tags(brief, 5, ["1인창업", "소상공인", "콘텐츠마케팅", "마케팅팁", "업무자동화", "데모"], first=default_tags)
         slides = []
         for i, (heading, line, visual, alt) in enumerate(_IG_SLIDES, start=1):
             slides.append(
                 f"### 슬라이드 {i} — {heading.format_map(ctx)}\n- 문구: {line.format_map(ctx)}\n"
                 f"- 비주얼: {visual.format_map(ctx)}\n- 대체텍스트: {alt.format_map(ctx)}"
             )
+        contact = profile.contact.strip() if has_profile and profile is not None else ""
+        brand_lines = [*([cta] if cta else []), *([f"문의: {_clip(contact, 60)}"] if contact and "://" not in contact else []),
+                       *required]
         caption_lines = [
             _clip(f"{ctx['kw0']}, 혼자서도 시작할 수 있어요. 오늘은 딱 3단계만 정리했어요.", 120),
             "",
@@ -707,6 +864,7 @@ def template_draft(brief: Brief, research: ResearchPack, channel: ChannelId, rou
             "2. 가장 오래 걸린 일 하나만 도구에 맡겨요",
             "3. 수치는 출처와 기준 시점을 직접 확인해요",
             "",
+            *([*brand_lines, ""] if brand_lines else []),
             "저장해 두고 이번 주에 하나만 해 보세요. 친구에게 공유하면 함께 시작하기 좋아요.",
             "",
             " ".join(hashtags),
@@ -717,6 +875,18 @@ def template_draft(brief: Brief, research: ResearchPack, channel: ChannelId, rou
             change_log = ["[minor] 슬라이드 5: 문구를 짧게 다듬음"]
     else:  # pragma: no cover - ChannelId is a closed set
         raise ValueError(channel)
+
+    if fixed and has_profile and profile is not None and profile.banned_words:
+        banned = [w for w in profile.banned_words if w.strip()]
+        kept_tags = [t for t in hashtags if not scrub_banned(t, banned)[1]]
+        if kept_tags != hashtags and channel in ("linkedin", "instagram"):
+            content = content.replace(" ".join(hashtags), " ".join(kept_tags))
+        hashtags = kept_tags
+        title, hit_title = scrub_banned(title, banned)
+        content, hit_body = scrub_banned(content, banned)
+        hits = list(dict.fromkeys(hit_title + hit_body))
+        if hits:
+            change_log.append(f"[major] 브랜드: 금지 표현({', '.join(hits)})을 지움")
 
     return Draft(channel=channel, round=round, title=title, content=content, hashtags=hashtags,
                  used_finding_ids=used, change_log=change_log)
@@ -853,6 +1023,80 @@ def template_review(brief: Brief, research: ResearchPack, draft: Draft, format_c
 
 
 # ---------------------------------------------------------------------------
+# Template content calendar
+# ---------------------------------------------------------------------------
+
+_CALENDAR_ANGLES: list[tuple[str, str]] = [
+    ("체크리스트", "{subject}, 시작 전에 확인할 5가지"),
+    ("단계별 방법", "{subject} 3단계로 시작하기"),
+    ("자주 묻는 질문", "{audience_i} {subject}에 대해 자주 묻는 질문"),
+    ("흔한 실수", "{subject}에서 흔히 하는 실수 3가지"),
+    ("데이터 해설", "{subject} 관련 공식 통계 읽는 법"),
+    ("비교", "{subject}: 직접 하기와 도구 쓰기 비교"),
+    ("비하인드", "{service_eul} 만들며 배운 점"),
+    ("사례", "{subject} 적용 전후로 달라진 점 [사례 확인 필요]"),
+    ("용어 정리", "{subject} 핵심 용어 한 번에 정리"),
+]
+
+
+def _calendar_topics(profile: Profile | None, theme: str) -> list[tuple[str, str]]:
+    """Deterministic (topic, angle) bank from the theme and the profile."""
+    p = profile if profile is not None and not profile_is_empty(profile) else Profile()
+    service = _clip(p.service_name, 24) or _clip(p.company_name, 24) or "우리 서비스"
+    subject = _clip(theme, 40) or _clip(p.one_liner, 40) or service
+    audience = _clip(p.target_customers, 24) or "고객"
+    ctx = _Ctx(subject=subject, audience_i=josa(audience, "이/가"), service_eul=josa(service, "을/를"))
+    bank = [(template.format_map(ctx), angle) for angle, template in _CALENDAR_ANGLES]
+    for diff in _items(p.differentiators, 3, 40):
+        bank.append((f"{josa(diff, '이/가')} 필요한 이유", "차별점 소개"))
+    if p.problem.strip():
+        bank.append((f"{_clip(p.problem, 50)} — 왜 생기고 어떻게 줄일까", "고객 문제"))
+    return bank
+
+
+def template_calendar(profile: Profile | None, theme: str, start: str, end: str, counts: dict[str, int],
+                      history: list[ContentItem]) -> ContentPlan:
+    """Deterministic plan: each channel's posts spread over the weekdays in
+    range (channels offset so they rarely share a day), topics drawn in turn
+    from a bank built from the theme and profile, skipping any topic that
+    repeats ``history`` or an earlier slot."""
+    days = slot_days(start, end)
+    capped, _ = cap_counts(normalize_counts(counts), len(days))
+    p = profile if profile is not None and not profile_is_empty(profile) else Profile()
+    bank = _calendar_topics(p, theme)
+    seen = history_keys(history)
+    main = _clip(theme, 20) or _clip(p.service_name, 20) or "콘텐츠 마케팅"
+    order = {c: i for i, c in enumerate(ALL_CHANNELS)}
+    wanted: list[tuple[str, ChannelId]] = []
+    for channel, count in capped.items():
+        wanted += [(day, channel) for day in spread(count, days, offset=order[channel])]
+    wanted.sort(key=lambda pair: (pair[0], order[pair[1]]))
+
+    slots: list[PlannedSlot] = []
+    cursor = 0
+    extra = 0
+    for day, channel in wanted:
+        while True:
+            if cursor < len(bank):
+                topic, angle = bank[cursor]
+            else:
+                extra += 1
+                topic, angle = f"{_clip(theme, 40) or main} 인사이트 {extra}", "인사이트"
+            cursor += 1
+            if not repeats_history(topic, seen):
+                break
+        seen.add(topic_key(topic))
+        keywords = list(dict.fromkeys(k for k in (main, _clip(p.industry, 20), angle) if k))[:5]
+        slots.append(PlannedSlot(date=day, channel=channel, topic=topic, angle=angle, keywords=keywords,
+                                 goal=DEFAULT_GOALS.get(channel, "")))
+    total = len(slots)
+    mix = ", ".join(f"{CHANNELS[c].label} {n}편" for c, n in capped.items())
+    summary = (f"[데모] {start}~{end} 평일에 {mix}, 모두 {total}편을 배치했어요. 지난 게시물과 겹치는 주제는 뺐어요. "
+               "live 모드에서는 총괄 에이전트가 프로필과 주제를 읽고 계획해요.")
+    return normalize_plan(ContentPlan(summary=summary, slots=slots), start, end, capped)
+
+
+# ---------------------------------------------------------------------------
 # Recorded sample run
 # ---------------------------------------------------------------------------
 
@@ -937,7 +1181,18 @@ class MockBackend:
         self.sample = SampleRun.load(sample_dir if sample_dir is not None else settings.sample_dir)
         self.model = TEMPLATE_MODEL
         self.on_notice: NoticeFn | None = None
+        self.on_usage: UsageFn | None = None
+        self.context = RunContext(today=settings.today)
         self._last_review_round: dict[str, int] = {}
+
+    @property
+    def today(self) -> str:
+        return (self.context.today if self.context is not None else "") or self.settings.today
+
+    @property
+    def profile(self) -> Profile | None:
+        profile = self.context.profile if self.context is not None else None
+        return None if profile_is_empty(profile) else profile
 
     # -- source selection ----------------------------------------------------
     def replaying(self, brief: Brief) -> bool:
@@ -948,7 +1203,10 @@ class MockBackend:
         if self.replaying(brief):
             assert self.sample is not None
             self.model = str(self.sample.meta().get("model") or self.settings.model)
-            return f"샘플 브리프와 같아서 기록된 실행({self.sample.root.name})을 재생해요"
+            note = f"샘플 브리프와 같아서 기록된 실행({self.sample.root.name})을 재생해요"
+            if self.profile is not None or (self.context is not None and self.context.documents):
+                note += ". 기록을 그대로 재생하므로 회사 프로필과 사용자 자료는 반영되지 않아요"
+            return note
         self.model = TEMPLATE_MODEL
         if self.sample is not None and self.sample.matches(brief):
             return "샘플 기록이 아직 완성되지 않아 [데모] 템플릿으로 만들어요"
@@ -956,6 +1214,26 @@ class MockBackend:
 
     def sim_seconds(self, kind: str, channel: str | None = None, round: int = 0) -> float:
         return sim_seconds(kind, channel, round)
+
+    # -- usage / notices ---------------------------------------------------------
+    def _notice(self, agent: str, level: str, message: str) -> None:
+        if self.on_notice is not None:
+            try:
+                self.on_notice(agent, level, message)
+            except Exception:
+                pass
+
+    def _usage(self, agent: str, task: str, prompt: Any, output: Any) -> None:
+        """Synthetic, free usage (tokens estimated from the text length)."""
+        if self.on_usage is None:
+            return
+        record = mock_usage(agent=agent, task=task, prompt=_as_text(prompt), output=_as_text(output))
+        try:
+            self.on_usage(record)
+        except BackendError:
+            raise
+        except Exception as exc:  # a broken recorder must not fail the run
+            self._notice("system", "warn", f"사용량 기록 중 오류가 나서 이번 호출 사용량을 저장하지 못했어요: {exc}")
 
     # -- Backend protocol ------------------------------------------------------
     def plan(self, brief: Brief) -> Plan:
@@ -965,50 +1243,106 @@ class MockBackend:
             wanted = set(brief.channels)
             missing = [c for c in brief.channels if c not in {o.channel for o in plan.outlines}]
             extra = template_plan(brief.model_copy(update={"channels": missing})).outlines if missing else []
-            return plan.model_copy(update={"outlines": [o for o in plan.outlines if o.channel in wanted] + extra})
-        return template_plan(brief)
+            plan = plan.model_copy(update={"outlines": [o for o in plan.outlines if o.channel in wanted] + extra})
+        else:
+            plan = template_plan(brief, self.profile)
+        self._usage("orchestrator", "plan", [brief, self.profile], plan)
+        return plan
 
     def research(self, brief: Brief, questions: list[ResearchQuestion], emit: EmitFn,
                  existing: ResearchPack | None = None) -> ResearchPack:
         for question in questions:
             emit("research.query", {"question_id": question.id, "query": _query_from_question(question.question)})
+        pack, sent = self._research(brief, questions, existing)
+        self._usage("researcher", "research", [brief, questions, sent], pack)
+        return pack
+
+    def _research(self, brief: Brief, questions: list[ResearchQuestion],
+                  existing: ResearchPack | None) -> tuple[ResearchPack, list[str]]:
         if existing is None:
             if self.replaying(brief):
                 assert self.sample is not None
-                return self.sample.research()
-            return template_research(brief, self.settings.today)
+                return self.sample.research(), []
+            pack = template_research(brief, self.today, self.profile)
+            excerpts, notice = budget_documents(list(self.context.documents) if self.context else [],
+                                                self.settings.max_document_chars)
+            if notice:
+                self._notice("researcher", "warn", notice)
+            if excerpts:
+                s, f = len(pack.sources) + 1, len(pack.findings) + 1
+                mine = template_user_research(excerpts, questions or template_plan(brief, self.profile).questions, s, f, self.today)
+                pack = ResearchPack(findings=[*pack.findings, *mine.findings], sources=[*pack.sources, *mine.sources],
+                                    gaps=pack.gaps)
+            return pack, [e.text for e in excerpts]
         # follow-up: recorded file when present, else a labelled placeholder
         if self.replaying(brief):
             assert self.sample is not None
             channel = questions[0].channels[0] if questions and questions[0].channels else ""
             recorded = self.sample.followup(channel, self._last_review_round.get(channel, 0))
             if recorded is not None:
-                return recorded
-            return ResearchPack(findings=[], sources=[], gaps=[f"(기록된 추가 조사 없음) {q.question}" for q in questions])
-        return template_followup(questions, existing, self.settings.today)
+                return recorded, []
+            return ResearchPack(findings=[], sources=[], gaps=[f"(기록된 추가 조사 없음) {q.question}" for q in questions]), []
+        return template_followup(questions, existing, self.today), []
 
     def draft(self, brief: Brief, plan: Plan, research: ResearchPack, channel: ChannelId) -> Draft:
+        produced = None
         if self.replaying(brief):
             assert self.sample is not None
             recorded = self.sample.draft(channel, 0)
             if recorded is not None:
-                return recorded.model_copy(update={"channel": channel, "round": 0})
-        return template_draft(brief, research, channel, 0)
+                produced = recorded.model_copy(update={"channel": channel, "round": 0})
+        if produced is None:
+            produced = template_draft(brief, research, channel, 0, self.profile)
+        self._usage("orchestrator", "draft", [brief, plan, research, self.profile], produced)
+        return produced
 
     def review(self, brief: Brief, research: ResearchPack, draft: Draft, format_checks: list[FormatCheck]) -> Review:
         self._last_review_round[draft.channel] = draft.round  # a follow-up after this review reads followups/<ch>.r<N>
+        result = None
         if self.replaying(brief):
             assert self.sample is not None
             recorded = self.sample.review(draft.channel, draft.round)
             if recorded is not None:
-                return recorded.model_copy(update={"channel": draft.channel, "round": draft.round, "format_checks": list(format_checks)})
-        return template_review(brief, research, draft, format_checks)
+                result = recorded.model_copy(update={"channel": draft.channel, "round": draft.round,
+                                                     "format_checks": list(format_checks)})
+        if result is None:
+            result = template_review(brief, research, draft, format_checks)
+        self._usage("reviewer", "review", [brief, research, draft, format_checks, self.profile], result)
+        return result
 
-    def revise(self, brief: Brief, plan: Plan, research: ResearchPack, draft: Draft, review: Review) -> Draft:
+    def revise(self, brief: Brief, plan: Plan, research: ResearchPack, draft: Draft, review: Review,
+               instructions: str = "") -> Draft:
         next_round = draft.round + 1
+        human = (instructions or (self.context.instructions if self.context is not None else "") or "").strip()
+        produced = None
         if self.replaying(brief):
             assert self.sample is not None
             recorded = self.sample.draft(draft.channel, next_round)
             if recorded is not None:
-                return recorded.model_copy(update={"channel": draft.channel, "round": next_round})
-        return template_draft(brief, research, draft.channel, next_round)
+                produced = recorded.model_copy(update={"channel": draft.channel, "round": next_round})
+        if produced is None:
+            produced = template_draft(brief, research, draft.channel, next_round, self.profile)
+        if human:
+            note = f"[사람 지시] {_clip(human, 100)} — [데모] mock 모드라 지시는 기록만 했어요(live 모드에서 실제로 반영)"
+            produced = produced.model_copy(update={"change_log": [note, *produced.change_log]})
+        self._usage("orchestrator", "revise", [brief, plan, research, draft, review, human, self.profile], produced)
+        return produced
+
+    def plan_calendar(self, profile: Profile, theme: str, start: str, end: str, counts: dict[str, int],
+                      history: list[ContentItem]) -> ContentPlan:
+        plan = template_calendar(profile, theme, start, end, counts, history)
+        self._usage("orchestrator", "plan_calendar", [profile, theme, start, end, counts, history], plan)
+        return plan
+
+
+def _as_text(value: Any) -> str:
+    """Text used to estimate synthetic token counts."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_as_text(v) for v in value)
+    if hasattr(value, "model_dump_json"):
+        return value.model_dump_json()
+    return json.dumps(value, ensure_ascii=False, default=str)

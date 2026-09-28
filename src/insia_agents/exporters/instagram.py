@@ -14,12 +14,11 @@ PNG rendering uses Playwright + Chromium when available (optional extra
 
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
 import html
 import io
 import os
 import re
+import threading
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +32,8 @@ SLIDE_HEIGHT = 1350
 INSIA_PALETTE = ("#0B1220", "#6D5EF5", "#F5C451")  # dark base, main, accent
 FONT_STACK = ('"Pretendard", "Noto Sans KR", "Noto Sans CJK KR", "Apple SD Gothic Neo", "Malgun Gothic", '
               '"맑은 고딕", "NanumGothic", "나눔고딕", "NanumBarunGothic", "WenQuanYi Zen Hei", sans-serif')
-RENDER_TIMEOUT_MS = 45_000
+RENDER_TIMEOUT_MS = 45_000  # per browser step
+RENDER_DEADLINE_S = 150  # whole render; a hung browser must never block an export request
 
 
 class RenderUnavailable(RuntimeError):
@@ -354,6 +354,20 @@ def slides_html(slides: list[Slide], profile: Profile | None = None, *, title: s
 # ---------------------------------------------------------------------------
 
 
+# Draws "한" and an unassigned code point (U+0378, always the missing-glyph box)
+# with the slide font stack; identical pixels mean no Hangul font is installed
+# and the PNGs would show empty boxes instead of text.
+_HANGUL_CHECK_JS = """() => {
+  const canvas = document.createElement('canvas'); canvas.width = 80; canvas.height = 80;
+  const ctx = canvas.getContext('2d');
+  const font = '56px ' + getComputedStyle(document.body).fontFamily;
+  const sig = (ch) => { ctx.clearRect(0, 0, 80, 80); ctx.font = font; ctx.fillStyle = '#000';
+    ctx.textBaseline = 'top'; ctx.fillText(ch, 8, 8); return Array.from(ctx.getImageData(0, 0, 80, 80).data).join(','); };
+  const hangul = sig('한');
+  return hangul !== sig('\\u0378') && hangul !== sig(' ');
+}"""
+
+
 def _render_sync(page_html: str, count: int, executable: str | None) -> list[bytes]:
     from playwright.sync_api import sync_playwright
 
@@ -363,6 +377,9 @@ def _render_sync(page_html: str, count: int, executable: str | None) -> list[byt
             page = browser.new_page(viewport={"width": SLIDE_WIDTH, "height": SLIDE_HEIGHT}, device_scale_factor=1)
             page.set_content(page_html, wait_until="load", timeout=RENDER_TIMEOUT_MS)
             page.evaluate("() => (document.fonts ? document.fonts.ready.then(() => true) : true)")
+            if not page.evaluate(_HANGUL_CHECK_JS):
+                raise RenderUnavailable("이 컴퓨터에 한글 글꼴이 없어 PNG 글자가 깨져요 "
+                                        "(리눅스·도커라면 fonts-noto-cjk 같은 한글 글꼴을 설치하세요)")
             page.evaluate("() => window.__insiaFit && window.__insiaFit()")
             slides = page.locator("section.slide")
             found = slides.count()
@@ -374,6 +391,27 @@ def _render_sync(page_html: str, count: int, executable: str | None) -> list[byt
             browser.close()
 
 
+def _run_with_deadline(fn, *args):
+    """Run ``fn`` in a daemon thread (the Playwright sync API refuses to run in
+    an asyncio thread, and a hung browser must not block the caller)."""
+    box: dict[str, object] = {}
+
+    def target() -> None:
+        try:
+            box["value"] = fn(*args)
+        except BaseException as exc:  # noqa: BLE001 — re-raised in the caller's thread
+            box["error"] = exc
+
+    worker = threading.Thread(target=target, name="insia-slide-render", daemon=True)
+    worker.start()
+    worker.join(RENDER_DEADLINE_S)
+    if worker.is_alive():
+        raise RenderUnavailable(f"슬라이드를 그리는 데 {RENDER_DEADLINE_S}초가 넘게 걸려 멈췄어요")
+    if "error" in box:
+        raise box["error"]  # type: ignore[misc]
+    return box["value"]
+
+
 def render_pngs(page_html: str, count: int) -> list[bytes]:
     """Render every ``section.slide`` of ``page_html`` to PNG bytes.
 
@@ -383,36 +421,27 @@ def render_pngs(page_html: str, count: int) -> list[bytes]:
     if (os.environ.get("INSIA_RENDER") or "").strip().lower() in {"0", "false", "no", "off"}:
         raise RenderUnavailable("PNG 렌더링이 꺼져 있어요 (INSIA_RENDER=0)")
     try:
-        import playwright.sync_api  # noqa: F401
+        from playwright.sync_api import Error as PlaywrightError
     except ImportError as exc:
         raise RenderUnavailable(
             f"PNG를 만들려면 Playwright가 필요해요. `{EXTRA_HINT.format(extra='render')}` 설치 후 "
             "`playwright install chromium`을 실행하세요"
         ) from exc
-    from playwright.sync_api import Error as PlaywrightError
 
     executable = (os.environ.get("INSIA_CHROMIUM") or "").strip() or None
     if executable and not Path(executable).exists():
         raise RenderUnavailable(f"INSIA_CHROMIUM에 지정한 브라우저를 찾을 수 없어요: {executable}")
 
     try:
-        asyncio.get_running_loop()
-        in_loop = True
-    except RuntimeError:
-        in_loop = False
-    try:
-        if in_loop:  # the sync API refuses to run inside an asyncio loop thread
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(_render_sync, page_html, count, executable).result()
-        return _render_sync(page_html, count, executable)
+        return _run_with_deadline(_render_sync, page_html, count, executable)
     except RenderUnavailable:
         raise
     except PlaywrightError as exc:
         first = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
         hint = "" if executable else " (브라우저가 없다면 `playwright install chromium` 또는 INSIA_CHROMIUM 설정)"
         raise RenderUnavailable(f"브라우저로 슬라이드를 그리지 못했어요: {first[:200]}{hint}") from exc
-    except OSError as exc:
-        raise RenderUnavailable(f"브라우저를 실행하지 못했어요: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 — never fail the export over rendering; fall back to slides.html
+        raise RenderUnavailable(f"브라우저로 슬라이드를 그리지 못했어요: {str(exc).strip()[:200] or exc.__class__.__name__}") from exc
 
 
 # ---------------------------------------------------------------------------

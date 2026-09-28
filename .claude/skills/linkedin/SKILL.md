@@ -22,6 +22,7 @@ argument-hint: "[주제 또는 brief.json 경로] [전하고 싶은 관점(선�
 - 글이면 Brief를 채운다. `notes`에 사용자가 말한 경험·관점을 그대로 옮긴다(글의 1인칭 경험은 여기 있는 것만 쓴다).
 - 주제를 알 수 없을 때만 질문한다(최대 3개): ① 주제 ② 전하고 싶은 관점이나 직접 겪은 일 ③ 읽을 사람(창업자, 채용 후보, 고객사 등).
 - `outputs/<YYYY-MM-DD>-<slug>/brief.json` 저장.
+- 이어서 `.claude/skills/content-studio/SKILL.md` 1-1단계대로 워크스페이스의 회사 프로필(`profile.json`)과 사용자 자료(`documents.json`)를 가져온다. 명령이 실패하면 핵심 사실 3가지만 묻고 진행한다. 프로필이 있으면 브랜드 톤, 기본 CTA, 기본 해시태그(3~5개 안), 필수 문구를 쓰고 금지 표현은 쓰지 않는다. 프로필에 URL이 있어도 본문에는 넣지 않는다.
 
 ## 2. 계획과 리서치
 
@@ -44,16 +45,19 @@ python -m insia_agents check <run>/drafts/linkedin.r0.json
 # 설치 전이면: PYTHONPATH=src python -m insia_agents check <run>/drafts/linkedin.r0.json
 ```
 
+`check`는 가까운 `brief.json`을 자동으로 찾는다(또는 `--brief <run>/brief.json`). `profile.json`이 있으면 금지 표현·필수 문구·블라인드 검사까지 도는 content-studio 4단계의 프로필 포함 명령을 쓴다.
+
 ## 4. 검수와 수정 (최대 2회)
 
-1. `reviewer`에게 채널 `linkedin`, round, 초안·`research.json`·`brief.json`·가이드 경로를 넘긴다. Review JSON을 `reviews/linkedin.r<N>.json`에 저장하고 `finalize_review`로 확정한다(content-studio 5단계 명령).
+1. `reviewer`에게 채널 `linkedin`, round, 초안·`research.json`·`brief.json`·(있으면) `profile.json`·가이드 경로를 넘긴다. Review JSON을 `reviews/linkedin.r<N>.json`에 저장하고 `finalize_review`로 확정한다(content-studio 5단계 명령).
 2. 통과 = 80점 이상 + critical 0개. 미통과면 critical·major를 모두 고치고 `round + 1`로 저장, `change_log`에 이슈별 한 줄.
 3. 2회 뒤에도 미통과면 최고 점수 round를 최종본으로, 미통과로 표시한다.
 
 ## 5. 최종 패키지와 보고
 
 - `final/linkedin.md`(본문 + 해시태그, 첫 댓글 링크 메모), `final/summary.md`(요약 표, 모든 출처, 확인 사항, 승인 체크리스트).
-- 사용자에게: `| 채널 | 점수 | 라운드 | 통과 여부 |` 표, 실행 폴더 경로, 채울 것 3가지 이내, 승인 체크리스트.
+- `python -m insia_agents import-run <run>`으로 워크스페이스 보관함에 가져온다(로컬 저장, 게시 아님). 실패하면 오류를 한 줄로 전하고 나중에 같은 명령으로 가져올 수 있다고 안내한다.
+- 사용자에게: `| 채널 | 점수 | 라운드 | 통과 여부 |` 표, 실행 폴더 경로, 보관함 가져오기 결과, 채울 것 3가지 이내, 승인 체크리스트.
 
 사람 최종 승인 체크리스트 (링크드인)
 - [ ] 1인칭 경험이 실제 있었던 일이다

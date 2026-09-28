@@ -64,6 +64,11 @@ TRPR_ORDER = ("cnfStyle", "divId", "gridBefore", "gridAfter", "wBefore", "wAfter
               "tblHeader", "tblCellSpacing", "jc", "hidden", "ins", "del", "trPrChange")
 ORDERS = {"pPr": PPR_ORDER, "rPr": RPR_ORDER, "tblPr": TBLPR_ORDER, "tcPr": TCPR_ORDER, "trPr": TRPR_ORDER}
 
+CM_PER_UNIT = 0.1676  # one half-width character at 9.5 pt
+CELL_PADDING_CM = 0.5  # left/right cell margins + slack
+SHORT_CELL_UNITS = 18  # cells up to ~9 Korean characters should not wrap
+MAX_MIN_CM = 5.0
+
 _NUMERIC_CELL = re.compile(r"^(약\s?)?[-+]?[\d,.]+\s?(원|%|%p|개|명|건|회|억원|만원|백만원|천원|달러)?$")
 _BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _LABEL_PAREN = re.compile(r"^(\([^()\n]{1,16}\))(\s*)")
@@ -87,29 +92,51 @@ def display_width(text: str) -> int:
     return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
 
 
-def column_widths(rows: list[list[str]], total_cm: float = TEXT_WIDTH_CM, min_cm: float = 1.4) -> list[float]:
-    """Fixed column widths (cm) from content length; wide (Korean) chars count double."""
+def _cell_text(cell: str) -> str:
+    return strip_inline(_BR.sub(" ", cell)).strip()
+
+
+def column_widths(rows: list[list[str]], total_cm: float = TEXT_WIDTH_CM) -> list[float]:
+    """Fixed column widths (cm) that avoid ugly wraps.
+
+    Each column first gets a minimum that fits its longest word and, for short
+    cells (labels, amounts like "약 3조 179억원"), the whole cell on one line.
+    The remaining width goes to columns with long text, by content length.
+    Wide (Korean) characters count as two units.
+    """
     ncols = max(len(r) for r in rows)
+    mins: list[float] = []
     weights: list[float] = []
     for c in range(ncols):
-        lens = [display_width(strip_inline(_BR.sub(" ", r[c]))) if c < len(r) else 0 for r in rows]
+        cells = [_cell_text(r[c]) if c < len(r) else "" for r in rows]
+        lens = [display_width(t) for t in cells]
+        longest_word = max((display_width(w) for t in cells for w in t.split()), default=0)
+        short_cells = max((n for n in lens if n <= SHORT_CELL_UNITS), default=0)
+        min_units = max(longest_word, short_cells, 4)
+        mins.append(min(MAX_MIN_CM, min_units * CM_PER_UNIT + CELL_PADDING_CM))
         longest = max(lens) if lens else 0
         average = sum(lens) / len(lens) if lens else 0
-        weights.append(max(4, min(longest, 60)) * 0.5 + max(4, min(average, 60)) * 0.5)
-    raw = [max(min_cm, total_cm * w / sum(weights)) for w in weights]
-    scale = total_cm / sum(raw)
-    return [round(w * scale, 2) for w in raw]
+        weights.append(max(0.0, min(longest, 80) * 0.5 + min(average, 80) * 0.5 - min_units))
+    spare = total_cm - sum(mins)
+    if spare <= 0:
+        scale = total_cm / sum(mins)
+        return [round(m * scale, 2) for m in mins]
+    if sum(weights) <= 0:
+        weights = [1.0] * ncols
+    widths = [m + spare * w / sum(weights) for m, w in zip(mins, weights)]
+    return [round(w, 2) for w in widths]
 
 
-def _numeric_columns(rows: list[list[str]]) -> set[int]:
-    numeric: set[int] = set()
+def _numeric_columns(rows: list[list[str]]) -> dict[int, str]:
+    """Columns whose cells are mostly numbers → "right" (amounts) or "center" (short indexes)."""
+    result: dict[int, str] = {}
     if not rows:
-        return numeric
+        return result
     for c in range(max(len(r) for r in rows)):
-        values = [strip_inline(r[c]).strip() for r in rows if c < len(r) and strip_inline(r[c]).strip()]
+        values = [_cell_text(r[c]) for r in rows if c < len(r) and _cell_text(r[c])]
         if values and sum(1 for v in values if _NUMERIC_CELL.match(v)) / len(values) >= 0.6:
-            numeric.add(c)
-    return numeric
+            result[c] = "center" if all(len(v) <= 3 for v in values) else "right"
+    return result
 
 
 class _Builder:
@@ -298,7 +325,7 @@ class _Builder:
         paragraph._p.append(link)
 
     def _runs(self, paragraph, text: str, *, size: float | None = None, color: str | None = None,
-              bold: bool = False, italic: bool = False, links: bool = True) -> None:
+              bold: bool = False, italic: bool = False, links: bool = True, highlight: bool = True) -> None:
         pieces = _BR.split(text)
         for index, piece in enumerate(pieces):
             if index:
@@ -316,7 +343,7 @@ class _Builder:
                     run.font.size = self.Pt(size)
                 if color:
                     self._set_color(run.font, color)
-                if seg.kind == "placeholder":
+                if seg.kind == "placeholder" and highlight and not self.in_references:
                     run.font.highlight_color = self.HIGHLIGHT.YELLOW
 
     def _paragraph(self, *, style: str | None = None, before: float | None = None, after: float | None = None,
@@ -358,7 +385,7 @@ class _Builder:
         self._box(text, fill="FDECEA", border_color="D92D20", border_val="single", color="912018", bold=True)
 
     def _box(self, text: str, *, fill: str, border_color: str, border_val: str, color: str,
-             bold: bool = False, italic: bool = False, align=None) -> None:
+             bold: bool = False, italic: bool = False, align=None, label: str = "") -> None:
         table = self.doc.add_table(rows=1, cols=1)
         table.alignment = self.TABLE_ALIGN.CENTER
         table.autofit = False
@@ -371,6 +398,8 @@ class _Builder:
         fmt.space_before, fmt.space_after, fmt.line_spacing = self.Pt(4), self.Pt(4), 1.25
         if align is not None:
             paragraph.alignment = align
+        if label:
+            self._runs(paragraph, label + " ", size=9.5, color=color, bold=True, highlight=False, links=False)
         self._runs(paragraph, text, size=9.5, color=color, bold=bold, italic=italic)
         self._after_table()
 
@@ -443,8 +472,8 @@ class _Builder:
         self._runs(paragraph, block.text, italic=True, color=MUTED)
 
     def image(self, block: Block) -> None:
-        self._box(f"[이미지 자리] {block.text}", fill="F3F4F6", border_color="9CA3AF", border_val="dashed",
-                  color=NOTE, italic=True, align=self.ALIGN.CENTER)
+        self._box(block.text or "사진", fill="F3F4F6", border_color="9CA3AF", border_val="dashed",
+                  color=NOTE, italic=True, align=self.ALIGN.CENTER, label="[이미지 자리]")
 
     def _shade(self, cell, fill: str) -> None:
         tcpr = cell._tc.get_or_add_tcPr()
@@ -505,8 +534,10 @@ class _Builder:
                 align = block.aligns[c_index] if c_index < len(block.aligns) else ""
                 if r_index == 0 or align == "center":
                     paragraph.alignment = self.ALIGN.CENTER
-                elif align == "right" or c_index in numeric:
+                elif align == "right" or numeric.get(c_index) == "right":
                     paragraph.alignment = self.ALIGN.RIGHT
+                elif numeric.get(c_index) == "center":
+                    paragraph.alignment = self.ALIGN.CENTER
                 self._runs(paragraph, values[c_index], size=9.5, bold=r_index == 0)
         self._after_table()
 

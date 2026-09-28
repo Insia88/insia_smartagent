@@ -176,3 +176,141 @@ def test_real_sample_replays(settings):
             assert isinstance(draft, Draft)
         for review in channel_result.reviews:
             assert isinstance(review, Review)
+
+
+# ---------------------------------------------------------------------------
+# Run context: profile, user documents, instructions, synthetic usage
+# ---------------------------------------------------------------------------
+
+from insia_agents.backends.base import RunContext  # noqa: E402
+from insia_agents.models import Profile, TeamMember, UserDocument  # noqa: E402
+
+PROFILE = Profile(
+    company_name="인시아랩", service_name="INSIA", one_liner="1인 창업자를 위한 AI 콘텐츠 비서",
+    target_customers="동네 카페 사장님", problem="콘텐츠 제작 시간이 부족함", differentiators=["출처 기반 작성"],
+    business_model="월 구독형 SaaS", traction=["베타 사용자 120명(2026-08 기준)"],
+    team=[TeamMember(role="대표", name="김철수", background="마케팅 10년"), TeamMember(role="디자이너", hiring=True)],
+    banned_words=["완벽한", "업무자동화"], required_phrases=["#광고아님"], default_hashtags=["#INSIA"],
+    cta="무료 체험은 프로필 링크에서", contact="hello@insia.kr", instagram_handle="@insia.ai", brand_colors=["#6D5EF5"],
+)
+
+
+def _profiled(settings, **context) -> MockBackend:
+    backend = MockBackend(settings)
+    backend.context = RunContext(**{"profile": PROFILE, "documents": [], "today": "2026-09-28", **context})
+    return backend
+
+
+def test_profile_values_appear_in_template_drafts(brief):
+    research = template_research(brief, "2026-09-28", PROFILE)
+    drafts = {(c, r): template_draft(brief, research, c, r, PROFILE) for c in ALL_CHANNELS for r in (0, 1)}
+    biz = drafts[("bizplan", 1)].content
+    assert "INSIA 사업계획서" in drafts[("bizplan", 1)].title
+    assert "| 기업명 | 인시아랩 (자사 자료) |" in biz and "| 사업 형태 | 월 구독형 SaaS (자사 자료) |" in biz
+    assert "- 실적·지표: 베타 사용자 120명(2026-08 기준) (자사 자료)" in biz
+    assert "| 대표 | ○○○ | 대표 | 마케팅 10년 (자사 자료) |" in biz and "| 채용 예정 | ○○○ | 디자이너 | [요구 역량: ○○] |" in biz
+    assert "김철수" not in biz and "동네 카페 사장님" in biz
+    for channel in ("naver_blog", "linkedin", "instagram"):
+        final = drafts[(channel, 1)]
+        assert "#광고아님" in final.content and "무료 체험은 프로필 링크에서" in final.content
+        assert final.hashtags[0] == "#INSIA"
+    assert "계정명 @insia.ai" in drafts[("instagram", 0)].content and "브랜드 주 색(#6D5EF5) 배경" in drafts[("instagram", 0)].content
+    assert "문의: hello@insia.kr" in drafts[("naver_blog", 0)].content
+    assert "참고로 INSIA를 한 줄로 소개하면" in drafts[("linkedin", 1)].content
+
+
+def test_profile_checks_drive_a_realistic_loop(brief):
+    research = template_research(brief, "2026-09-28", PROFILE)
+    for channel in ALL_CHANNELS:
+        revised = template_draft(brief, research, channel, 1, PROFILE)
+        failed = [c for c in check_format(revised, brief, PROFILE) if not c.passed]
+        assert not failed, (channel, failed)
+    blog_r0 = {c.id: c.passed for c in check_format(template_draft(brief, research, "naver_blog", 0, PROFILE), brief, PROFILE)}
+    assert blog_r0["banned_words"] is False  # the template says "완벽한"; the revision removes it
+    blog_r1 = template_draft(brief, research, "naver_blog", 1, PROFILE)
+    assert "완벽한" not in blog_r1.content and "#업무자동화" not in blog_r1.hashtags
+    assert any("금지 표현" in line for line in blog_r1.change_log)
+
+
+def test_user_documents_become_user_sources_and_demo_findings(settings, brief):
+    docs = [UserDocument(id="u1", title="회사 소개서", text="INSIA는 2026년에 시작한 서비스다. 두 번째 문장이다." * 40),
+            UserDocument(id="u2", title="빈 자료", text="   "),
+            UserDocument(id="u3", title="IR 메모", text="# 요약\n베타 사용자는 120명이다.")]
+    backend = MockBackend(replace(settings, max_document_chars=500))
+    backend.context = RunContext(profile=None, documents=docs, today="2026-09-28")
+    notices = []
+    backend.on_notice = lambda agent, level, msg: notices.append((agent, level, msg))
+    plan = backend.plan(brief)
+    pack = backend.research(brief, plan.questions, lambda t, d: None)
+    users = [s for s in pack.sources if s.origin == "user"]
+    assert [(s.id, s.url, s.tier, s.publisher, s.title) for s in users] == [
+        ("s5", "user://u1", 1, "사용자 제공 자료", "회사 소개서"), ("s6", "user://u3", 1, "사용자 제공 자료", "IR 메모")]
+    claims = [f for f in pack.findings if f.source_ids[0] in ("s5", "s6")]
+    assert [f.claim for f in claims] == [
+        "[데모] 「회사 소개서」(사용자 제공 자료)에 적힌 내용: INSIA는 2026년에 시작한 서비스다.",
+        "[데모] 「IR 메모」(사용자 제공 자료)에 적힌 내용: 요약 베타 사용자는 120명이다."]
+    assert all(f.confidence == "medium" and "외부 검증 전" in f.note for f in claims)
+    assert {f.question_id for f in claims} <= {q.id for q in plan.questions}
+    assert [(a, lvl) for a, lvl, m in notices if "max_document_chars" in m] == [("researcher", "warn")]
+    # follow-ups never re-add the documents
+    followup = backend.research(brief, plan.questions[:1], lambda t, d: None, existing=pack)
+    assert not any(s.origin == "user" for s in followup.sources)
+    # the business plan cites them as 자사 자료
+    biz = template_draft(brief, pack, "bizplan", 1)
+    assert "- [s5] 자사 자료, 「회사 소개서」(사용자 제공, 외부 검증 전)" in biz.content and "[s5]" in biz.content.split("## 1.")[0]
+    blog = template_draft(brief, pack, "naver_blog", 1)
+    assert "출처: 자사 자료 「IR 메모」(사용자 제공)" in blog.content
+
+
+def test_mock_reports_free_synthetic_usage(settings, brief):
+    from insia_agents.pipeline import execute_run
+
+    backend = _profiled(settings)
+    records = []
+    backend.on_usage = records.append
+    brief1 = brief.model_copy(update={"channels": ["linkedin"]})
+    context = RunContext(profile=PROFILE, documents=[], today="2026-09-28")
+    result, _ = execute_run(brief1, settings, backend=backend, context=context)
+    tasks = [r.task for r in records]
+    assert tasks[:2] == ["plan", "research"] and "draft" in tasks and "review" in tasks
+    assert all(r.model == "mock" and r.cost_usd == 0.0 and r.input_tokens > 0 and r.output_tokens > 0 for r in records)
+    assert result.results[0].final.hashtags[0] == "#INSIA"
+
+
+def test_mock_revise_records_human_instructions(settings, brief):
+    backend = _profiled(settings, instructions="도입부를 두 문장으로 줄여 주세요")
+    research = template_research(brief, "2026-09-28")
+    draft = template_draft(brief, research, "linkedin", 0)
+    review = template_review(brief, research, draft, check_format(draft, brief))
+    plan = template_plan(brief)
+    from_context = backend.revise(brief, plan, research, draft, review)
+    assert from_context.round == 1 and from_context.change_log[0].startswith("[사람 지시] 도입부를 두 문장으로 줄여 주세요")
+    explicit = backend.revise(brief, plan, research, draft, review, instructions="해시태그를 3개로")
+    assert explicit.change_log[0].startswith("[사람 지시] 해시태그를 3개로")
+    plain = MockBackend(backend.settings).revise(brief, plan, research, draft, review)
+    assert not any(line.startswith("[사람 지시]") for line in plain.change_log)
+
+
+def test_replay_ignores_the_context_and_says_so(settings, sample_dir):
+    backend = MockBackend(replace(settings, sample_dir=sample_dir))
+    brief = SampleRun.load(sample_dir).brief
+    recorded = SampleRun.load(sample_dir).research()
+    backend.context = RunContext(profile=PROFILE, documents=[UserDocument(id="u1", title="자료", text="본문")], today="2026-09-28")
+    assert "반영되지 않아요" in backend.prepare(brief)
+    assert backend.research(brief, [], lambda t, d: None) == recorded
+    assert backend.draft(brief, backend.plan(brief), recorded, "linkedin").title == "기록 R0"
+
+
+@pytest.mark.skipif(not (REAL_SAMPLE / "research.json").is_file(), reason="examples/sample-run is not recorded yet")
+def test_real_sample_replay_is_unchanged_by_a_profile(settings):
+    real = replace(settings, sample_dir=REAL_SAMPLE)
+    brief = Brief.model_validate_json((REAL_SAMPLE / "brief.json").read_text(encoding="utf-8"))
+    plain, profiled = MockBackend(real), MockBackend(real)
+    profiled.context = RunContext(profile=PROFILE, documents=[UserDocument(id="u1", title="자료", text="본문")], today="2026-09-28")
+    for backend in (plain, profiled):
+        backend.prepare(brief)
+    assert plain.research(brief, [], lambda t, d: None) == profiled.research(brief, [], lambda t, d: None)
+    plan = plain.plan(brief)
+    for channel in brief.channels:
+        assert plain.draft(brief, plan, plain.research(brief, [], lambda t, d: None), channel) == \
+            profiled.draft(brief, plan, profiled.research(brief, [], lambda t, d: None), channel)

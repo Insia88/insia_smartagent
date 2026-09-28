@@ -268,7 +268,7 @@
     instagram: { minSlides: 7, maxSlides: 10, maxCaption: 2200, maxHook: 125, minTags: 3, maxTags: 5 }
   };
   ws.LIMITS = LIMITS;
-  var LINE_BREAK = /\r\n|[\n\r\u000b\u000c\u001c\u001d\u001e\u0085  ]/;
+  var LINE_BREAK = /\r\n|[\n\r\u000b\u000c\u001c\u001d\u001e\u0085\u2028\u2029]/;
   function cpLen(s) { return Array.from(s).length; }  // Python len() counts code points
   function charsWithSpace(t) { return cpLen(String(t || '').trim()); }
   function charsNoSpace(t) { return cpLen(String(t || '').replace(/\s/g, '')); }
@@ -441,7 +441,7 @@
           itemId ? el('a', { class: 'btn btn--small', href: '#/library/' + encodeURIComponent(itemId), text: '보관함에서 보기' }) : null,
           el('button', { type: 'button', class: 'btn btn--small btn--ghost', text: '닫기', onclick: function () { banner.hidden = true; } })
         ]);
-        toast((opts.label || '작업') + (ok ? '이 끝났어요' + result : '이 실패했어요'), ok ? 'success' : 'error');
+        toast((opts.label || '작업') + (ok ? ' 완료' + result : ' 실패'), ok ? 'success' : 'error');
         jobListeners.forEach(function (fn) {
           try { fn({ runId: runId, itemId: itemId, slotId: opts.slotId || '', ok: ok, state: state, event: ev }); } catch (e) { if (window.console) console.warn(e); }
         });

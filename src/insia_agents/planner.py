@@ -208,34 +208,38 @@ def normalize_plan(plan: ContentPlan, start: str, end: str, counts: Mapping[str,
     """Make any backend's plan obey the calendar rules.
 
     Drops slots with an unknown/unrequested channel, an empty topic or a date
-    outside the range; moves a weekend slot to the nearest free weekday;
-    keeps one post per channel per day and at most ``counts[channel]`` posts
-    (earliest first); sorts by date then channel order. Idempotent.
+    outside the range; keeps one post per channel per day and at most
+    ``counts[channel]`` posts. Slots already on a free weekday are kept first
+    (earliest first); then a weekend or same-day duplicate moves to the
+    nearest free weekday while the channel still has room. Sorted by date
+    then channel order. Idempotent.
     """
     days = slot_days(start, end)
     allowed = set(days)
     span = {d.isoformat() for d in date_span(start, end)}
     wanted = normalize_counts(counts) if counts else {}
     order = {c: i for i, c in enumerate(ALL_CHANNELS)}
-    taken: dict[str, set[str]] = {}
+    taken: dict[str, set[str]] = {c: set() for c in wanted}
     kept: list[PlannedSlot] = []
 
-    candidates = sorted(plan.slots, key=lambda s: (s.date, order.get(s.channel, 99)))
-    for slot in candidates:
-        if slot.channel not in wanted or not slot.topic.strip():
+    candidates = [s for s in sorted(plan.slots, key=lambda s: (s.date, order.get(s.channel, 99)))
+                  if s.channel in wanted and s.topic.strip() and s.date.strip() in span]
+    movers: list[PlannedSlot] = []
+    for slot in candidates:  # pass 1: slots that are fine where they are
+        day, used = slot.date.strip(), taken[slot.channel]
+        if day in allowed and day not in used and len(used) < wanted[slot.channel]:
+            used.add(day)
+            kept.append(_clean_slot(slot, day))
+        else:
+            movers.append(slot)
+    for slot in movers:  # pass 2: relocate while there is room
+        used = taken[slot.channel]
+        free = [d for d in days if d not in used]
+        if len(used) >= wanted[slot.channel] or not free:
             continue
         day = slot.date.strip()
-        if day not in span:
-            continue
-        used = taken.setdefault(slot.channel, set())
-        if len(used) >= wanted[slot.channel]:
-            continue
-        if day not in allowed or day in used:
-            free = [d for d in days if d not in used]
-            if not free:
-                continue
-            target = date.fromisoformat(day)
-            day = min(free, key=lambda d: (abs((date.fromisoformat(d) - target).days), d < day))
+        target = date.fromisoformat(day)
+        day = min(free, key=lambda d: (abs((date.fromisoformat(d) - target).days), d < day))
         used.add(day)
         kept.append(_clean_slot(slot, day))
 

@@ -157,7 +157,7 @@ def test_pause_turn_resume_through_real_sdk(settings, prompts_dir, brief, plan):
     assert blocks[1]["id"] == "srvtoolu_1" and blocks[1]["input"] == {"query": "소상공인 실태조사 2025"}
     assert blocks[2]["content"][0]["encrypted_content"] == "xyz"
     assert ("research.query", {"question_id": "q1", "query": "소상공인 실태조사 2025"}) in emitted
-    structure = json.loads(seen[2].content)["messages"][0]["content"]
+    structure = "\n".join(b["text"] for b in json.loads(seen[2].content)["messages"][0]["content"])
     assert "https://kosis.kr/a" in structure
 
 
@@ -210,3 +210,43 @@ def test_mid_stream_error_event_is_classified_by_type(settings, prompts_dir, bri
         backend.plan(brief)
     assert info.value.retryable
     assert "(200)" not in str(info.value) and "잠시 후 다시 실행해 주세요" in str(info.value)
+
+
+def _usage_stream(text: str) -> bytes:
+    message = {"id": "msg_5", "type": "message", "role": "assistant", "model": "claude-opus-5", "content": [],
+               "stop_reason": None, "stop_sequence": None,
+               "usage": {"input_tokens": 1500, "output_tokens": 1, "cache_read_input_tokens": 20000,
+                         "cache_creation_input_tokens": 800}}
+    return _sse([
+        ("message_start", {"type": "message_start", "message": message}),
+        ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                           "usage": {"output_tokens": 2400,
+                                     "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 1}}}),
+        ("message_stop", {"type": "message_stop"}),
+    ])
+
+
+def test_profile_blocks_and_usage_through_real_sdk(settings, prompts_dir, brief, plan):
+    from insia_agents.backends.base import RunContext
+    from insia_agents.models import Profile, TeamMember
+
+    seen: list[httpx2.Request] = []
+    backend = AnthropicBackend(settings, client=_client([_usage_stream(plan.model_dump_json())], seen))
+    backend.context = RunContext(profile=Profile(service_name="INSIA", team=[TeamMember(role="대표", name="김철수")]),
+                                 documents=[], today="2026-09-28")
+    records = []
+    backend.on_usage = records.append
+    assert backend.plan(brief.model_copy(update={"channels": ["linkedin"]})) == plan
+    body = json.loads(seen[0].content)
+    content = body["messages"][0]["content"]
+    assert [b["type"] for b in content] == ["text", "text"]
+    assert content[0]["cache_control"] == {"type": "ephemeral"} and "INSIA" in content[0]["text"]
+    assert "cache_control" not in content[1]
+    assert "김철수" in content[0]["text"]  # a LinkedIn-only plan may use names
+    (record,) = records
+    assert (record.input_tokens, record.output_tokens, record.cache_read_tokens, record.cache_write_tokens,
+            record.web_search_requests) == (1500, 2400, 20000, 800, 2)
+    assert record.cost_usd == pytest.approx((1500 * 5 + 2400 * 25 + 20000 * 0.5 + 800 * 6.25) / 1e6 + 0.02)

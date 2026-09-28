@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel
 
-from insia_agents.models import Draft, Plan, ResearchPack, Review
+from insia_agents.models import ContentPlan, Draft, Plan, ResearchPack, Review
 from insia_agents.schema import UNSUPPORTED_KEYS, SchemaError, iter_objects, json_format, output_schema
 
 
@@ -21,7 +21,7 @@ def _walk(node):
             yield from _walk(item)
 
 
-@pytest.mark.parametrize("model", [Plan, ResearchPack, Draft, Review])
+@pytest.mark.parametrize("model", [Plan, ResearchPack, Draft, Review, ContentPlan])
 def test_strict_schema(model):
     schema = output_schema(model)
     objects = list(iter_objects(schema))
@@ -43,6 +43,15 @@ def test_all_fields_required_even_with_defaults():
     source = output_schema(ResearchPack)["properties"]["sources"]["items"]
     assert source["properties"]["tier"]["enum"] == [1, 2, 3]
     assert "title" in source["properties"]  # a property *named* title survives
+    assert source["properties"]["origin"]["enum"] == ["web", "user"] and "origin" in source["required"]
+
+
+def test_content_plan_schema_for_the_calendar():
+    slot = output_schema(ContentPlan)["properties"]["slots"]["items"]
+    assert set(slot["required"]) == {"date", "channel", "topic", "angle", "keywords", "goal"}
+    assert slot["properties"]["channel"]["enum"] == ["bizplan", "naver_blog", "linkedin", "instagram"]
+    assert slot["properties"]["keywords"] == {"type": "array", "items": {"type": "string"},
+                                              "description": slot["properties"]["keywords"]["description"]}
 
 
 def test_dict_fields_are_rejected():

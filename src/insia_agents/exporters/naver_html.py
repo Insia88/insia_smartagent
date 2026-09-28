@@ -144,7 +144,7 @@ button:focus-visible { outline: 3px solid #1D4ED8; outline-offset: 2px; }
 .panel { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin-top: 16px; }
 .panel h2 { font-size: 15px; margin: 0 0 10px; }
 .panel ol, .panel ul { margin: 0; padding-left: 20px; line-height: 1.7; font-size: 14px; }
-.stats { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.panel ul.stats { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .stats li { border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; font-size: 13px; font-variant-numeric: tabular-nums; }
 .stats li.bad { border-color: #F3B4AE; color: var(--bad); }
 .warn { background: var(--warn-bg); border-color: #F2D08A; color: var(--warn); }

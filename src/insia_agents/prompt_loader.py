@@ -283,9 +283,10 @@ def budget_documents(documents: list[UserDocument], max_chars: int) -> tuple[lis
         if take <= 0:
             skipped.append(f"「{_title(doc)}」")
             continue
-        excerpts.append(DocumentExcerpt(document=doc, text=full[:take].rstrip(), total_chars=len(full)))
-        if take < len(full):
-            cut.append(f"「{_title(doc)}」 {len(full):,}자 → {take:,}자")
+        excerpt = DocumentExcerpt(document=doc, text=full[:take].rstrip(), total_chars=len(full))
+        excerpts.append(excerpt)
+        if excerpt.truncated:
+            cut.append(f"「{_title(doc)}」 {len(full):,}자 → {len(excerpt.text):,}자")
     if not cut and not skipped:
         return excerpts, None
     total = sum(len(t) for t in texts.values())
