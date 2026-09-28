@@ -25,3 +25,22 @@ jobs:
 
       - name: Build artifact
         run: python scripts/build_artifact.py
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          python -m pip install -e ".[export,docs]" pytest playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Dashboard end-to-end tests
+        env:
+          INSIA_E2E_REQUIRED: "1"
+        run: python -m pytest -q tests/test_e2e_dashboard.py

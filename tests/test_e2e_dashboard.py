@@ -30,6 +30,8 @@ import pytest
 try:  # a missing or broken Playwright install (e.g. no greenlet wheel) skips the module
     from playwright import sync_api
 except ImportError as exc:  # includes ModuleNotFoundError
+    if os.environ.get("INSIA_E2E_REQUIRED") == "1":  # CI: a missing browser must fail, not skip
+        raise
     pytest.skip(f"Playwright가 없어서 대시보드 E2E를 건너뛰어요 ({exc})", allow_module_level=True)
 
 from insia_agents.config import Settings, today_kst  # noqa: E402
@@ -121,6 +123,8 @@ def e2e(tmp_path_factory):
     except Exception as exc:  # noqa: BLE001 - no browser on this machine
         pw.stop()
         mp.undo()
+        if os.environ.get("INSIA_E2E_REQUIRED") == "1":
+            raise
         pytest.skip(f"Chromium을 띄울 수 없어서 대시보드 E2E를 건너뛰어요: {str(exc).splitlines()[0]}")
     server = Server(settings)
     shots = os.environ.get("INSIA_E2E_SHOTS")

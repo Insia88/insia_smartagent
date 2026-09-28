@@ -278,7 +278,8 @@ def _norm_space(text: str) -> str:
 
 def profile_checks(draft: Draft, profile: Profile) -> list[FormatCheck]:
     """Brand checks derived from the company profile (deterministic)."""
-    text = f"{draft.title}\n{draft.content}"
+    # hashtags count too: they are part of what gets posted (the paste text ends with them)
+    text = f"{draft.title}\n{draft.content}\n{' '.join(draft.hashtags)}"
     flat = _norm_space(text)
     checks: list[FormatCheck] = []
 

@@ -80,3 +80,13 @@ def test_finalize_review_clamps_and_fills_missing():
     assert next(r for r in final.rubric if r.id == "hook").score == 25
     assert next(r for r in final.rubric if r.id == "slide_flow").comment == "검수 결과 누락"
     assert 0 <= final.score <= 100
+
+
+def test_required_phrase_in_hashtags_counts():
+    from insia_agents.channels import profile_checks
+    from insia_agents.models import Draft, Profile
+
+    profile = Profile(required_phrases=["#광고"])
+    draft = Draft(channel="instagram", round=0, title="t", content="## 캐러셀\n\n## 캡션\n본문", hashtags=["#광고", "#AI"])
+    check = next(c for c in profile_checks(draft, profile) if c.id == "required_phrases")
+    assert check.passed, check
