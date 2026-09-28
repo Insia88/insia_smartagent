@@ -12,16 +12,19 @@
 
 ## 에이전트가 일하는 모습 보기
 
-`web/`의 대시보드가 세 에이전트의 작업을 실시간으로 보여 줍니다. 활성화된 에이전트는 모션 영상으로 움직이고, 작업이 넘어갈 때마다 패킷이 에이전트 사이를 오가며, 채널 카드에 점수와 수정 라운드가 채워집니다. API 키가 없어도 실제로 녹화한 실행 기록을 재생하는 데모 모드로 볼 수 있습니다.
+`web/`의 대시보드가 세 에이전트의 작업을 실시간으로 보여 줍니다. 활성화된 에이전트는 모션 영상으로 움직이고, 작업이 넘어갈 때마다 패킷이 에이전트 사이를 오가며, 채널 카드에 점수와 수정 라운드가 채워집니다. API 키가 없어도 실행 기록을 재생하는 데모 모드로 볼 수 있습니다.
 
 ```bash
 pip install -e .
-insia serve            # http://127.0.0.1:8765 에서 대시보드 열기
+insia serve            # http://127.0.0.1:8765 에서 대시보드 열기 (API 키 없어도 됨)
 ```
 
-- **데모 모드**: 서버 없이 `web/index.html`을 열거나, API 키 없이 `insia serve`를 실행하면 `web/demo/demo-run.json`(샘플 브리프로 실제 리서치·작성·검수를 돌린 기록)을 재생합니다. 1×/2×/4× 속도, 일시정지, 구간 이동이 됩니다.
-- **라이브 모드**: `ANTHROPIC_API_KEY`가 있으면 대시보드의 브리프 폼으로 새 작업을 실행하고, 이벤트가 SSE로 들어오는 대로 화면에 그립니다.
-- **3D로 보기**: 에이전트 카드의 버튼을 누르면 카피바라 3D 모델(GLB)을 돌려 볼 수 있습니다.
+- **데모 모드**: 페이지를 열면 실행 기록을 재생합니다. `web/demo/demo-run.json`(`insia run --record`로 녹화한 기록)이 있으면 그 파일을, 없으면 손으로 만든 예시 `web/demo/sample-trace.json`을 씁니다. 1×/2×/4× 속도, 일시정지, 구간 이동이 됩니다. 브라우저는 `file://` 페이지의 `fetch()`를 막으므로 `web/index.html`을 파일로 바로 열면 기록을 불러오지 못합니다. 아래 셋 중 하나로 여세요.
+  - `insia serve`
+  - 정적 서버: `cd web && python3 -m http.server 8000` 뒤 http://127.0.0.1:8000
+  - 단일 페이지 빌드: `python scripts/build_artifact.py`로 만든 `dist/artifact/index.html`. 기록과 에셋 목록이 페이지 안에 들어 있어 파일로 열어도 재생됩니다.
+- **라이브 모드**: `insia serve`로 열면 **새 실행** 버튼(브리프 폼)으로 작업을 시작하고, 이벤트가 SSE로 들어오는 대로 화면에 그립니다. API 자격 증명(`ANTHROPIC_API_KEY` 등)이 있으면 Claude API로 실제 실행하고, 없으면 모의 실행으로 같은 흐름을 보여 줍니다. 대시보드 API는 같은 주소에서 연 대시보드 페이지만 쓰도록 되어 있습니다.
+- **3D로 보기**: 에이전트 카드의 3D 버튼을 누르면 카피바라 3D 모델(GLB)을 돌려 볼 수 있습니다. 뷰어 스크립트를 CDN에서 불러오므로 인터넷 연결이 필요합니다.
 
 ## 빠른 시작
 
@@ -30,8 +33,8 @@ insia serve            # http://127.0.0.1:8765 에서 대시보드 열기
 ```bash
 pip install -e .
 
-# API 키 없이: 녹화된 샘플 실행을 재생 (모의 모드)
-insia run --brief examples/sample-run/brief.json --mode mock
+# API 키 없이: 녹화된 샘플 실행을 재생 (모의 모드, --speed 0이면 기다리지 않고 바로 끝남)
+insia run --brief examples/sample-run/brief.json --mode mock --speed 0
 
 # 실제 실행: Claude API로 리서치(웹 검색)·작성·검수
 export ANTHROPIC_API_KEY=sk-ant-...

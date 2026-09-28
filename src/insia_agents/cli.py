@@ -116,7 +116,7 @@ def build_brief(args: argparse.Namespace) -> Brief:
     if args.brief:
         path = Path(args.brief)
         try:
-            brief = Brief.model_validate_json(path.read_text(encoding="utf-8"))
+            brief = Brief.model_validate_json(path.read_text(encoding="utf-8-sig"))  # -sig: tolerate a UTF-8 BOM
         except OSError as exc:
             raise UsageError(f"브리프 파일을 읽을 수 없어요: {path} ({exc.strerror})") from None
         except ValidationError as exc:
@@ -177,6 +177,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     brief = build_brief(args)
     settings = _settings_from_args(args)
+    if args.record and Path(args.record).is_dir():
+        raise UsageError(f"--record에는 폴더가 아닌 파일 경로를 지정해 주세요 (예: {Path(args.record) / 'demo-run.json'})")
     printer = ProgressPrinter(quiet=args.quiet)
     try:
         result, bus = execute_run(brief, settings, listener=printer)
@@ -190,9 +192,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"실행하지 못했어요: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
+    exit_code = 0
     if args.record:
         record_path = Path(args.record)
-        record_path.parent.mkdir(parents=True, exist_ok=True)
         meta = {
             "title": f"INSIA 실행 기록 — {brief.topic[:40]}",
             "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -200,8 +202,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             "model": result.model,
             "brief": brief.model_dump(mode="json"),
         }
-        record_path.write_text(json.dumps(bus.to_trace(meta), ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
-        print(f"트레이스 저장: {record_path} (이벤트 {len(bus)}개)")
+        try:
+            record_path.parent.mkdir(parents=True, exist_ok=True)
+            record_path.write_text(json.dumps(bus.to_trace(meta), ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"트레이스를 저장하지 못했어요: {record_path} ({exc.strerror or exc})", file=sys.stderr)
+            exit_code = 1
+        else:
+            print(f"트레이스 저장: {record_path} (이벤트 {len(bus)}개)")
 
     print("\n채널별 결과")
     out_dir = settings.out_dir / result.run_id if settings.out_dir is not None else None
@@ -210,7 +218,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         verdict = "통과" if item.passed else "미통과"
         where = f"  {out_dir / (item.channel + '.md')}" if out_dir is not None else ""
         print(f"- {channel_label(item.channel)}: {score}점 · {verdict} · 수정 {item.rounds}회{where}")
-    return 0
+    return exit_code
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -242,7 +250,7 @@ def _find_brief_near(path: Path) -> Path | None:
 def cmd_check(args: argparse.Namespace) -> int:
     path = Path(args.draft)
     try:
-        draft = Draft.model_validate_json(path.read_text(encoding="utf-8"))
+        draft = Draft.model_validate_json(path.read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise UsageError(f"초안 파일을 읽을 수 없어요: {path} ({exc.strerror})") from None
     except ValidationError as exc:
@@ -251,7 +259,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     brief = None
     if brief_path is not None:
         try:
-            brief = Brief.model_validate_json(brief_path.read_text(encoding="utf-8"))
+            brief = Brief.model_validate_json(brief_path.read_text(encoding="utf-8-sig"))
         except (OSError, ValidationError):
             raise UsageError(f"브리프 파일을 읽을 수 없어요: {brief_path}") from None
     checks = check_format(draft, brief)
@@ -293,7 +301,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--out", help="결과 폴더 (기본 outputs)")
     run.add_argument("--no-save", action="store_true", help="결과 파일을 저장하지 않아요")
     run.add_argument("--record", help="대시보드용 트레이스 JSON 저장 경로 (예: web/demo/demo-run.json)")
-    run.add_argument("--speed", type=float, help="mock 재생 속도 (1.0 = 실제 시간, 0 = 기다리지 않음)")
+    run.add_argument("--speed", type=float,
+                     help="mock 재생 배속 (기본 1 = 실제 시간, 2 = 2배 빠르게, 0.5 = 2배 느리게, 0 = 기다리지 않음)")
     run.add_argument("--max-rounds", type=int, dest="max_rounds", help="최대 수정 횟수 (기본 2)")
     run.add_argument("--pass-score", type=int, dest="pass_score", help="통과 점수 (기본 80)")
     run.add_argument("--no-fallbacks", action="store_true", help="서버 측 거절 대체 모델(fallbacks)을 끕니다")

@@ -68,8 +68,7 @@ MAX_TOKENS = {
     "review": 32000,
 }
 
-# Block types that may be echoed back when resuming a paused turn.
-_ECHO_SAFE_BEFORE_FALLBACK = {"text", "server_tool_use", "web_search_tool_result", "web_fetch_tool_result"}
+CREDENTIALS_HINT = "API 자격 증명을 찾을 수 없어요. ANTHROPIC_API_KEY를 설정하거나 `ant auth login`을 실행해 주세요."
 
 SEARCH_INSTRUCTION = (
     "지금은 조사 단계입니다. web_search와 web_fetch 도구로 아래 리서치 질문마다 근거를 찾으세요. "
@@ -109,23 +108,34 @@ def echo_content(content: Iterable[Any]) -> list[Any]:
     """Assistant content to send back when resuming a ``pause_turn``.
 
     After a server-side fallback (a ``fallback`` block in ``content``), blocks
-    before the last boundary are filtered as the fallback docs require: drop
-    thinking / tool_use / unpaired server_tool_use / unknown internal blocks.
-    A trailing text block is right-stripped (continuations reject trailing
-    whitespace).
+    before the last boundary are filtered as the fallback docs require: keep
+    text and *paired* server-tool blocks (a ``server_tool_use`` together with
+    its ``*_tool_result`` — web search/fetch, or the code execution that
+    dynamic filtering runs), drop thinking / client tool_use / unpaired
+    server-tool blocks / unknown internal blocks. A trailing text block is
+    right-stripped (continuations reject trailing whitespace).
     """
     blocks = list(content)
     boundary = max((i for i, b in enumerate(blocks) if _type(b) == "fallback"), default=-1)
-    paired = {_get(b, "tool_use_id") for b in blocks if _type(b).endswith("_tool_result")}
+    # Server-executed uses end in "_tool_use" (server_tool_use, mcp_tool_use);
+    # the client "tool_use" does not. Assistant content never holds client
+    # tool_result blocks, so every "*_tool_result" here is a server-tool result.
+    use_ids = {_get(b, "id") for b in blocks if _type(b).endswith("_tool_use")}
+    result_ids = {_get(b, "tool_use_id") for b in blocks if _type(b).endswith("_tool_result")}
+    paired = (use_ids & result_ids) - {None}
     out: list[Any] = []
     for i, block in enumerate(blocks):
         kind = _type(block)
         if kind == "fallback":
             continue
-        if i < boundary:
-            if kind not in _ECHO_SAFE_BEFORE_FALLBACK:
-                continue
-            if kind == "server_tool_use" and _get(block, "id") not in paired:
+        if i < boundary and kind != "text":
+            if kind.endswith("_tool_use"):
+                if _get(block, "id") not in paired:
+                    continue
+            elif kind.endswith("_tool_result"):
+                if _get(block, "tool_use_id") not in paired:
+                    continue
+            else:
                 continue
         out.append(block)
     if out and _type(out[-1]) == "text":
@@ -183,16 +193,34 @@ def map_api_error(exc: Exception, model: str) -> BackendError:
     if isinstance(exc, anthropic.BadRequestError):
         return RequestRejectedError(f"API가 요청을 거부했어요 (400): {detail}", kind="bad_request", status_code=status, request_id=rid)
     if isinstance(exc, anthropic.APIStatusError):
-        if status is not None and status >= 500:
-            return ServerSideError(f"Anthropic 서버 오류예요 ({status}). 잠시 후 다시 실행해 주세요.", kind="server", status_code=status, request_id=rid, retryable=True)
+        # Classify by the error body's type first: an SSE `error` event that
+        # arrives after HTTP 200 (e.g. a mid-stream overloaded_error) surfaces
+        # as a bare APIStatusError whose status_code is still 200.
+        etype = getattr(exc, "type", None)
+        code = f" ({status})" if status is not None and status >= 400 else ""
+        if etype == "rate_limit_error":
+            return RateLimitedError(f"요청 한도를 넘었어요{code}. 잠시 후 다시 실행해 주세요.", kind="rate_limit", status_code=status, request_id=rid, retryable=True)
+        if etype == "overloaded_error":
+            return ServerSideError(f"Anthropic 서버가 지금 혼잡해요{code}. 잠시 후 다시 실행해 주세요.", kind="server", status_code=status, request_id=rid, retryable=True)
+        if etype in ("api_error", "timeout_error") or (status is not None and status >= 500):
+            return ServerSideError(f"Anthropic 서버 오류예요{code}. 잠시 후 다시 실행해 주세요.", kind="server", status_code=status, request_id=rid, retryable=True)
         return RequestRejectedError(f"API 오류 ({status}): {detail}", kind="status", status_code=status, request_id=rid)
     if isinstance(exc, anthropic.APITimeoutError):
         return APIConnectionFailed("API 응답 시간이 초과됐어요. 네트워크를 확인하고 다시 실행해 주세요.", kind="timeout", retryable=True)
     if isinstance(exc, anthropic.APIConnectionError):
         return APIConnectionFailed("Anthropic API에 연결할 수 없어요. 네트워크·프록시 설정을 확인해 주세요.", kind="connection", retryable=True)
-    if isinstance(exc, anthropic.CredentialsError):
-        return AuthError("API 자격 증명을 찾을 수 없어요. ANTHROPIC_API_KEY를 설정하거나 `ant auth login`을 실행해 주세요.", kind="credentials")
+    credentials_error = getattr(anthropic, "CredentialsError", None)  # exported from SDK 1.5 on
+    if credentials_error is not None and isinstance(exc, credentials_error):
+        return AuthError(CREDENTIALS_HINT, kind="credentials")
+    if credentials_error is None and type(exc) is anthropic.AnthropicError and _looks_like_credentials(detail):
+        # SDK 1.0-1.4: the credential providers raise a plain AnthropicError.
+        return AuthError(f"{CREDENTIALS_HINT} ({detail})", kind="credentials")
     return APICallError(f"API 호출 중 오류가 났어요: {detail}", kind="unknown", status_code=status, request_id=rid)
+
+
+def _looks_like_credentials(detail: str) -> bool:
+    text = detail.lower()
+    return any(word in text for word in ("credential", "config file", "identity token"))
 
 
 def _tokens(text: str) -> set[str]:
@@ -372,6 +400,7 @@ class AnthropicBackend:
                     after_turn: Callable[[Any], None] | None = None) -> list[Any]:
         """Run one logical call; returns every assistant turn (``pause_turn`` resumes included)."""
         import anthropic
+        import httpx2  # the SDK's HTTP transport (a dependency of every anthropic 1.x)
 
         stream_fn = self._client.beta.messages.stream if self.settings.fallbacks else self._client.messages.stream
         messages = list(request["messages"])

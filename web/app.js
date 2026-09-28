@@ -22,7 +22,7 @@
   var ACTIVE_STATUSES = { planning: 1, searching: 1, reading: 1, writing: 1, reviewing: 1, revising: 1 };
   var CH_STATE_LABEL = {
     waiting: '대기', drafting: '초안 작성', queued: '검수 대기', reviewing: '검수 중',
-    revision: '수정 요청', passed: '완료', failed: '미통과'
+    revision: '수정 요청', passed: '완료', failed: '미통과', error: '오류'
   };
   var TIER_LABEL = { 1: 'Tier 1 공식·공공', 2: 'Tier 2 언론·리서치', 3: 'Tier 3 기타' };
   var SEVERITY_LABEL = { critical: '치명', major: '중요', minor: '사소' };
@@ -106,7 +106,21 @@
 
   // ------------------------------------------------------------------ reducer
   function newChannel(id) {
-    return { id: id, state: 'waiting', round: 0, score: null, passed: null, drafts: [], reviews: [], final: null, topIssue: null };
+    return { id: id, state: 'waiting', round: 0, score: null, passed: null, drafts: [], reviews: [], final: null, topIssue: null, error: '' };
+  }
+
+  /** Round the pipeline keeps as final: passed first, then score, then the later round (pipeline._best_index). */
+  function bestRound(reviews) {
+    var best = null;
+    (reviews || []).forEach(function (r) {
+      var k = [r.passed ? 1 : 0, Number(r.score) || 0, r.round || 0];
+      if (!best || k[0] > best[0] || (k[0] === best[0] && (k[1] > best[1] || (k[1] === best[1] && k[2] > best[2])))) best = k;
+    });
+    return best ? best[2] : null;
+  }
+  function finalReview(ch) {
+    if (!ch.final || typeof ch.final.round !== 'number') return null;
+    return ch.reviews.filter(function (x) { return (x.round || 0) === ch.final.round; })[0] || null;
   }
 
   function initialState() {
@@ -265,26 +279,55 @@
         break;
       }
       case 'channel.completed': {
-        upd(d.channel, function () {
+        upd(d.channel, function (c) {
+          // the final is the best round, not necessarily the last one
+          var fr = typeof d.final_round === 'number' ? d.final_round : bestRound(c.reviews);
+          if (fr === null) fr = c.round || 0;
           return {
-            final: { title: d.title || '', content: d.content || '', hashtags: d.hashtags || [], score: d.score, passed: !!d.passed, rounds: d.rounds || 0 },
-            state: d.passed ? 'passed' : 'failed', score: typeof d.score === 'number' ? d.score : null, passed: !!d.passed
+            final: { title: d.title || '', content: d.content || '', hashtags: d.hashtags || [], score: d.score, passed: !!d.passed, rounds: d.rounds || 0, round: fr },
+            state: d.passed ? 'passed' : 'failed', score: typeof d.score === 'number' ? d.score : null, passed: !!d.passed, round: fr, error: ''
           };
         });
         log({ weight: 'key', tone: d.passed ? 'pass' : 'warn', parts: [{ b: chName(d.channel) }, ' 최종본 확정 · ' + d.score + '점 · ' + (d.passed ? '통과' : '미통과') + (d.rounds ? ' · 수정 ' + d.rounds + '회' : '')] });
         break;
       }
       case 'run.completed': {
+        var errs = d.errors && typeof d.errors === 'object' ? d.errors : {};
         s.run = Object.assign({}, prev.run || {}, {
           status: 'completed', duration: typeof d.duration_s === 'number' ? d.duration_s : Number(ev.t) || 0,
-          scores: d.scores || {}, passed: d.passed || {}, outputDir: d.output_dir || ''
+          scores: d.scores || {}, passed: d.passed || {}, outputDir: d.output_dir || '', errors: errs
         });
-        log({ weight: 'key', tone: 'pass', parts: [{ b: '모든 작업 완료' }, ' · ' + fmtDuration(s.run.duration) + (d.output_dir ? ' · ' + d.output_dir : '')] });
+        // a channel that raised never gets channel.completed; don't leave it "in progress"
+        s.channelOrder.forEach(function (c) {
+          if (s.channels[c] && !s.channels[c].final) {
+            upd(c, function () { return { state: 'error', error: String(errs[c] || '작업이 끝나지 않았어요') }; });
+          }
+        });
+        var nErr = s.channelOrder.filter(function (c) { return s.channels[c] && s.channels[c].state === 'error'; }).length;
+        log({
+          weight: 'key', tone: nErr ? 'warn' : 'pass',
+          parts: [{ b: nErr ? '작업 종료 · 채널 ' + nErr + '개 실패' : '모든 작업 완료' }, ' · ' + fmtDuration(s.run.duration) + (d.output_dir ? ' · ' + d.output_dir : '')]
+        });
         break;
       }
       case 'run.failed': {
-        s.run = Object.assign({}, prev.run || {}, { status: 'failed', error: d.error || '' });
-        log({ weight: 'key', level: 'error', parts: [{ b: '실행 실패' }, ' · ' + (d.error || '원인을 알 수 없어요')] });
+        var why = d.error || '원인을 알 수 없어요';
+        s.run = Object.assign({}, prev.run || {}, { status: 'failed', error: why });
+        // stop every agent that was still working or waiting; the pipeline sends no status reset
+        var stopped = {};
+        AGENT_IDS.forEach(function (id) {
+          var a = prev.agents[id];
+          if (a && ACTIVE_STATUSES[a.status]) stopped[id] = { status: 'error', message: why, since: Number(ev.t) || 0 };
+          else if (a && a.status === 'waiting') stopped[id] = { status: 'idle', message: '실행이 중단됐어요', since: Number(ev.t) || 0 };
+        });
+        s.agents = Object.assign({}, prev.agents, stopped);
+        s.channelOrder.forEach(function (c) {
+          var cur = s.channels[c];
+          if (cur && !cur.final && cur.state !== 'waiting') {
+            upd(c, function () { return { state: 'error', error: '실행이 중단돼 최종본을 만들지 못했어요' }; });
+          }
+        });
+        log({ weight: 'key', level: 'error', parts: [{ b: '실행 실패' }, ' · ' + why] });
         break;
       }
       case 'log': {
@@ -781,8 +824,15 @@
       case 'channel.completed':
         launchPacket('orchestrator', d.channel, '최종본', d.passed ? '#F5C451' : '#F2616D', function () { flashCard(d.channel, d.passed ? '#F5C451' : '#F2616D'); });
         break;
-      case 'run.completed':
-        $('srStatus').textContent = '모든 채널 작업이 끝났어요.';
+      case 'run.completed': {
+        var failedCh = d.errors && typeof d.errors === 'object' ? Object.keys(d.errors) : [];
+        $('srStatus').textContent = failedCh.length
+          ? '작업이 끝났어요. 실패한 채널: ' + failedCh.map(chName).join(', ') + '.'
+          : '모든 채널 작업이 끝났어요.';
+        break;
+      }
+      case 'run.failed':
+        $('srStatus').textContent = '실행이 실패했어요: ' + (d.error || '원인을 알 수 없어요');
         break;
       default:
         break;
@@ -978,7 +1028,8 @@
   }
 
   function formatChips(channel, ch) {
-    var rev = last(ch.reviews);
+    // once final, show the checks of the round that became the final, not of the last round
+    var rev = finalReview(ch) || last(ch.reviews);
     var draft = last(ch.drafts);
     var out = [];
     if (rev && rev.format_checks && rev.format_checks.length) {
@@ -1213,7 +1264,8 @@
     var run = s.run || {};
     var chans = s.channelOrder;
     var doneCount = chans.filter(function (c) { return s.channels[c] && s.channels[c].final; }).length;
-    var key = [sourceKind, brief.topic, run.status, run.model, run.mode, doneCount, s.research.sources.length, s.research.findings.length, chans.join(','), serverInfo ? 1 : 0, run.duration].join('|');
+    var errCount = chans.filter(function (c) { return s.channels[c] && s.channels[c].state === 'error'; }).length;
+    var key = [sourceKind, brief.topic, run.status, run.error, run.model, run.mode, doneCount, errCount, s.research.sources.length, s.research.findings.length, chans.join(','), serverInfo ? 1 : 0, run.duration].join('|');
     if (key === summaryKey) return;
     summaryKey = key;
 
@@ -1247,6 +1299,10 @@
     prog.appendChild(stat(complete ? '총 소요' : '완료 채널', complete ? fmtDuration(run.duration) : doneCount + ' / ' + chans.length));
     prog.appendChild(stat('출처', s.research.sources.length + '개'));
     prog.appendChild(stat('근거', s.research.findings.length + '개'));
+    if (run.status === 'failed') {
+      // run.failed.error is a sentence meant to be shown as-is (docs/event-schema.md)
+      prog.appendChild(el('p', { class: 'summary-error' }, [el('b', { text: '실행 실패' }), ' · ' + (run.error || '원인을 알 수 없어요')]));
+    }
 
     var res = $('summaryResults');
     res.textContent = '';
@@ -1255,14 +1311,19 @@
       chans.forEach(function (c) {
         var ch = s.channels[c];
         var m = manifest.channels[c] || {};
+        var failed = !!(ch && ch.state === 'error');
         var score = ch && typeof ch.score === 'number' ? ch.score : (run.scores && run.scores[c]);
+        var hasScore = typeof score === 'number';
         var passed = ch && ch.passed !== null ? ch.passed : (run.passed && run.passed[c]);
         var icon = m.icon ? el('img', { src: assetUrl(m.icon), alt: '' }) : el('span', { class: 'mini-fallback', style: '--ch:' + (m.color || '#3B5BDB'), text: chName(c).charAt(0) });
+        var label = failed
+          ? chName(c) + ' 작업 실패, 자세히 보기'
+          : chName(c) + ' 최종 ' + (hasScore ? score + '점' : '점수 없음') + ', ' + (passed ? '통과' : '미통과') + ', 결과물 보기';
         res.appendChild(el('button', {
-          type: 'button', class: 'result-tile', 'data-passed': String(!!passed),
-          'aria-label': chName(c) + ' 최종 ' + score + '점, ' + (passed ? '통과' : '미통과') + ', 결과물 보기',
+          type: 'button', class: 'result-tile', 'data-passed': String(!!passed), 'data-error': failed ? 'true' : null,
+          'aria-label': label, title: failed ? ch.error : null,
           onclick: function (e) { openDrawer(c, e.currentTarget); }
-        }, [icon, el('span', { class: 'rt-name', text: chName(c) }), el('span', { class: 'rt-score', text: score === undefined ? '—' : String(score) })]));
+        }, [icon, el('span', { class: 'rt-name', text: chName(c) }), el('span', { class: 'rt-score', text: failed ? '오류' : hasScore ? String(score) : '—' })]));
       });
     }
   }
@@ -1271,11 +1332,14 @@
     var ph = currentPhase(s);
     var idx = PHASES.indexOf(ph);
     var started = !!s.run;
+    var failed = started && s.run.status === 'failed';
     Array.prototype.forEach.call($('phase').children, function (li) {
       var i = PHASES.indexOf(li.dataset.phase);
-      var st = !started ? '' : i < idx ? 'done' : i === idx ? 'active' : '';
+      // a failed run stays on the step where it stopped, marked as failed
+      var st = !started ? '' : i < idx ? 'done' : i === idx ? (failed ? 'failed' : 'active') : '';
       if (li.dataset.state !== st) li.dataset.state = st;
-      if (st === 'active') li.setAttribute('aria-current', 'step'); else li.removeAttribute('aria-current');
+      if (st === 'active' || st === 'failed') li.setAttribute('aria-current', 'step'); else li.removeAttribute('aria-current');
+      if (st === 'failed') li.title = '이 단계에서 실행이 멈췄어요'; else li.removeAttribute('title');
     });
   }
 
@@ -1285,8 +1349,9 @@
     var t = player.t;
     if (live && state.run && state.run.status === 'running') t = player.t + (now - player.liveArrival) / 1000;
     var finished = !live && player.events.length && player.t >= player.duration;
-    var recState = live ? 'live' : finished ? 'done' : player.playing ? 'playing' : 'paused';
-    var recText = live ? 'LIVE' : finished ? '재생 완료' : player.playing ? '재생 중 ' + player.speed + '×' : (player.events.length ? '일시정지' : '대기');
+    var runFailed = !!(finished && state.run && state.run.status === 'failed');
+    var recState = live ? 'live' : runFailed ? 'failed' : finished ? 'done' : player.playing ? 'playing' : 'paused';
+    var recText = live ? 'LIVE' : runFailed ? '실행 실패' : finished ? '재생 완료' : player.playing ? '재생 중 ' + player.speed + '×' : (player.events.length ? '일시정지' : '대기');
     var key = [Math.floor(t), recState, recText, player.duration, player.speed, live, player.events.length].join('|');
     if (key === transportKey) return;
     transportKey = key;

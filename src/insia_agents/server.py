@@ -4,19 +4,29 @@
   no traversal, no dotfiles, single-range requests for videos).
 - ``GET  /api/health``           → ``{mode, model, version, live_available}``
 - ``GET  /api/sample-brief``     → the sample Brief
-- ``POST /api/runs``             → start a run: Brief JSON (+ optional ``options``)
+- ``POST /api/runs``             → start a run: Brief JSON (+ optional ``options``:
+  ``mode``, ``speed`` = mock playback multiplier (1 = recorded pace, 2 = twice
+  as fast, 0 = no waiting), ``max_rounds``, ``pass_score``)
 - ``GET  /api/runs``             → recent runs
 - ``GET  /api/runs/<id>``        → status + RunResult when finished
 - ``GET  /api/runs/<id>/events`` → Server-Sent Events: replay, then live;
   ``: ping`` heartbeat; closes after ``run.completed`` / ``run.failed``.
+
+Every ``/api`` request must carry a loopback / bind-address ``Host`` header
+(blocks DNS rebinding). ``POST`` additionally needs a same-origin ``Origin`` (when
+present) and ``Content-Type: application/json``, which forces a CORS preflight
+that this server never approves, so other web pages cannot start runs.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import math
 import mimetypes
 import re
 import threading
+import traceback
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -36,6 +46,9 @@ from .pipeline import new_run_id, prepare_run, run_pipeline
 MAX_BODY = 64 * 1024
 MAX_RECORDS = 50
 RUN_PATH = re.compile(r"^/api/runs/([A-Za-z0-9][A-Za-z0-9._-]{0,80})(/events)?/?$")
+HOST_HEADER = re.compile(r"^(?:\[(?P<v6>[0-9A-Fa-f:.]+)\]|(?P<name>[A-Za-z0-9.-]+))(?::(?P<port>[0-9]{1,5}))?$")
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+WILDCARD_HOSTS = frozenset({"", "0.0.0.0", "::"})
 
 MIME_OVERRIDES = {
     ".html": "text/html; charset=utf-8",
@@ -132,13 +145,29 @@ def parse_options(raw: Any) -> dict[str, Any]:
         value = raw[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise RequestError(400, f"options.{key}는 숫자여야 해요")
-        if kind is int and float(value) != int(value):
-            raise RequestError(400, f"options.{key}는 정수여야 해요")
-        value = kind(value)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise RequestError(400, f"options.{key}는 유한한 숫자여야 해요")
+        # Range first: int/float comparison is exact, so a huge int never reaches float().
         if not lo <= value <= hi:
             raise RequestError(400, f"options.{key}는 {lo}~{hi} 사이여야 해요")
-        out[key] = value
+        if kind is int and isinstance(value, float) and not value.is_integer():
+            raise RequestError(400, f"options.{key}는 정수여야 해요")
+        out[key] = kind(value)
     return out
+
+
+def _reject_json_constant(name: str) -> Any:
+    raise ValueError(f"JSON constant {name} is not allowed")
+
+
+def split_host(value: str, default_port: int = 80) -> tuple[str, int] | None:
+    """Parse a ``Host`` value (``name[:port]`` / ``[v6][:port]``) → ``(lowercase name, port)``."""
+    match = HOST_HEADER.match(value.strip())
+    if not match:
+        return None
+    name = (match.group("v6") or match.group("name")).lower()
+    port = int(match.group("port")) if match.group("port") else default_port
+    return name, port
 
 
 class RunManager:
@@ -156,10 +185,6 @@ class RunManager:
     def start(self, brief: Brief, options: dict[str, Any]) -> RunRecord:
         if options.get("mode") == "live" and not has_credentials():
             raise RequestError(400, "API 키가 없어 live 모드를 쓸 수 없어요. ANTHROPIC_API_KEY를 설정한 뒤 서버를 다시 시작해 주세요.")
-        with self._lock:
-            active = sum(1 for r in self._runs.values() if r.status == "running")
-            if active >= self.max_active:
-                raise RequestError(429, "동시에 실행할 수 있는 작업 수를 넘었어요. 잠시 후 다시 시도해 주세요.")
         try:
             settings = self.settings.with_options(**options)
             backend, bus, note = prepare_run(settings, run_id=new_run_id())
@@ -180,6 +205,10 @@ class RunManager:
 
         record.thread = threading.Thread(target=work, name=f"insia-run-{record.run_id}", daemon=True)
         with self._lock:
+            # Check and insert in one critical section so a burst cannot exceed max_active.
+            active = sum(1 for r in self._runs.values() if r.status == "running")
+            if active >= self.max_active:
+                raise RequestError(429, "동시에 실행할 수 있는 작업 수를 넘었어요. 잠시 후 다시 시도해 주세요.")
             self._runs[record.run_id] = record
             self._trim()
         record.thread.start()
@@ -212,6 +241,7 @@ class InsiaServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], manager: RunManager, web_root: Path | None, heartbeat: float = 15.0,
                  quiet: bool = True) -> None:
+        self.bind_host = str(address[0]).strip("[]").lower()
         super().__init__(address, InsiaHandler)
         self.manager = manager
         self.web_root = web_root.resolve() if web_root is not None and web_root.is_dir() else None
@@ -222,6 +252,24 @@ class InsiaServer(ThreadingHTTPServer):
     def url(self) -> str:
         host, port = self.server_address[:2]
         return f"http://{host}:{port}/"
+
+    def allows_host(self, name: str, port: int) -> bool:
+        """True for loopback names or the bind address, on this server's port.
+
+        When listening on every interface (``0.0.0.0``), any IP literal is also
+        accepted so LAN access keeps working; DNS rebinding needs a domain name.
+        """
+        if port != self.server_address[1]:
+            return False
+        if name in LOOPBACK_HOSTS or name in (self.bind_host, str(self.server_address[0]).lower()):
+            return True
+        if self.bind_host in WILDCARD_HOSTS:
+            try:
+                ipaddress.ip_address(name)
+            except ValueError:
+                return False
+            return True
+        return False
 
 
 class InsiaHandler(BaseHTTPRequestHandler):
@@ -253,6 +301,28 @@ class InsiaHandler(BaseHTTPRequestHandler):
         parts = urllib.parse.urlsplit(self.path)
         return parts.path, urllib.parse.parse_qs(parts.query)
 
+    def _check_host(self) -> None:
+        """Reject requests whose ``Host`` is not loopback / the bind address (DNS rebinding)."""
+        parsed = split_host(self.headers.get("Host") or "")
+        if parsed is None or not self.server.allows_host(*parsed):
+            self.close_connection = True
+            port = self.server.server_address[1]
+            raise RequestError(403, f"허용되지 않은 주소(Host)로 들어온 요청이에요. "
+                                    f"http://127.0.0.1:{port}/ 또는 http://localhost:{port}/ 로 접속해 주세요.")
+
+    def _check_post_headers(self) -> None:
+        """Same-origin ``Origin`` (when sent) and a JSON body type, so other sites cannot POST."""
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            parsed = split_host(origin[len("http://"):]) if origin.lower().startswith("http://") else None
+            if parsed is None or not self.server.allows_host(*parsed):
+                self.close_connection = True
+                raise RequestError(403, "다른 사이트에서 보낸 요청은 받을 수 없어요. 대시보드에서 실행해 주세요.")
+        media_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            self.close_connection = True
+            raise RequestError(415, "요청 본문은 Content-Type: application/json으로 보내 주세요")
+
     # -- verbs ----------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
         try:
@@ -267,14 +337,20 @@ class InsiaHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         try:
+            self._check_host()
             path, _ = self._path()
             if path.rstrip("/") != "/api/runs":
                 raise RequestError(404, "없는 API 경로예요")
+            self._check_post_headers()
             self._create_run()
         except RequestError as exc:
             self._error(exc.status, exc.message)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Exception:  # noqa: BLE001 - answer with 500 instead of dropping the connection
+            self.log_error("POST %s failed:\n%s", self.path, traceback.format_exc())
+            self.close_connection = True
+            self._error(500, "서버에서 요청을 처리하지 못했어요. 잠시 후 다시 시도해 주세요.")
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -285,6 +361,8 @@ class InsiaHandler(BaseHTTPRequestHandler):
     def _route_get(self) -> None:
         path, query = self._path()
         manager = self.server.manager
+        if path == "/api" or path.startswith("/api/"):
+            self._check_host()
         if path == "/api/health":
             self._send_json(200, manager.health())
             return
@@ -322,8 +400,9 @@ class InsiaHandler(BaseHTTPRequestHandler):
             raise RequestError(400, "브리프 JSON을 보내 주세요")
         raw = self.rfile.read(length)
         try:
-            body = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            # NaN/Infinity are not JSON; deep nesting raises RecursionError.
+            body = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+        except (ValueError, RecursionError):  # includes UnicodeDecodeError and JSONDecodeError
             raise RequestError(400, "JSON 형식이 올바르지 않아요") from None
         if not isinstance(body, dict):
             raise RequestError(400, "브리프는 JSON 객체여야 해요")
@@ -463,7 +542,13 @@ def resolve_static(root: Path, url_path: str) -> Path | None:
     if resolved != root and not resolved.is_relative_to(root):
         return None
     if resolved.is_dir():
-        resolved = resolved / "index.html"
+        # index.html itself may be a symlink, so resolve and check containment again.
+        try:
+            resolved = (resolved / "index.html").resolve()
+        except (OSError, RuntimeError):
+            return None
+        if not resolved.is_relative_to(root):
+            return None
     return resolved
 
 

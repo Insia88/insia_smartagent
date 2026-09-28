@@ -34,6 +34,14 @@ def test_settings_from_env():
         Settings.from_env(env={}, max_rounds=9)
 
 
+def test_blank_model_and_today_fall_back_to_defaults():
+    blank = Settings.from_env(env={"INSIA_MODEL": "   ", "INSIA_TODAY": " \t"})
+    assert blank.model == "claude-opus-5"
+    assert blank.today and len(blank.today) == 10  # today_kst(), YYYY-MM-DD
+    padded = Settings.from_env(env={"INSIA_MODEL": " claude-sonnet-5 ", "INSIA_TODAY": " 2026-09-28 "})
+    assert padded.model == "claude-sonnet-5" and padded.today == "2026-09-28"
+
+
 def test_prompts_load_from_override(prompts_dir):
     assert "orchestrator" in agent_prompt("orchestrator")
     assert "linkedin" in channel_guide("linkedin")

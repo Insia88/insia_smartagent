@@ -57,8 +57,10 @@ class RealClock:
 class SimClock:
     """Virtual time for mock runs.
 
-    ``advance(d)`` moves virtual time forward by ``d`` seconds and sleeps
-    ``d * speed`` real seconds (``speed=0`` → no sleeping at all).
+    ``speed`` is a playback multiplier: ``advance(d)`` moves virtual time
+    forward by ``d`` seconds and sleeps ``d / speed`` real seconds (``1`` = real
+    time, ``2`` = twice as fast, ``0`` = no sleeping at all). The recorded
+    virtual ``t`` never depends on ``speed``.
     """
 
     simulated = True
@@ -83,7 +85,7 @@ class SimClock:
                 return
             self._now = t
         if self.speed > 0:
-            self._sleep(delta * self.speed)
+            self._sleep(delta / self.speed)
 
 
 # ---------------------------------------------------------------------------

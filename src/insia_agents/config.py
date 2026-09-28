@@ -56,7 +56,7 @@ class Settings:
     fallbacks: bool = True  # server-side refusal fallback (beta server-side-fallback-2026-07-01)
     max_rounds: int = 2
     pass_score: int = DEFAULT_PASS_SCORE
-    speed: float = 1.0  # mock only: real seconds slept per simulated second
+    speed: float = 1.0  # mock only: playback multiplier (1 = real time, 2 = twice as fast, 0 = no waiting)
     out_dir: Path | None = Path("outputs")
     web_dir: Path | None = None
     sample_dir: Path | None = None
@@ -78,12 +78,12 @@ class Settings:
                 effort[role] = value  # type: ignore[assignment]
         base = cls(
             mode=(env.get("INSIA_MODE") or "auto").strip().lower() or "auto",  # type: ignore[arg-type]
-            model=(env.get("INSIA_MODEL") or DEFAULT_MODEL).strip(),
+            model=(env.get("INSIA_MODEL") or "").strip() or DEFAULT_MODEL,
             effort=effort,
             fallbacks=_truthy(env.get("INSIA_FALLBACKS"), True),
             web_dir=_find_dir(env.get("INSIA_WEB_DIR"), "web"),
             sample_dir=_find_dir(env.get("INSIA_SAMPLE_DIR"), "examples/sample-run"),
-            today=(env.get("INSIA_TODAY") or today_kst()).strip(),
+            today=(env.get("INSIA_TODAY") or "").strip() or today_kst(),
         )
         if env.get("INSIA_OUT_DIR"):
             base = replace(base, out_dir=Path(env["INSIA_OUT_DIR"]))
@@ -106,7 +106,7 @@ class Settings:
         if not 0 <= self.pass_score <= 100:
             raise ValueError("pass_score는 0~100 사이여야 해요")
         if not 0 <= self.speed <= 100:
-            raise ValueError("speed는 0~100 사이여야 해요 (0 = 기다리지 않음)")
+            raise ValueError("speed는 0~100 사이여야 해요 (1 = 실제 시간, 2 = 2배 빠르게, 0 = 기다리지 않음)")
 
 
 # Fallback copy of examples/sample-run/brief.json (used when the repo's

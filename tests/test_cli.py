@@ -31,6 +31,35 @@ def test_run_from_brief_file_no_save(tmp_path, capsys):
     assert not (tmp_path / "out").exists()
 
 
+def test_run_accepts_brief_with_utf8_bom(tmp_path, capsys):
+    brief_path = tmp_path / "brief.json"
+    brief_path.write_bytes(b"\xef\xbb\xbf" + Brief(topic="BOM 브리프", channels=["linkedin"]).model_dump_json().encode("utf-8"))
+    code = main(["run", "--brief", str(brief_path), "--mode", "mock", "--speed", "0", "--no-save", "--quiet"])
+    assert code == 0, capsys.readouterr().err
+    assert "링크드인 완료" in capsys.readouterr().out
+
+
+def test_run_record_to_directory_is_a_usage_error(tmp_path, capsys):
+    folder = tmp_path / "traces"
+    folder.mkdir()
+    code = main(["run", "--mode", "mock", "--topic", "t", "--channels", "linkedin", "--speed", "0", "--no-save",
+                 "--record", str(folder)])
+    captured = capsys.readouterr()
+    assert code == 2 and "--record" in captured.err and "Traceback" not in captured.err
+    assert "실행 시작" not in captured.out  # rejected before the run starts
+
+
+def test_run_record_write_failure_reports_error(tmp_path, capsys):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    code = main(["run", "--mode", "mock", "--topic", "t", "--channels", "linkedin", "--speed", "0", "--no-save",
+                 "--record", str(blocker / "trace.json")])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "트레이스를 저장하지 못했어요" in captured.err
+    assert "채널별 결과" in captured.out  # the finished run's summary is still shown
+
+
 def test_run_usage_errors(capsys):
     assert main(["run", "--mode", "mock"]) == 2
     assert main(["run", "--mode", "mock", "--topic", "t", "--channels", "tiktok"]) == 2
@@ -56,6 +85,13 @@ def test_check_command(tmp_path, capsys):
     checks = json.loads(capsys.readouterr().out)
     assert {c["id"] for c in checks if not c["passed"]} == {"hook_length", "hashtags"}
     assert main(["check", str(tmp_path / "missing.json")]) == 2
+    # UTF-8 BOM (Windows editors / PowerShell 5.1) in both the draft and the brief
+    (tmp_path / "brief.json").write_bytes(b"\xef\xbb\xbf" + brief.model_dump_json().encode("utf-8"))
+    bom = drafts / "linkedin.bom.json"
+    bom.write_bytes(b"\xef\xbb\xbf" + good.read_bytes())
+    capsys.readouterr()
+    assert main(["check", str(bom)]) == 0
+    assert "4/4개 통과" in capsys.readouterr().out
 
 
 def test_sample_brief_and_help(capsys):

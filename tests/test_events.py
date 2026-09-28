@@ -29,10 +29,20 @@ def test_sim_clock_virtual_time_and_sleep():
     clock.advance_to(4)  # never goes backwards
     event = bus.emit("log", "system", {"level": "info", "message": "x"})
     assert event["t"] == 10.0
-    assert slept == [5.0]
+    assert slept == [20.0]  # speed is a playback multiplier: 0.5 → half speed, twice the wait
     fast = SimClock(speed=0, sleep=lambda s: pytest.fail("speed 0 must not sleep"))
     fast.advance(100)
     assert fast.now() == 100
+
+
+@pytest.mark.parametrize("speed, expected_sleep", [(1, 8.0), (2, 4.0), (4, 2.0), (0.5, 16.0)])
+def test_sim_clock_speed_is_a_playback_multiplier(speed, expected_sleep):
+    slept = []
+    clock = SimClock(speed=speed, sleep=slept.append)
+    bus = EventBus("r", clock=clock)
+    clock.advance(8)
+    assert slept == [expected_sleep]  # larger speed → shorter real wait
+    assert bus.emit("log", "system", {"level": "info", "message": "x"})["t"] == 8.0  # virtual t unchanged
 
 
 def test_concurrent_emits_are_ordered():
