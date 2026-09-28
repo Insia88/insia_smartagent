@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,14 @@ def web_dir(tmp_path) -> Path:
     (root / ".env").write_text("SECRET=1", encoding="utf-8")
     (tmp_path / "site" / "secret.txt").write_text("top secret", encoding="utf-8")
     return root
+
+
+@pytest.fixture
+def settings(settings, tmp_path, monkeypatch):
+    """The server persists everything: keep its workspace in a temp dir, never ./workspace."""
+    for name in ("INSIA_ACCESS_TOKEN", "INSIA_PUBLIC_HOSTS", "INSIA_TRUST_PROXY", "INSIA_MAX_LIVE_JOBS", "INSIA_MAX_MOCK_JOBS"):
+        monkeypatch.delenv(name, raising=False)  # a token in the developer's shell must not switch on token mode
+    return replace(settings, home=tmp_path / "workspace")
 
 
 @pytest.fixture
@@ -248,7 +257,8 @@ def test_post_from_the_dashboard_origin_is_accepted(server):
 
 
 def test_wildcard_bind_allows_ip_literals_but_not_names(settings):
-    srv = make_server(settings, host="0.0.0.0", port=0, web_dir=None)
+    # a non-loopback bind needs an access token since the workspace API exists
+    srv = make_server(settings, host="0.0.0.0", port=0, web_dir=None, token="test-token-1234567890")
     try:
         port = srv.server_address[1]
         assert srv.allows_host("192.168.0.10", port) and srv.allows_host("127.0.0.1", port)
