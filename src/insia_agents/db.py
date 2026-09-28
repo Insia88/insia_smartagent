@@ -183,6 +183,58 @@ class ApprovalBlockedError(WorkspaceError):
         self.score = score
 
 
+class ItemLockedError(InvalidTransitionError):
+    """The item has a live API publish attempt (``sending`` or ``unknown``): its versions and status are frozen.
+
+    Raised by the workspace's internal write paths (new versions, reviews, status changes) so that every
+    caller — the pipeline, jobs, ``import-run``, the dashboard — is stopped in one place. It lives here, not in
+    ``insia_agents.publishers``, so those callers can catch it without importing the publishing package.
+    ``insia_agents.publishers.PublishInProgressError`` is this same class. The server answers 409
+    ``{"code": "item_locked", "attempt_id": …}`` (``code``/``extra()`` mirror ``PublishError``).
+    """
+
+    http_status = 409
+    code = "item_locked"
+    outcome = "not_sent"
+    SENDING_MESSAGE = "이 콘텐츠를 지금 게시하는 중이에요."
+    UNKNOWN_MESSAGE = "게시됐는지 확인이 필요한 기록이 있어요. 먼저 정리해 주세요."
+
+    def __init__(self, message: str | None = None, *, attempt_id: str = "", platform: str = "",
+                 status: str = "sending") -> None:
+        if not message:
+            message = self.UNKNOWN_MESSAGE if status == "unknown" else self.SENDING_MESSAGE
+        super().__init__(message)
+        self.attempt_id = attempt_id
+        self.platform = platform
+        self.status = status
+
+    def extra(self) -> dict[str, str]:
+        return {"attempt_id": self.attempt_id, "platform": self.platform, "status": self.status}
+
+
+class AttemptTakenOverError(WorkspaceError):
+    """This worker no longer owns the publish attempt (recovery cleared its ``owner_token``): stop, send nothing.
+
+    Raised by the owner-token-conditional publish-attempt writes (``update_publish_attempt``,
+    ``claim_publish_write``, ``finish_publish_*``) when the conditional UPDATE matches no row. It lives here for
+    the same reason as ``ItemLockedError`` (the workspace raises it and must not import the publishing package);
+    ``insia_agents.publishers.AttemptTakenOverError`` is this same class. It is only used inside the worker and
+    never becomes an HTTP answer (the attempt record already holds the recovery's outcome).
+    """
+
+    http_status = 409
+    code = "taken_over"
+    outcome = "not_sent"
+    DEFAULT_MESSAGE = "다른 곳에서 이 게시 시도를 정리했어요. 이 프로세스는 보내지 않고 멈춰요."
+
+    def __init__(self, message: str | None = None, *, attempt_id: str = "") -> None:
+        super().__init__(message or self.DEFAULT_MESSAGE)
+        self.attempt_id = attempt_id
+
+    def extra(self) -> dict[str, str]:
+        return {"attempt_id": self.attempt_id}
+
+
 # Why a run's new version was kept in the history instead of becoming the item's current one (``RunVersion.reason``).
 HELD_HUMAN_EDIT = "human_edit"  # a person saved an edit after the run's last stored round
 HELD_STATUS = "status"  # a person approved, scheduled or published the item

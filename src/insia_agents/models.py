@@ -280,6 +280,12 @@ class ContentItem(BaseModel):
     approval_forced: bool = Field(default=False, description="검수를 통과하지 못한 버전을 사람이 '그래도 승인'했으면 true")
     approved_score: int | None = Field(default=None, description="승인한 버전의 검수 점수 (검수 전이면 None)")
     approved_at: str = Field(default="", description="승인한 시각 (UTC ISO)")
+    # How the item was published (see PUBLISHED_VIA). Manual '게시 완료 표시' keeps ''.
+    published_via: str = Field(
+        default="",
+        description="''=사람이 직접 올린 기록, linkedin_api/instagram_api=사람이 확인한 뒤 INSIA가 API로 올림, fake=가짜 게시 모드(테스트용)",
+    )
+    published_external_id: str = Field(default="", description="API로 올린 게시물 id (LinkedIn URN, 인스타그램 미디어 id)")
 
 
 class DraftVersion(BaseModel):
@@ -339,3 +345,82 @@ class CalendarSlot(BaseModel):
     item_id: str = ""
     run_id: str = ""
     created_at: str = ""
+
+
+# ---------------------------------------------------------------------------
+# API publishing (LinkedIn / Instagram) — records kept by the workspace
+# ---------------------------------------------------------------------------
+# Not LLM output, so free-form ``dict`` fields are fine here. Secrets never
+# appear in these models: tokens and app secrets live only in
+# ``credentials/secrets.sqlite`` (``insia_agents.publishers.store``); the
+# preview's confirm-code hash and the attempt's owner token / heartbeat /
+# media token are internal columns that are deliberately not model fields.
+
+PublishPlatform = Literal["linkedin", "instagram"]
+PublishAttemptStatus = Literal["sending", "published", "failed", "unknown", "abandoned"]
+PublishConnectionStatus = Literal["connected", "needs_reconnect"]
+PublishPreviewVia = Literal["dashboard", "cli"]
+
+# ContentItem.published_via values: '' = a person published by hand and pressed '게시 완료 표시'.
+PUBLISHED_VIA: tuple[str, ...] = ("", "linkedin_api", "instagram_api", "fake")
+# Attempt statuses that hold the item (no new version, no status change) until they are closed.
+ACTIVE_ATTEMPT_STATUSES: tuple[str, ...] = ("sending", "unknown")
+
+
+class PublishConnection(BaseModel):
+    """연결된 게시 계정의 표시용 정보 (토큰 없음). 권위 있는 계정 id는 토큰과 함께 secrets.sqlite에 있다."""
+
+    platform: PublishPlatform
+    account_id: str = ""
+    account_name: str = Field(default="", description="인스타그램 @핸들만 저장 (LinkedIn 이름은 약관상 저장하지 않음)")
+    scopes: list[str] = Field(default_factory=list)
+    status: PublishConnectionStatus = "connected"
+    status_reason: str = ""
+    token_expires_at: str = ""
+    expires_estimated: bool = False
+    token_issued_at: str = ""
+    token_refreshed_at: str = ""
+    api_version: str = ""
+    connected_at: str = ""
+    updated_at: str = ""
+
+
+class PublishPreview(BaseModel):
+    """사람이 확인한 '보낼 내용 그대로'. payload는 보낼 요청의 정규 JSON(토큰 없음), payload_hash는 그 sha256."""
+
+    id: str = Field(description="pv_<24 hex>")
+    item_id: str
+    version: int
+    platform: PublishPlatform
+    account_id: str = ""
+    payload: dict = Field(default_factory=dict)
+    payload_hash: str = Field(default="", description="sha256:<64 hex>")
+    created_via: PublishPreviewVia = "dashboard"
+    requested_by: str = ""
+    created_at: str = ""
+    expires_at: str = ""
+    used_at: str = ""
+
+
+class PublishAttempt(BaseModel):
+    """확인 게시 한 번의 기록. (item_id, version, platform)마다 sending·published·unknown은 하나뿐."""
+
+    id: str = Field(description="pa_<24 hex>")
+    item_id: str
+    version: int
+    platform: PublishPlatform
+    preview_id: str = ""
+    payload_hash: str = ""
+    account_id: str = ""
+    status: PublishAttemptStatus = "sending"
+    step: str = Field(default="", description="check | children 3/8 | polling | carousel | write | permalink")
+    external_id: str = Field(default="", description="LinkedIn 게시물 URN / 인스타그램 미디어 id")
+    permalink: str = ""
+    state: dict = Field(default_factory=dict, description="children, carousel_id, is_ai_generated, item_update_error … (토큰 없음)")
+    error_code: str = ""
+    error: str = Field(default="", description="한국어 메시지")
+    requested_by: str = Field(default="", description="dashboard@<클라이언트> | cli:<사용자>@<호스트>")
+    resolved_by: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    finished_at: str = ""
