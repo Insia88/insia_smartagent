@@ -313,10 +313,11 @@
         el('b', { text: '이전 버전(v' + v.version + ')을 보고 있어요' }), ' · 최신 버전은 v' + latest.version + '예요.',
         el('button', { type: 'button', class: 'btn btn--small notice-action', text: '최신 버전 보기', onclick: function () { S.viewVersion = null; renderDetail(false); } })
       ]) : null,
+      // actions sit above the content so they come first on a phone and in reading order
+      isDemo() ? demoNote() : actionsCard(item, latest),
       S.editing ? editorCard(item, latest) : contentCard(item, v)
     ]);
     var side = el('div', { class: 'detail-side' }, [
-      isDemo() ? demoNote() : actionsCard(item, latest),
       isDemo() ? null : exportCard(item),
       reviewCard(item, v),
       versionsCard(item, v)
@@ -420,7 +421,8 @@
 
     var title = el('input', { id: 'edTitle', type: 'text', value: start.title, autocomplete: 'off', 'aria-describedby': 'edTitleCount' });
     var titleCount = el('span', { class: 'field-count', id: 'edTitleCount' });
-    var content = el('textarea', { id: 'edContent', rows: '22', spellcheck: 'false', 'aria-describedby': 'edMeters' });
+    var contentCount = el('span', { class: 'field-count', id: 'edContentCount' });
+    var content = el('textarea', { id: 'edContent', rows: '22', spellcheck: 'false', 'aria-describedby': 'edContentCount edMeters' });
     content.value = start.content;
     var tags = withTags ? el('input', { id: 'edTags', type: 'text', value: start.tags, autocomplete: 'off', 'aria-describedby': 'edTagsHint' }) : null;
     var meters = el('ul', { class: 'meters', id: 'edMeters', 'aria-label': '실시간 형식 확인' });
@@ -454,6 +456,10 @@
       var dirty = cur.title !== (d.title || '') || cur.content !== (d.content || '') || (withTags && tags.value !== (d.hashtags || []).join(' '));
       if (dirty) U.storageSet(unsavedKey(item, latest), JSON.stringify({ title: cur.title, content: cur.content, tags: withTags ? tags.value : '' }));
       else U.storageSet(unsavedKey(item, latest), '');
+      // the main length check stays next to the textarea label (the full list sits below it)
+      var main = checks.filter(function (c) { return c.id === (ch === 'instagram' ? 'caption_length' : 'length'); })[0];
+      contentCount.textContent = main ? (ch === 'instagram' ? '캡션 ' : '') + main.value + ' · 기준 ' + main.expected.replace(/ \(.*\)$/, '') + (ch === 'bizplan' || ch === 'naver_blog' ? ' (공백 제외)' : ' (공백 포함)') : '';
+      contentCount.dataset.ok = main ? String(main.passed) : '';
       saveBtn.disabled = S.busy || !dirty;
     }
     function queue() { if (!queued) { queued = true; requestAnimationFrame(update); } }
@@ -486,9 +492,10 @@
       el('div', { class: 'field' }, [
         el('span', { class: 'field-label' }, [
           el('label', { for: 'edContent', text: '본문' }),
-          el('small', { text: ch === 'instagram' ? '## 캐러셀 / ### 슬라이드 N — 제목 / ## 캡션 형식을 지켜 주세요' : ch === 'linkedin' ? '일반 텍스트 · 링크는 본문 대신 첫 댓글에' : '마크다운' })
+          contentCount
         ]),
-        content
+        content,
+        el('small', { class: 'field-hint', text: ch === 'instagram' ? '## 캐러셀 / ### 슬라이드 N — 제목 / ## 캡션 형식을 지켜 주세요' : ch === 'linkedin' ? '일반 텍스트 · 링크는 본문 대신 첫 댓글에' : '마크다운 (## 소제목, [이미지: 설명])' })
       ]),
       meters,
       withTags ? el('div', { class: 'field' }, [

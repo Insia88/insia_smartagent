@@ -279,14 +279,14 @@
     if (old) old.remove();
     var W = box.clientWidth || 600;
     S.lastWidth = W;
-    var H = W < 480 ? 200 : 240;
+    var H = W < 480 ? 216 : 256;
     var rows = days();
     var max = rows.reduce(function (a, d) { return Math.max(a, d.usd); }, 0);
     var step = niceStep(max);
     var top = Math.max(step, Math.ceil(max / step - 1e-9) * step);
     var ticks = [];
     for (var v = 0; v <= top + 1e-9; v += step) ticks.push(v);
-    var ml = 48, mr = 8, mt = 12, mb = 40;
+    var ml = 48, mr = 8, mt = 28, mb = 40;
     var pw = Math.max(40, W - ml - mr), ph = H - mt - mb;
     var band = pw / rows.length;
     var bw = Math.max(2, Math.min(24, band - 2));
@@ -322,7 +322,7 @@
     });
     // axis titles
     s.appendChild(svg('text', { class: 'axis-title', x: ml + pw / 2, y: H - 4, 'text-anchor': 'middle' }, (+S.month.slice(5, 7)) + '월 날짜 (일)'));
-    s.appendChild(svg('text', { class: 'axis-title', x: 2, y: mt - 2, 'text-anchor': 'start' }, 'USD'));
+    s.appendChild(svg('text', { class: 'axis-title', x: 0, y: 12, 'text-anchor': 'start' }, '비용 (USD)'));
     // hover cursor band
     var cursor = svg('rect', { class: 'cursor', x: 0, y: mt, width: band, height: ph, visibility: 'hidden' });
     s.insertBefore(cursor, s.firstChild);

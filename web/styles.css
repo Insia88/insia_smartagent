@@ -901,7 +901,7 @@ dialog::backdrop { background: var(--backdrop); backdrop-filter: blur(2px); }
 .sheet-head h2 { font-size: var(--fs-md); }
 .brief-form { display: flex; flex-direction: column; max-height: inherit; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 14px 18px; overflow: auto; }
-.field { display: grid; gap: 4px; font-size: var(--fs-sm); font-weight: 600; min-width: 0; border: 0; padding: 0; margin: 0; }
+.field { display: grid; gap: 4px; align-content: start; font-size: var(--fs-sm); font-weight: 600; min-width: 0; border: 0; padding: 0; margin: 0; }
 .field--wide { grid-column: 1 / -1; }
 .field small { font-weight: 400; color: var(--muted); margin-left: 4px; }
 .field input, .field select, .field textarea {
@@ -929,8 +929,8 @@ dialog::backdrop { background: var(--backdrop); backdrop-filter: blur(2px); }
 .view-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 10px 16px; padding-top: 2px; }
 .view-head-text { display: grid; gap: 4px; min-width: 0; flex: 1 1 360px; }
 .view-title { font-size: var(--fs-lg); font-weight: 700; letter-spacing: -.015em; }
-.view-title:focus { outline: none; }
-.view-title:focus-visible { outline: 2px solid var(--focus); outline-offset: 4px; }
+/* headings receive focus only programmatically (tabindex=-1) after navigation; they are not controls */
+.view-title:focus, #studioTitle:focus { outline: none; }
 .view-sub { color: var(--muted); font-size: var(--fs-sm); max-width: 72ch; }
 .view-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .card {
@@ -1066,6 +1066,13 @@ a.btn--primary { color: var(--accent-ink); }
 .content-card .md { max-width: 72ch; }
 .pub-link { font-size: var(--fs-sm); color: var(--muted); overflow-wrap: anywhere; }
 .actions-card .card-sub { color: var(--ink-2); }
+.actions-card { grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 900px) {
+  .actions-card { grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 16px; }
+  .actions-card .card-title, .actions-card .card-sub { grid-column: 1; }
+  .actions-card .action-row { grid-column: 2; grid-row: 1 / span 2; justify-content: flex-end; }
+  .actions-card .action-panel { grid-column: 1 / -1; }
+}
 .action-row { display: flex; flex-wrap: wrap; gap: 8px; }
 .action-panel { display: grid; gap: 10px; padding: 12px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--surface-2); }
 .action-panel[data-panel="approve"] { border-color: color-mix(in srgb, var(--c-gold) 55%, var(--line)); }
@@ -1210,7 +1217,7 @@ a.btn--primary { color: var(--accent-ink); }
 .plan-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); }
 .plan-grid .field--wide { grid-column: 1 / -1; }
 .plan-span { font-size: var(--fs-xs); color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
-.counts { display: grid; gap: 8px; }
+.counts { display: grid; gap: 8px; max-width: 380px; }
 .counts legend { margin-bottom: 4px; padding: 0; font-weight: 600; }
 .count-field { display: grid; grid-template-columns: 12px minmax(0, 1fr) 72px auto; gap: 8px; align-items: center; font-weight: 400; }
 .count-field .lg-swatch { background: var(--ch); }
@@ -1231,8 +1238,9 @@ a.btn--primary { color: var(--accent-ink); }
 /* 브랜드·자료 */
 .brand-layout { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); grid-template-areas: "meter" "form" "docs"; align-items: start; }
 @media (min-width: 1100px) {
-  .brand-layout { grid-template-columns: minmax(0, 1fr) minmax(320px, 400px); grid-template-areas: "form meter" "form docs"; }
-  .brand-meter { position: sticky; top: 12px; }
+  /* the form spans both rows; the flexible second row absorbs its height so 자료 sits right under the meter */
+  .brand-layout { grid-template-columns: minmax(0, 1fr) minmax(320px, 400px); grid-template-rows: auto 1fr; grid-template-areas: "form meter" "form docs"; }
+  .brand-docs { align-self: start; }
 }
 .brand-meter { grid-area: meter; min-width: 0; }
 .brand-form { grid-area: form; min-width: 0; }
@@ -1336,6 +1344,8 @@ a.btn--primary { color: var(--accent-ink); }
 .table-view summary { cursor: pointer; font-size: var(--fs-sm); font-weight: 600; color: var(--accent); min-height: 28px; }
 .data-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 .data-table th, .data-table td { padding: 7px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.data-table td { overflow-wrap: normal; word-break: keep-all; }
+.data-table .mono { white-space: nowrap; }
 .data-table th { font-size: var(--fs-xs); color: var(--muted); font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
 .data-table .num { text-align: right; font-family: var(--f-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .data-table th.num { font-family: var(--f-body); }
@@ -1389,7 +1399,7 @@ a.btn--primary { color: var(--accent-ink); }
   .cal-month .slot--compact .slot-top { display: none; }
   .cal-month .slot--compact .slot-topic { font-size: 0.6875rem; -webkit-line-clamp: 2; }
   .cal-range { width: 100%; margin-left: 0; order: 5; }
-  .editor textarea { min-height: 320px; }
+  .editor textarea { min-height: 280px; height: 58vh; }
   .doc { grid-template-columns: minmax(0, 1fr); }
   .doc-actions { justify-content: flex-start; }
   .explainer, .login-card { padding: 16px; }

@@ -349,12 +349,16 @@
 
   function currentPhase(s) {
     if (s.run && s.run.status === 'completed') return 'done';
-    if (!s.plan) return 'plan';
-    if (!s.research.completed) return 'research';
     var reviewing = s.channelOrder.some(function (c) {
       var ch = s.channels[c];
       return ch && (ch.reviews.length || ch.state === 'reviewing');
     });
+    if (!s.plan) {
+      // item jobs (재검수 · 수정 요청) have no plan or research step
+      var drafting = s.channelOrder.some(function (c) { var ch = s.channels[c]; return ch && ch.drafts.length; });
+      return reviewing ? 'review' : drafting ? 'draft' : 'plan';
+    }
+    if (!s.research.completed) return 'research';
     return reviewing ? 'review' : 'draft';
   }
 

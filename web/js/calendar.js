@@ -115,7 +115,7 @@
             var today = D.today();
             // month → week lands on this week when this month is shown, else on the month's first week
             if (m[0] === 'week') C.anchor = D.weekStart(today.slice(0, 7) === C.anchor.slice(0, 7) ? today : C.anchor);
-            else C.anchor = D.monthStart(D.add(C.anchor, 3));
+            else C.anchor = D.monthStart(D.weekStart(today) === C.anchor ? today : D.add(C.anchor, 3));
             C.slots = null;
             render(false);
             load();
