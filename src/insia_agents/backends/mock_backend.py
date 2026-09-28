@@ -1086,12 +1086,15 @@ def template_calendar(profile: Profile | None, theme: str, start: str, end: str,
     cursor = 0
     extra = 0
     for day, channel in wanted:
-        while True:
+        # Bounded: a history title can make every candidate a repeat (a post titled like the theme is inside every
+        # "<theme> 인사이트 N번째"); then the last candidate is used and the planner's fit_plan drops it as a repeat.
+        for _ in range(len(bank) + len(seen) + 1):
             if cursor < len(bank):
                 topic, angle = bank[cursor]
             else:
                 extra += 1
-                topic, angle = f"{_clip(theme, 40) or main} 인사이트 {extra}", "인사이트"
+                # "번째": a bare "…인사이트 1" is inside "…인사이트 10", "…11", … and would count as their repeat
+                topic, angle = f"{_clip(theme, 40) or main} 인사이트 {extra}번째", "인사이트"
             cursor += 1
             if not repeats_history(topic, seen):
                 break

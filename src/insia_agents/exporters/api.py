@@ -169,15 +169,12 @@ def _export_html(ctx: _Ctx) -> ExportFile:
 
 
 def _export_docx(ctx: _Ctx) -> ExportFile:
-    from .docx_writer import build_docx, exposed_names
+    from .docx_writer import blind_warning, build_docx
 
     data = build_docx(ctx.draft, meta=ctx.meta(), profile=ctx.profile, channel_label=ctx.label)
-    notes: tuple[str, ...] = ()
-    if ctx.channel == "bizplan":
-        exposed = exposed_names(ctx.draft, ctx.profile)
-        if exposed:
-            notes = (f"팀원 실명 {len(exposed)}개가 본문에 있어요 ({', '.join(exposed)}). 제출 전에 ○○로 가려 주세요.",)
-    return ExportFile(ctx.filename("docx"), CONTENT_TYPES["docx"], data, notes)
+    # the same text as the red box inside the Word file (team names, school and employer names)
+    warning = blind_warning(ctx.draft, ctx.profile) if ctx.channel == "bizplan" else ""
+    return ExportFile(ctx.filename("docx"), CONTENT_TYPES["docx"], data, (warning,) if warning else ())
 
 
 def _export_zip(ctx: _Ctx) -> ExportFile:

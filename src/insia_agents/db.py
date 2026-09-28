@@ -51,7 +51,7 @@ import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, NamedTuple, Sequence
 
 from pydantic import BaseModel, ValidationError
 
@@ -181,6 +181,36 @@ class ApprovalBlockedError(WorkspaceError):
         self.item_id = item_id
         self.version = version
         self.score = score
+
+
+# Why a run's new version was kept in the history instead of becoming the item's current one (``RunVersion.reason``).
+HELD_HUMAN_EDIT = "human_edit"  # a person saved an edit after the run's last stored round
+HELD_STATUS = "status"  # a person approved, scheduled or published the item
+HELD_NEWER_VERSION = "newer_version"  # another job (e.g. 수정 요청) saved a newer version
+
+# Item statuses a person set on purpose: a run's later rounds never replace the version they refer to.
+HELD_STATUSES = ("approved", "scheduled", "published")
+
+
+class RunVersion(NamedTuple):
+    """What ``Workspace.add_run_version`` stored.
+
+    ``restored`` is set when the run's version was only kept in the history:
+    the version that must stay current (a person's edit, the approved text, …)
+    was put back on top as this copy, which is the item's current version.
+    """
+
+    version: DraftVersion
+    restored: DraftVersion | None = None
+    by_human: bool = False  # a person saved a version after the run's last stored round
+    reason: str = ""  # HELD_HUMAN_EDIT / HELD_STATUS / HELD_NEWER_VERSION when ``restored`` is set
+
+
+class _RunHead(NamedTuple):
+    keep: sqlite3.Row | None  # the version that must stay current, or None when the run may add its version on top
+    own: int  # the newest version the run itself stored (0 = none)
+    by_human: bool
+    reason: str
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +787,10 @@ class Workspace:
                 conn.execute("ROLLBACK")
                 raise
             conn.execute("COMMIT")
+
+    def transaction(self):
+        """Public write transaction for callers outside this module (all nested workspace writes join it)."""
+        return self._tx()
 
     @contextmanager
     def _read(self) -> Iterator[sqlite3.Connection]:
@@ -1426,13 +1460,17 @@ class Workspace:
         return DraftVersion(id=version_id, item_id=item_id, version=number, source=source, draft=draft, review=review,  # type: ignore[arg-type]
                             instructions=instructions or "", created_at=now)
 
-    def _refresh_item(self, conn: sqlite3.Connection, item_id: str) -> None:
+    def _refresh_item(self, conn: sqlite3.Connection, item_id: str, *, keep_status: bool = False) -> None:
         """Recompute title/version/score/passed/status from the latest version.
 
         - ``draft`` / ``needs_changes`` follow the latest review (failed → needs_changes).
         - ``approved`` / ``scheduled`` fall back to draft/needs_changes when a newer
           version than the approved one appears (approval is for specific content).
         - ``published`` / ``archived`` never change here.
+
+        ``keep_status``: the status stays as it is (the latest version is a copy of
+        the version that was current, put back on top, so nothing a person decided
+        about it changes).
         """
         item = self._item_row(conn, item_id)
         latest = conn.execute("SELECT * FROM versions WHERE item_id = ? ORDER BY version DESC LIMIT 1", (item_id,)).fetchone()
@@ -1443,7 +1481,9 @@ class Workspace:
         review = Review.model_validate(review_data) if review_data else None
         failed = review is not None and not review.passed
         status = item["status"]
-        if status in ("draft", "needs_changes"):
+        if keep_status:
+            pass
+        elif status in ("draft", "needs_changes"):
             status = "needs_changes" if failed else "draft"
         elif status in ("approved", "scheduled") and int(latest["version"]) != int(item["approved_version"]):
             status = "needs_changes" if failed else "draft"
@@ -1466,10 +1506,117 @@ class Workspace:
         review = _as_model(Review, review, "검수 결과")
         with self._tx() as conn:
             self._guard_run(conn, run_id)
+            if source == "agent" and run_id and item_id == pipeline_item_id(run_id, draft.channel):
+                # a run's round on its own item (pipeline, import): never buries a person's edit or decision
+                return self._add_run_version(conn, item_id, draft, review=review, instructions=instructions,
+                                             run_id=run_id).version
             version = self._insert_version(conn, item_id, draft, source=source, review=review, instructions=instructions,
                                            run_id=run_id, role="round")
             self._refresh_item(conn, item_id)
         return version
+
+    def add_run_version(self, item_id: str, draft: Draft, *, run_id: str, review: Review | None = None,
+                        instructions: str = "") -> RunVersion:
+        """Store a run's draft round on the run's own item (``it_<run_id>_<channel>``) without burying newer work.
+
+        Normally the round is appended and becomes the current version, like
+        ``add_version``. But when the item moved on after the run's last
+        stored round — a person saved an edit (while the run was stopped, or
+        from the dashboard while a CLI run was going), another job saved a
+        version, or a person approved, scheduled or published the item — the
+        round is only kept in the history (resume still finds it) and the
+        version that was current is put back on top as a copy (role
+        ``restored``, same content and review, a change-log note), the way
+        ``add_job_version`` does for revise jobs. The item's status stays as
+        the person left it (an approval moves to the copy, which has the same
+        content). The check and the inserts are one transaction.
+        """
+        draft = _as_model(Draft, draft, "초안")
+        review = _as_model(Review, review, "검수 결과")
+        with self._tx() as conn:
+            self._guard_run(conn, run_id)
+            return self._add_run_version(conn, item_id, draft, review=review, instructions=instructions, run_id=run_id)
+
+    def _add_run_version(self, conn: sqlite3.Connection, item_id: str, draft: Draft, *, review: Review | None,
+                         instructions: str, run_id: str) -> RunVersion:
+        head = self._run_head(conn, item_id, run_id)
+        version = self._insert_version(conn, item_id, draft, source="agent", review=review, instructions=instructions,
+                                       run_id=run_id, role="round")
+        if head.keep is None:
+            self._refresh_item(conn, item_id)
+            return RunVersion(version)
+        restored = self._put_back_on_top(conn, item_id, head.keep, self._held_note(conn, item_id, head, draft.round,
+                                                                                   version.version), run_id)
+        self._refresh_item(conn, item_id, keep_status=True)
+        return RunVersion(version, restored, head.by_human, head.reason)
+
+    @staticmethod
+    def _same_text(a: sqlite3.Row, b: sqlite3.Row) -> bool:
+        """Whether two stored versions hold the same draft from the same source (the change log aside: a copy put
+        back on top starts with a note)."""
+        if a["source"] != b["source"]:
+            return False
+        da, db_ = _loads(a["draft"], {}) or {}, _loads(b["draft"], {}) or {}
+        da.pop("change_log", None)
+        db_.pop("change_log", None)
+        return bool(da) and da == db_
+
+    def _is_copy_of(self, row: sqlite3.Row, original: sqlite3.Row) -> bool:
+        """``row`` is a copy of ``original`` put back on top later (role ``restored``, same text and source), e.g. a
+        run kept a 수정 요청 job's revision current over its own round, or a job kept a run's round current."""
+        return row["role"] == "restored" and int(row["version"]) > int(original["version"]) and self._same_text(row, original)
+
+    def _own_row(self, conn: sqlite3.Connection, item_id: str, run_id: str) -> sqlite3.Row | None:
+        """The newest version run ``run_id`` itself stored on the item (a round or its final copy)."""
+        return conn.execute("SELECT * FROM versions WHERE item_id = ? AND run_id = ? AND source = 'agent' "
+                            "AND role IN ('round', 'final') ORDER BY version DESC LIMIT 1", (item_id, run_id)).fetchone()
+
+    def _run_head(self, conn: sqlite3.Connection, item_id: str, run_id: str) -> _RunHead:
+        """Whether run ``run_id`` may put a new version of its item on top (``keep`` is None) or must keep it in
+        the history only: the item's latest version is not the run's own agent work (a person's edit, another
+        job's version, or a copy the run already put back on top), or a person approved, scheduled or published
+        the item. A copy of the run's own newest version that another job put back on top counts as the run's
+        own work (the text is the run's)."""
+        latest = conn.execute("SELECT * FROM versions WHERE item_id = ? ORDER BY version DESC LIMIT 1", (item_id,)).fetchone()
+        if latest is None:
+            return _RunHead(None, 0, False, "")
+        own_row = self._own_row(conn, item_id, run_id)
+        own = int(own_row["version"]) if own_row is not None else 0
+        by_human = conn.execute("SELECT 1 FROM versions WHERE item_id = ? AND version > ? AND source = 'human' LIMIT 1",
+                                (item_id, own)).fetchone() is not None
+        moved = int(latest["version"]) != own and not (own_row is not None and self._is_copy_of(latest, own_row))
+        held_status = self._item_row(conn, item_id)["status"] in HELD_STATUSES
+        if not moved and not held_status:
+            return _RunHead(None, own, False, "")
+        if not moved:  # the run's own text is current but a person approved, scheduled or published it
+            by_human = False
+        reason = HELD_HUMAN_EDIT if by_human else (HELD_STATUS if held_status else HELD_NEWER_VERSION)
+        return _RunHead(latest, own, by_human, reason)
+
+    def _held_note(self, conn: sqlite3.Connection, item_id: str, head: _RunHead, round_: int, number: int) -> str:
+        kept = int(head.keep["version"]) if head.keep is not None else 0
+        tail = f"(에이전트의 R{int(round_)} 결과는 기록에만 남겨요: v{number})"
+        if head.reason == HELD_STATUS:
+            label = STATUS_LABELS.get(self._item_row(conn, item_id)["status"], "")
+            return f"이 콘텐츠가 '{label}' 상태라 v{kept} 버전을 그대로 현재 버전으로 두었어요 {tail}"
+        who = "사람이 고친 " if head.reason == HELD_HUMAN_EDIT else ""
+        return f"이 실행이 멈췄거나 진행되는 동안 {who}v{kept} 버전이 저장돼서, 그 내용을 다시 현재 버전으로 올렸어요 {tail}"
+
+    def _put_back_on_top(self, conn: sqlite3.Connection, item_id: str, kept_row: sqlite3.Row, note: str,
+                         run_id: str) -> DraftVersion:
+        """Append a copy of ``kept_row`` (role ``restored``) so it is the latest version again; an approval of it
+        moves to the copy (same content). The caller refreshes the item with ``keep_status=True``."""
+        kept = self._version(kept_row)
+        change_log = list(kept.draft.change_log)
+        if kept_row["role"] == "restored" and change_log:  # a copy of a copy: replace its note instead of stacking notes
+            change_log = change_log[1:]
+        copy = kept.draft.model_copy(update={"change_log": [note, *change_log]})
+        restored = self._insert_version(conn, item_id, copy, source=kept.source, review=kept.review,
+                                        instructions=kept.instructions, run_id=run_id, role="restored")
+        item = self._item_row(conn, item_id)
+        if item["status"] in ("approved", "scheduled") and int(item["approved_version"]) == kept.version:
+            conn.execute("UPDATE items SET approved_version = ? WHERE id = ?", (restored.version, item_id))
+        return restored
 
     def add_job_version(self, item_id: str, draft: Draft, *, base_version: int, source: str = "agent",
                         review: Review | None = None, instructions: str = "", run_id: str = "",
@@ -1483,8 +1630,9 @@ class Workspace:
         current one: the version that was current is appended again right
         after it (role ``restored``, same content, source and review, with a
         change-log note), so the latest version — what exports and approval
-        use — is still the newer work. The check and both inserts are one
-        transaction (refused like ``add_version`` when the job was taken over).
+        use — is still the newer work, and the item's status (and approval) stays
+        as it was. The check and both inserts are one transaction (refused like
+        ``add_version`` when the job was taken over).
         """
         draft = _as_model(Draft, draft, "초안")
         review = _as_model(Review, review, "검수 결과")
@@ -1495,26 +1643,38 @@ class Workspace:
                                            run_id=run_id, role="round")
             restored: DraftVersion | None = None
             if latest is not None and int(latest["version"]) != int(base_version):
-                kept = self._version(latest)
-                note = (f"{label}이 진행되는 동안 v{kept.version} 버전이 저장돼서, 그 내용을 다시 현재 버전으로 올렸어요 "
-                        f"({label} 결과는 v{version.version}, v{int(base_version)} 기준)")
-                copy = kept.draft.model_copy(update={"change_log": [note, *kept.draft.change_log]})
-                restored = self._insert_version(conn, item_id, copy, source=kept.source, review=kept.review,
-                                                instructions=kept.instructions, run_id=run_id, role="restored")
-            self._refresh_item(conn, item_id)
+                note = (f"{label}이 진행되는 동안 v{int(latest['version'])} 버전이 저장돼서, 그 내용을 다시 현재 버전으로 "
+                        f"올렸어요 ({label} 결과는 v{version.version}, v{int(base_version)} 기준)")
+                restored = self._put_back_on_top(conn, item_id, latest, note, run_id)
+            self._refresh_item(conn, item_id, keep_status=restored is not None)
         return version, restored
 
     def attach_review(self, version_id: str, review: Review, *, run_id: str = "") -> None:
         """Store ``review`` on a version. ``run_id`` is the run (pipeline or job) that made the review: refused
-        (``RunTakenOverError``) when this process held it but another process took it over."""
+        (``RunTakenOverError``) when this process held it but another process took it over. The item's summary
+        and status follow only when it is the item's current (latest) version.
+
+        Copies of the version that were put back on top while the review was being made (``add_run_version`` /
+        ``add_job_version``: e.g. a CLI run kept a 수정 요청 job's revision current over its own round) show the
+        same text, so they get the review too — unless a copy already has a different review of its own. Without
+        this the current version would stay unreviewed and approval would need "그래도 승인"."""
         review = _as_model(Review, review, "검수 결과")
         with self._tx() as conn:
             self._guard_run(conn, run_id)
-            row = conn.execute("SELECT item_id FROM versions WHERE id = ?", (version_id,)).fetchone()
+            row = conn.execute("SELECT * FROM versions WHERE id = ?", (version_id,)).fetchone()
             if row is None:
                 raise NotFoundError(f"버전 {version_id}를 찾을 수 없어요")
+            item_id, before = row["item_id"], _loads(row["review"])
             conn.execute("UPDATE versions SET review = ? WHERE id = ?", (review.model_dump_json(), version_id))
-            self._refresh_item(conn, row["item_id"])
+            touched = {int(row["version"])}
+            for copy in conn.execute("SELECT * FROM versions WHERE item_id = ? AND version > ? AND role = 'restored'",
+                                     (item_id, int(row["version"]))).fetchall():
+                if self._is_copy_of(copy, row) and _loads(copy["review"]) == before:  # the copy still mirrors it
+                    conn.execute("UPDATE versions SET review = ? WHERE id = ?", (review.model_dump_json(), copy["id"]))
+                    touched.add(int(copy["version"]))
+            latest = conn.execute("SELECT MAX(version) FROM versions WHERE item_id = ?", (item_id,)).fetchone()[0]
+            if int(latest or 0) in touched:
+                self._refresh_item(conn, item_id)
 
     def get_version(self, version_id: str) -> DraftVersion | None:
         with self._read() as conn:
@@ -1666,6 +1826,45 @@ class Workspace:
                                 "ORDER BY round, version", (item_id, run_id)).fetchall()
         return [self._version(row) for row in rows]
 
+    def run_item_superseded(self, run_id: str, channel: str) -> dict[str, Any] | None:
+        """Whether run ``run_id``'s work is not the current version of its item for ``channel``.
+
+        None when the item's latest version is the run's own (or there is no
+        item). Otherwise ``{"version": the run's newest version, "current_version":
+        the item's current one, "superseded_by_human_edit": a person saved a
+        version after the run's, "status": the item's status}`` — e.g. a person
+        edited the item while the run was stopped or going (``add_run_version``).
+        """
+        item_id = pipeline_item_id(run_id, channel)
+        with self._read() as conn:
+            item = conn.execute("SELECT status FROM items WHERE id = ?", (item_id,)).fetchone()
+            if item is None:
+                return None
+            latest = conn.execute("SELECT * FROM versions WHERE item_id = ? ORDER BY version DESC LIMIT 1", (item_id,)).fetchone()
+            own_row = self._own_row(conn, item_id, run_id)
+            if latest is None or own_row is None or int(latest["version"]) == int(own_row["version"]) \
+                    or self._is_copy_of(latest, own_row):  # a copy of the run's text that a job put back on top
+                return None
+            own = int(own_row["version"])
+            by_human = conn.execute("SELECT 1 FROM versions WHERE item_id = ? AND version > ? AND source = 'human' LIMIT 1",
+                                    (item_id, own)).fetchone() is not None
+        return {"version": own, "current_version": int(latest["version"]), "superseded_by_human_edit": by_human,
+                "status": item["status"]}
+
+    def version_is_current(self, item_id: str, version: int) -> bool:
+        """Whether version ``version`` holds the item's current text: it is the latest version, or the latest is a
+        copy of it put back on top (``add_run_version`` / ``add_job_version`` keep a version current that way, e.g.
+        a CLI run keeps a 수정 요청 job's revision current over its own round). For a job deciding whether its
+        result was superseded."""
+        with self._read() as conn:
+            latest = conn.execute("SELECT * FROM versions WHERE item_id = ? ORDER BY version DESC LIMIT 1", (item_id,)).fetchone()
+            if latest is None:
+                return False
+            if int(latest["version"]) == int(version):
+                return True
+            row = conn.execute("SELECT * FROM versions WHERE item_id = ? AND version = ?", (item_id, int(version))).fetchone()
+            return row is not None and self._is_copy_of(latest, row)
+
     def upsert_item_from_result(self, run_id: str, result: ChannelResult, brief: Brief) -> ContentItem:
         """Create/update item ``it_<run_id>_<channel>`` from a finished channel.
 
@@ -1678,6 +1877,12 @@ class Workspace:
         review), so "the latest version" is always the final text. Refused
         (``RunTakenOverError``) when this process held the run but another
         process took it over.
+
+        When the item moved on after the run's last stored round (a person's
+        edit or decision, another job's version: see ``add_run_version``),
+        the run's work stays in the history only: no final copy is added,
+        rounds stored now are followed by a copy of the current version, and
+        the item's status is left as it is (``run_item_superseded`` reports it).
         """
         result = _as_model(ChannelResult, result, "채널 결과")
         brief = _as_model(Brief, brief, "브리프")
@@ -1687,21 +1892,30 @@ class Workspace:
             self._guard_run(conn, run_id)
             if conn.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone() is None:
                 self._insert_item(conn, item_id, result.channel, result.final.title, run_id=run_id, brief=brief)
+            head = self._run_head(conn, item_id, run_id)
             stored = {
                 row["round"]: row
                 for row in conn.execute("SELECT id, round, review FROM versions WHERE item_id = ? AND run_id = ? "
                                         "AND role = 'round' AND source = 'agent'", (item_id, run_id)).fetchall()
             }
+            added: DraftVersion | None = None
             for draft in result.drafts:
                 review = reviews_by_round.get(draft.round)
                 row = stored.get(draft.round)
                 if row is None:
-                    self._insert_version(conn, item_id, draft, source="agent", review=review, instructions="",
-                                         run_id=run_id, role="round")
+                    added = self._insert_version(conn, item_id, draft, source="agent", review=review, instructions="",
+                                                 run_id=run_id, role="round")
                 elif review is not None and (_loads(row["review"]) != review.model_dump(mode="json")):
                     conn.execute("UPDATE versions SET review = ? WHERE id = ?", (review.model_dump_json(), row["id"]))
+            if head.keep is not None:  # someone else's version (or decision) stays current
+                if added is not None:
+                    note = self._held_note(conn, item_id, head, added.draft.round, added.version)
+                    self._put_back_on_top(conn, item_id, head.keep, note, run_id)
+                self._refresh_item(conn, item_id, keep_status=True)
+                return self._item(self._item_row(conn, item_id))
             newest = conn.execute("SELECT round, role, draft, review FROM versions WHERE item_id = ? AND run_id = ? "
-                                  "ORDER BY version DESC LIMIT 1", (item_id, run_id)).fetchone()
+                                  "AND source = 'agent' AND role IN ('round', 'final') ORDER BY version DESC LIMIT 1",
+                                  (item_id, run_id)).fetchone()
             if newest is not None and not self._is_final_copy(newest, result.final):
                 later = int(newest["round"]) > result.final.round and newest["review"] is None and newest["role"] == "round"
                 if later:  # e.g. the reviewer failed on the last revision: fall back to the best reviewed round
@@ -1963,6 +2177,8 @@ class Workspace:
                 raise WorkspaceError("이 슬롯은 이미 초안을 만드는 중이에요")
             if row["status"] == "drafted" and row["item_id"] and not force:
                 raise WorkspaceError(f"이미 초안이 있어요 (보관함 {row['item_id']}). 다시 만들려면 force로 요청해 주세요.")
+            if row["status"] == "skipped" and not force:
+                raise WorkspaceError("건너뛰기로 표시한 슬롯이에요. 먼저 '계획'으로 되돌리거나 force로 요청해 주세요.")
             conn.execute("UPDATE slots SET status = 'generating', run_id = ?, updated_at = ? WHERE id = ?",
                          (run_id, _fmt(now), slot_id))
             return self._slot(conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone())
@@ -2002,7 +2218,9 @@ class Workspace:
                 raise WorkspaceError(f"이 슬롯은 지금 다른 실행({busy})이 초안을 만드는 중이에요. 그 실행이 끝난 뒤 보관함을 확인해 주세요.")
             row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
             if row["status"] == "drafted" and row["item_id"] and (row["run_id"] or "") != run_id:
-                newer = conn.execute("SELECT 1 FROM items i JOIN runs mine ON mine.id = ? WHERE i.id = ? AND i.created_at > mine.created_at",
+                # ">=": timestamps have millisecond precision; a draft made in the same millisecond as this run
+                # counts as newer (leaving the slot alone never unlinks someone else's draft)
+                newer = conn.execute("SELECT 1 FROM items i JOIN runs mine ON mine.id = ? WHERE i.id = ? AND i.created_at >= mine.created_at",
                                      (run_id, row["item_id"])).fetchone()
                 if newer is not None:
                     return None

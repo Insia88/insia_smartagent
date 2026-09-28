@@ -1739,14 +1739,18 @@
     return out;
   }
 
+  /** FormatCheck list. A browser preview check with `partial: true` (only part of the rule could be checked here)
+   *  never shows as passed: '…', "일부만 확인" and its `note` saying where the full verdict comes from. */
   function formatChecksBlock(checks, title) {
     return el('div', null, [
       el('h3', { class: 'sub-title', text: title }),
       el('ul', { class: 'checks-list' }, checks.map(function (c) {
-        return el('li', null, [
-          el('span', { class: c.passed ? 'ok' : 'no', text: c.passed ? '✓' : '✕', 'aria-label': c.passed ? '통과' : '미통과' }),
+        var state = c.partial ? 'part' : c.passed ? 'ok' : 'no';
+        return el('li', { 'data-state': state, 'data-check': c.id || null }, [
+          el('span', { class: state, text: c.partial ? '…' : c.passed ? '✓' : '✕', 'aria-label': c.partial ? '일부만 확인' : c.passed ? '통과' : '미통과' }),
           el('span', { text: c.label }),
-          el('span', { class: 'val', text: c.value + ' / 기준 ' + c.expected })
+          el('span', { class: 'val', text: c.value + ' / 기준 ' + c.expected }),
+          c.partial && c.note ? el('span', { class: 'note', text: c.note }) : null
         ]);
       }))
     ]);

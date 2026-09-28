@@ -16,13 +16,13 @@ Routes (JSON unless noted; errors are ``{"error": "<Korean>", "status": N}``)::
     GET    /api/profile        PUT /api/profile
     GET    /api/documents      POST /api/documents {title, text, kind?, filename?}
     GET    /api/documents/<id> DELETE /api/documents/<id>
-    GET    /api/runs?kind=&status=&limit=   POST /api/runs (Brief + options)
+    GET    /api/runs?kind=&status=&limit=&parent_item_id=   POST /api/runs (Brief + options)
     GET    /api/runs/<id>                   GET /api/runs/<id>/events (SSE)   GET /api/runs/<id>/export (zip)
     POST   /api/runs/<id>/resume            POST /api/runs/<id>/cancel
     GET    /api/items?status=&channel=      GET /api/items/<id>
     PUT    /api/items/<id>/draft            POST /api/items/<id>/review | /revise | /status
     GET    /api/items/<id>/export?format=md|txt|html|docx|zip[&version=N][&info=1]
-    GET    /api/calendar?from=&to=          POST /api/calendar/plan
+    GET    /api/calendar?from=&to=          POST /api/calendar/plan {theme, start, end|days, counts, weekend_channels?, replace?}
     POST   /api/calendar/<slot>             POST /api/calendar/<slot>/generate
     GET    /api/usage?since=&until=
 
@@ -64,6 +64,7 @@ import math
 import mimetypes
 import os
 import re
+import signal
 import socket
 import sys
 import threading
@@ -86,16 +87,16 @@ from . import actions
 from .backends import create_backend
 from .backends.base import BackendError, RunContext
 from .config import MIN_SPEED, Settings, has_credentials, load_sample_brief, resolve_mode
-from .db import (RUN_STATUSES, ApprovalBlockedError, InvalidTransitionError, NotFoundError, Workspace, WorkspaceError,
-                 pipeline_item_id, profile_is_empty)
+from .db import (RECOVERY_WATCH_SECONDS, RUN_STATUSES, STALE_AFTER_SECONDS, ApprovalBlockedError, InvalidTransitionError,
+                 NotFoundError, Workspace, WorkspaceError, pipeline_item_id, profile_is_empty)
 from .events import TERMINAL_TYPES, EventBus, SimClock
 from .exporters import (CHANNEL_FORMATS, ExportError, ExportFile, MissingDependencyError, capabilities, export_item,
                         export_run_zip, format_label, formats_for)
-from .models import Brief, Profile, RunResult
+from .models import Brief, CalendarSlot, Profile, RunResult
 from .pipeline import (RESUMABLE_KINDS, BudgetExceeded, PipelineError, RunCancelled, SimRunner, ThreadRunner,
                        build_context, continue_numbering, failure_status, load_resume_state, new_run_id, prepare_run,
                        run_pipeline, resume_run)
-from .planner import PlanningError, plan_week
+from .planner import PlanningError, date_span, plan_week, weekend_channel_set
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +112,7 @@ DEFAULT_MAX_MOCK = 4
 MAX_COST_OPTION = 10_000.0
 MAX_JSON_INT = 2 ** 53 - 1  # the largest integer a browser (JavaScript) can send exactly
 MAX_LOGGED_PATH = 200  # characters of a request path written to the log
+SHUTDOWN_GRACE = 20.0  # Ctrl+C / SIGTERM: seconds to wait for cancelled runs to stop (docker-compose stop_grace_period 30s)
 # The client went away (or stopped reading) while we answered: nothing to report.
 DISCONNECT_ERRORS: tuple[type[BaseException], ...] = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
@@ -126,6 +128,7 @@ ID_SEGMENT = r"([A-Za-z0-9][A-Za-z0-9._-]{0,120})"
 HOST_HEADER = re.compile(r"^(?:\[(?P<v6>[0-9A-Fa-f:.]+)\]|(?P<name>[A-Za-z0-9.-]+))(?::(?P<port>[0-9]{1,5}))?$")
 HOST_NAME = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
 DOC_ID = re.compile(r"^u\d{1,9}$")
+ITEM_ID = re.compile(r"^it_[A-Za-z0-9._-]{1,120}$")
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 WILDCARD_HOSTS = frozenset({"", "0.0.0.0", "::"})
 
@@ -503,6 +506,140 @@ class CancellableBackend:
 
 
 # ---------------------------------------------------------------------------
+# Planning
+# ---------------------------------------------------------------------------
+
+
+class PlannedSlotReplacement:
+    """The ``planned`` slots a re-plan of ``start``..``end`` sets aside (``--replace`` / ``replace: true``).
+
+    ``mark()`` marks them ``skipped`` so the new plan can use their days, and
+    ``restore()`` puts the ones still ``skipped`` back to ``planned`` after a
+    re-plan that failed or was stopped. Each is one write transaction of the
+    workspace (``Workspace.transaction``: ``BEGIN IMMEDIATE``, nested writes join it),
+    so the status check and the change cannot interleave with another thread
+    or process: a slot a cron ``insia run-due`` claims meanwhile is no longer
+    ``planned`` when it is read, so it is never marked (or put back) over the
+    claim, and a failure half-way changes nothing. Slots that are generating
+    or drafted are left alone.
+    """
+
+    def __init__(self, workspace: Workspace, start: str, end: str) -> None:
+        self.workspace = workspace
+        self.start = start
+        self.end = end
+        self.slots: list[CalendarSlot] = []
+        self._lock = threading.Lock()
+        self._restored = False
+
+    def mark(self) -> list[CalendarSlot]:
+        ws = self.workspace
+        with ws.transaction():  # all or none
+            marked = [ws.update_slot(slot.id, status="skipped")
+                      for slot in ws.list_slots(date_from=self.start, date_to=self.end) if slot.status == "planned"]
+        self.slots = marked
+        return marked
+
+    def restore(self) -> list[str]:
+        """Put the marked slots that are still ``skipped`` back to ``planned`` (once; later calls do nothing).
+
+        Returns their ids. A failure is logged (the slots stay ``skipped`` and
+        can be put back by hand) and a later call tries again.
+        """
+        with self._lock:
+            if self._restored or not self.slots:
+                return []
+            ws = self.workspace
+            restored: list[str] = []
+            try:
+                with ws.transaction():
+                    for slot in self.slots:
+                        current = ws.get_slot(slot.id)
+                        if current is not None and current.status == "skipped":
+                            ws.update_slot(slot.id, status="planned")
+                            restored.append(slot.id)
+            except Exception:  # noqa: BLE001 - never hide the error that made us put them back
+                log.exception("건너뜀으로 바꾼 계획 %d개를 되돌리지 못했어요 (%s)", len(self.slots),
+                              ", ".join(slot.id for slot in self.slots))
+                return []
+            self._restored = True
+            return restored
+
+
+@contextmanager
+def replacing_planned_slots(workspace: Workspace, start: str, end: str, *, enabled: bool = True,
+                            replacement: PlannedSlotReplacement | None = None) -> Iterator[list[CalendarSlot]]:
+    """Re-plan a range from scratch (``insia plan-week --replace``, ``POST /api/calendar/plan`` ``replace: true``).
+
+    The ``planned`` slots between ``start`` and ``end`` (no draft yet) are
+    marked ``skipped`` so the new plan can use their days; they are yielded.
+    When marking or the body raises (bad input, an AI call that failed,
+    Ctrl+C / SIGTERM, a server shutdown), the ones still ``skipped`` go back
+    to ``planned``, so a failed re-plan never empties the calendar (see
+    ``PlannedSlotReplacement``).
+    """
+    replacement = replacement if replacement is not None else PlannedSlotReplacement(workspace, start, end)
+    try:
+        if enabled:
+            replacement.mark()
+        yield replacement.slots
+    except BaseException:
+        replacement.restore()
+        raise
+
+
+class PlanJob:
+    """A calendar plan this server is making right now (``RunManager.plan_week``), so a shutdown can end it cleanly.
+
+    ``workspace()`` is the workspace as the planner sees it: its new slots are
+    saved only while the job was not stopped. ``abandon()`` (shutdown, when
+    the plan did not finish in time) stops it and, unless its slots are
+    already saved, puts the slots its ``replace`` set aside back right away,
+    before the process exits and the request thread with it.
+    """
+
+    def __init__(self, replacement: PlannedSlotReplacement) -> None:
+        self.replacement = replacement
+        self.cancel_event = threading.Event()
+        self.done = threading.Event()
+        self.saved = False
+        self._lock = threading.Lock()
+
+    def workspace(self) -> "_PlanningWorkspace":
+        return _PlanningWorkspace(self.replacement.workspace, self)
+
+    def save_slots(self, slots: Sequence[Any]) -> list[CalendarSlot]:
+        with self._lock:
+            if self.cancel_event.is_set():
+                raise RunCancelled("서버를 끄는 중이라 계획을 저장하지 않았어요")
+            saved = self.replacement.workspace.add_slots(list(slots))
+            self.saved = True
+            return saved
+
+    def abandon(self) -> list[str]:
+        """Stop the plan; returns the ids of the set-aside slots put back (none when the plan was already saved)."""
+        with self._lock:
+            self.cancel_event.set()
+            if self.saved:
+                return []
+        return self.replacement.restore()
+
+
+class _PlanningWorkspace:
+    """Workspace proxy for ``plan_week`` during a server plan: ``add_slots`` goes through the ``PlanJob``."""
+
+    def __init__(self, workspace: Workspace, job: PlanJob) -> None:
+        self._workspace = workspace
+        self._job = job
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._workspace, name)
+
+    def add_slots(self, slots: Sequence[Any]) -> list[CalendarSlot]:
+        return self._job.save_slots(slots)
+
+
+# ---------------------------------------------------------------------------
 # Runs
 # ---------------------------------------------------------------------------
 
@@ -578,6 +715,8 @@ class RunManager:
         self._active: dict[str, RunRecord] = {}
         self._recent: OrderedDict[str, RunRecord] = OrderedDict()
         self._planning = {"live": 0, "mock": 0}
+        self._plans: set[PlanJob] = set()  # calendar plans in progress (request threads), for shutdown
+        self._closing = False
         self._editing: dict[str, int] = {}  # item id → human edits being saved right now
         self._editing_runs: dict[str, int] = {}  # the same edits by the run that produced the item
         self._lock = threading.Lock()
@@ -619,13 +758,16 @@ class RunManager:
         with self._lock:
             return self._active.get(run_id)
 
-    def list(self, limit: int = 50, *, kind: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
-        rows = self.workspace.list_runs(limit, kind=kind, status=status if status != "running" else None)
+    def list(self, limit: int = 50, *, kind: str | None = None, status: str | None = None,
+             parent_item_id: str | None = None) -> list[dict[str, Any]]:
+        """Run summaries, newest first (``parent_item_id``: only the jobs run on that content item)."""
+        rows = self.workspace.list_runs(limit, kind=kind, status=status if status != "running" else None,
+                                        parent_item_id=parent_item_id or None)
         with self._lock:
             active = dict(self._active)
         known = {row["run_id"] for row in rows}
         pending = [r.summary() for r in active.values() if r.run_id not in known
-                   and (not kind or r.kind == kind)]
+                   and (not kind or r.kind == kind) and (not parent_item_id or r.item_id == parent_item_id)]
         out = []
         for row in pending + rows:
             record = active.get(row["run_id"])
@@ -919,8 +1061,15 @@ class RunManager:
         if run["kind"] not in RESUMABLE_KINDS:
             raise RequestError(400, f"'{run['kind']}' 작업은 이어서 실행할 수 없어요. 같은 작업을 다시 시작해 주세요.")
         if run["status"] == "running" and not force:
-            raise RequestError(409, "다른 곳(CLI 등)에서 실행 중으로 표시된 작업이에요. 정말 멈춘 작업이라면 "
-                                    "force: true로 다시 요청하거나 서버를 다시 시작해 주세요.", extra={"can_force": True})
+            # A process that is gone (killed CLI run, crashed server) is taken over now instead of waiting for the
+            # background check; trust_own_pid: this server may be starting a run of its own right now.
+            if not self.workspace.recover_stale(run_ids=[run_id], trust_own_pid=True):
+                owner = self.workspace.run_owner(run_id) or {}
+                raise RequestError(409, f"다른 곳(CLI 등)에서 아직 실행 중인 작업이에요 ({self._owner_text(owner)}). "
+                                        f"끝날 때까지 기다려 주세요. {self._stale_hint(owner)} 멈춘 게 확실하면 지금 넘겨받을 "
+                                        f"수도 있어요 (API는 force: true, CLI는 insia resume {run_id} --force).",
+                                   extra={"can_force": True})
+            run = self.workspace.get_run(run_id) or run  # its owner was gone: now 'interrupted'
         if run["status"] == "completed":
             state = load_resume_state(self.workspace, run_id)
             if all(state.channels.get(ch) and state.channels[ch].completed for ch in run.get("channels") or []):
@@ -935,8 +1084,9 @@ class RunManager:
                            cancel_event=cancel_event, runner=runner)
 
         def target() -> RunResult:
+            # options.max_cost_usd is this run's new cap (0 = none); without it the run keeps its own stored cap
             return resume_run(run_id, settings, self.workspace, backend=backend, bus=bus, runner=runner,
-                              out_dir=settings.out_dir, force=force)
+                              out_dir=settings.out_dir, force=force, max_cost_usd=options.get("max_cost_usd"))
 
         return self._launch(record, target)
 
@@ -947,11 +1097,59 @@ class RunManager:
             if run is None:
                 raise RequestError(404, "해당 실행을 찾을 수 없어요")
             if run["status"] == "running":
-                raise RequestError(409, "이 서버에서 실행 중인 작업이 아니에요. 다른 곳(CLI 등)에서 실행 중이거나 "
-                                        "비정상 종료된 작업이에요. 서버를 다시 시작하면 '중단됨'으로 정리돼요.")
+                if self.workspace.recover_stale(run_ids=[run_id], trust_own_pid=True):
+                    resumable = run["kind"] in RESUMABLE_KINDS
+                    # worded to read right after a client's "멈추지 못했어요: " as well as on its own
+                    raise RequestError(
+                        409, "이미 멈춰 있던 실행이에요. 실행하던 프로그램이 꺼져 있어서 '중단됨'으로 정리했어요. "
+                             + ("'이어서 실행'으로 남은 작업을 마칠 수 있어요." if resumable
+                                else "이 작업은 이어서 할 수 없어서 보관함에서 같은 작업을 다시 시작해 주세요."),
+                        extra={"run_status": "interrupted", "recovered": True, "resumable": resumable})
+                owner = self.workspace.run_owner(run_id) or {}
+                raise RequestError(409, f"이 서버에서 실행 중인 작업이 아니에요. 다른 곳(CLI 등)에서 실행 중이에요 "
+                                        f"({self._owner_text(owner)}). 멈추려면 그 프로그램에서 멈춰 주세요(Ctrl+C). "
+                                        f"{self._stale_hint(owner, resumable=run['kind'] in RESUMABLE_KINDS)}",
+                                   extra={"run_status": "running"})
             raise RequestError(409, "이미 끝난 실행이에요.", extra={"run_status": run["status"]})
         record.request_cancel()
         return record
+
+    @staticmethod
+    def _owner_text(owner: dict[str, Any]) -> str:
+        """Who runs a ``running`` run this server does not (``Workspace.run_owner``; for 409 messages): a pid here,
+        another host, when last seen."""
+        if owner.get("this_host") and owner.get("pid"):
+            where = f"이 컴퓨터의 프로세스 {owner['pid']}"
+        elif owner.get("host"):
+            where = f"다른 컴퓨터·컨테이너({owner['host']})"
+        else:
+            where = "다른 프로그램"
+        try:
+            beat = datetime.fromisoformat(str(owner.get("heartbeat_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            return where
+        if beat.tzinfo is None:
+            beat = beat.replace(tzinfo=timezone.utc)
+        minutes = int(max(0.0, (datetime.now(timezone.utc) - beat).total_seconds()) // 60)
+        return where + (f", 마지막 신호 {minutes}분 전" if minutes else ", 방금 신호가 있었어요")
+
+    @staticmethod
+    def _stale_hint(owner: dict[str, Any], *, resumable: bool = True) -> str:
+        """When a run another process owns gets cleaned up once that process is gone (``Workspace._owner_alive``).
+
+        A process on this machine is checked by its pid: the next resume/cancel
+        request cleans the run up at once, and the background check within two
+        rounds (``RECOVERY_WATCH_SECONDS``). Another machine/container (or no
+        pid, or this process's own pid, which only an earlier process can have
+        left) is judged by its heartbeat only: about ``STALE_AFTER_SECONDS``
+        after the last one.
+        """
+        then = "그 뒤에 이어서 실행할 수 있어요." if resumable else "그 뒤에 보관함에서 같은 작업을 다시 시작할 수 있어요."
+        if owner.get("this_host") and owner.get("pid") and owner["pid"] != os.getpid():
+            watch = max(1, math.ceil(2 * RECOVERY_WATCH_SECONDS / 60))
+            return f"그 프로그램이 꺼지면 다시 누를 때 바로 '중단됨'으로 정리되고(서버도 {watch}분 안에 알아서 정리해요), {then}"
+        minutes = int(STALE_AFTER_SECONDS // 60)
+        return f"그 프로그램이 이미 멈췄다면 마지막 신호에서 {minutes}분쯤 지나 자동으로 '중단됨'으로 정리되고, {then}"
 
     def _item_for_job(self, item_id: str, what: str):
         detail = self.workspace.get_item(item_id)
@@ -969,12 +1167,13 @@ class RunManager:
         channel = detail.item.channel
         brief = (detail.brief or Brief(topic=detail.item.title or "콘텐츠", channels=[channel])).model_copy(
             update={"channels": [channel]})
+        runner = self._runner(settings, bus, cancel_event)  # POST /api/runs/<id>/cancel stops the job at its next step
         record = RunRecord(run_id=bus.run_id, kind="review", bus=bus, mode=backend.name, model=backend.model,
                            brief=brief, options=options, item_id=item_id, item_run_id=detail.item.run_id,
-                           cancel_event=cancel_event)
+                           cancel_event=cancel_event, runner=runner)
 
         def target() -> actions.JobResult:
-            return actions.review_item(self.workspace, item_id, settings=settings, backend=backend, bus=bus)
+            return actions.review_item(self.workspace, item_id, settings=settings, backend=backend, bus=bus, runner=runner)
 
         return self._launch(record, target)
 
@@ -990,23 +1189,31 @@ class RunManager:
         channel = detail.item.channel
         brief = (detail.brief or Brief(topic=detail.item.title or "콘텐츠", channels=[channel])).model_copy(
             update={"channels": [channel]})
+        runner = self._runner(settings, bus, cancel_event)
         record = RunRecord(run_id=bus.run_id, kind="revise", bus=bus, mode=backend.name, model=backend.model,
                            brief=brief, options={**options, "instructions": instructions}, item_id=item_id,
-                           item_run_id=detail.item.run_id, cancel_event=cancel_event)
+                           item_run_id=detail.item.run_id, cancel_event=cancel_event, runner=runner)
 
         def target() -> actions.JobResult:
-            return actions.revise_item(self.workspace, item_id, instructions, settings=settings, backend=backend, bus=bus)
+            return actions.revise_item(self.workspace, item_id, instructions, settings=settings, backend=backend, bus=bus,
+                                       runner=runner)
 
         return self._launch(record, target)
 
     def generate_slot(self, slot_id: str, *, force: bool = False, options: dict[str, Any] | None = None) -> RunRecord:
         """캘린더 슬롯 초안 job (``POST /api/calendar/<slot>/generate``)."""
         options = dict(options or {})
-        slot = self.workspace.get_slot(slot_id)
+        # refresh_slot: a slot left 'generating' by a process that is gone is released first (no 409, no force needed)
+        slot = self.workspace.refresh_slot(slot_id)
         if slot is None:
             raise RequestError(404, f"캘린더 슬롯 {slot_id}를 찾을 수 없어요")
-        if slot.status == "generating" and not force:
-            raise RequestError(409, "이 슬롯은 이미 초안을 만드는 중이에요", extra={"run_id": slot.run_id})
+        if slot.status == "generating":
+            owner = self.workspace.run_owner(slot.run_id) if slot.run_id else None
+            if owner is not None and owner.get("live"):  # a live generation: never two at once, even with force
+                raise RequestError(409, f"이 슬롯은 지금 다른 실행({slot.run_id})이 초안을 만드는 중이에요. 그 실행이 끝난 뒤 "
+                                        "다시 시도해 주세요.", extra={"run_id": slot.run_id})
+            if not force:
+                raise RequestError(409, "이 슬롯은 이미 초안을 만드는 중이에요", extra={"run_id": slot.run_id})
         if slot.status == "drafted" and slot.item_id and not force:
             raise RequestError(409, "이미 초안이 있어요. 다시 만들려면 force: true로 요청해 주세요.",
                                extra={"item_id": slot.item_id, "can_force": True})
@@ -1019,18 +1226,30 @@ class RunManager:
         except WorkspaceError as exc:
             raise RequestError(400, str(exc)) from None
         brief = actions.slot_brief(slot, context.profile)
+        runner = self._runner(settings, bus, cancel_event)  # a cancelled slot run ends 'cancelled' (resumable)
         record = RunRecord(run_id=bus.run_id, kind="slot", bus=bus, mode=backend.name, model=backend.model, brief=brief,
                            options={**options, "slot_id": slot_id, "force": force}, slot_id=slot_id,
-                           cancel_event=cancel_event)
+                           cancel_event=cancel_event, runner=runner)
 
         def target() -> actions.JobResult:
             return actions.generate_slot(self.workspace, slot_id, settings=settings, backend=backend, bus=bus,
-                                         context=context, force=force)
+                                         context=context, force=force, runner=runner)
 
         return self._launch(record, target)
 
-    def plan_week(self, theme: str, start: str, end: str, counts: Any, options: dict[str, Any] | None = None):
-        """Plan the calendar synchronously (counts toward the concurrency limit while the backend works)."""
+    def plan_week(self, theme: str, start: str, end: str, counts: Any, options: dict[str, Any] | None = None, *,
+                  weekend_channels: Any = None, replace: bool = False) -> tuple[Any, str, list[str]]:
+        """Plan the calendar synchronously (counts toward the concurrency limit while the backend works).
+
+        ``weekend_channels``: channels that may also post on Saturday/Sunday
+        (``planner.weekend_channel_set``: list, ``"all"``/``"none"``, bool;
+        ``None`` = weekdays only). ``replace``: the range's ``planned`` slots
+        are marked ``skipped`` first (like ``insia plan-week --replace``) and
+        put back when planning fails. A server shutdown gives the plan the
+        grace period, then ends it with 503 (nothing saved, set-aside slots put
+        back; see ``shutdown``). Returns ``(WeekPlan, mode, ids of the slots
+        marked skipped)``.
+        """
         options = dict(options or {})
         opts = {k: options[k] for k in ("mode",) if options.get(k) is not None}
         if opts.get("mode") == "live" and not has_credentials():
@@ -1044,9 +1263,13 @@ class RunManager:
         except (ValueError, BackendError) as exc:
             raise RequestError(400, str(exc)) from exc
         key = "live" if backend.name == "live" else "mock"
+        job = PlanJob(PlannedSlotReplacement(self.workspace, start, end))
         with self._lock:
+            if self._closing:
+                raise RequestError(503, "서버를 끄는 중이에요. 서버를 다시 켠 뒤 계획을 세워 주세요.")
             self._check_capacity(backend.name)
             self._planning[key] += 1
+            self._plans.add(job)
         try:
             profile = self.workspace.get_profile() if settings.use_profile else Profile()
             try:
@@ -1054,11 +1277,26 @@ class RunManager:
                                              today=settings.today)
             except Exception:  # noqa: BLE001 - a backend without the attribute still plans
                 pass
-            plan = plan_week(self.workspace, backend, theme, start, end, counts, profile=profile)
+            if replace:  # bad input fails before any slot is touched
+                weekend_channel_set(weekend_channels)
+                date_span(start, end)
+            try:
+                # a shutdown stops the plan: no AI call after it, no slots saved, set-aside slots put back
+                with replacing_planned_slots(self.workspace, start, end, enabled=replace,
+                                             replacement=job.replacement) as replaced:
+                    plan = plan_week(job.workspace(), CancellableBackend(backend, job.cancel_event), theme, start, end,
+                                     counts, profile=profile, weekend_channels=weekend_channels)
+            except RunCancelled:
+                raise RequestError(503, "서버를 끄는 중이라 계획을 멈췄어요. 기존 계획은 그대로예요. 서버를 다시 켠 뒤 "
+                                        "다시 세워 주세요.") from None
         finally:
+            job.done.set()
             with self._lock:
                 self._planning[key] -= 1
-        return plan, backend.name
+                self._plans.discard(job)
+        if replaced:
+            plan.notices.insert(0, f"이 기간에 있던 계획 {len(replaced)}개(초안 전)는 건너뜀으로 바꾸고 새로 짰어요.")
+        return plan, backend.name, [slot.id for slot in replaced]
 
     # -- events ------------------------------------------------------------------------
     def iter_events(self, run_id: str, after: int = 0, heartbeat: float | None = 15.0,
@@ -1139,16 +1377,39 @@ class RunManager:
                 yield None
 
     # -- shutdown ----------------------------------------------------------------------
-    def shutdown(self, timeout: float = 5.0) -> None:
-        """Cancel active jobs, wait up to ``timeout`` seconds, close an owned workspace."""
+    def active_count(self) -> int:
+        """Runs and jobs this process is running right now."""
         with self._lock:
+            return len(self._active)
+
+    def planning_count(self) -> int:
+        """Calendar plans this process is making right now."""
+        with self._lock:
+            return len(self._plans)
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Cancel active jobs, wait up to ``timeout`` seconds, close an owned workspace.
+
+        Calendar plans in progress (request threads, which do not outlive the
+        process) get the same time to finish and save; one that does not is
+        abandoned: it can no longer save, and the planned slots its
+        ``replace`` set aside are put back now, before the workspace closes.
+        """
+        with self._lock:
+            self._closing = True
             records = list(self._active.values())
+            plans = list(self._plans)
         for record in records:
             record.request_cancel()
         deadline = time.monotonic() + max(0.0, timeout)
         for record in records:
             if record.thread is not None:
                 record.thread.join(max(0.0, deadline - time.monotonic()))
+        for job in plans:
+            if not job.done.wait(max(0.0, deadline - time.monotonic())):
+                restored = job.abandon()
+                log.warning("끝나지 않은 캘린더 계획을 멈췄어요%s",
+                            f" (건너뜀으로 바꿨던 계획 {len(restored)}개는 되돌렸어요)" if restored else "")
         if self._owns_workspace:
             self.workspace.close()
 
@@ -1298,6 +1559,8 @@ def address_family_for(host: str) -> socket.AddressFamily:
 class InsiaServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # server_close(): seconds to wait for cancelled runs to stop (``serve`` / ``insia serve`` use SHUTDOWN_GRACE)
+    shutdown_timeout = 5.0
 
     def __init__(self, address: tuple[str, int], manager: RunManager, web_root: Path | None, heartbeat: float = 15.0,
                  quiet: bool = True, *, token: str | None = None, public_hosts: Sequence[str] = (),
@@ -1392,7 +1655,7 @@ class InsiaServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         super().server_close()
         try:
-            self.manager.shutdown()
+            self.manager.shutdown(timeout=self.shutdown_timeout)
         except Exception:  # noqa: BLE001
             log.exception("작업 정리 중 오류")
 
@@ -1871,7 +2134,10 @@ class InsiaHandler(BaseHTTPRequestHandler):
         kind = _query_value(query, "kind")
         if kind is not None and not re.fullmatch(r"[a-z][a-z_]{0,31}", kind):
             raise RequestError(400, "kind 형식이 올바르지 않아요")
-        self._send_json(200, {"runs": self.server.manager.list(limit, kind=kind, status=status)})
+        parent = _query_value(query, "parent_item_id")
+        if parent is not None and not ITEM_ID.fullmatch(parent):
+            raise RequestError(400, "parent_item_id는 콘텐츠 id(it_로 시작)여야 해요")
+        self._send_json(200, {"runs": self.server.manager.list(limit, kind=kind, status=status, parent_item_id=parent)})
 
     def _h_create_run(self, *, query: dict[str, list[str]]) -> None:
         body = self._read_json(MAX_BODY, required=True, empty_message="브리프 JSON을 보내 주세요",
@@ -2113,9 +2379,17 @@ class InsiaHandler(BaseHTTPRequestHandler):
         counts = body.get("counts")
         if not isinstance(counts, dict) or not counts:
             raise RequestError(400, '채널별 개수(counts)를 {"naver_blog": 2, "linkedin": 1} 같은 형식으로 보내 주세요')
-        plan, mode = self.server.manager.plan_week(theme, start.strip(), end.strip(), counts, parse_options(body.get("options")))
+        weekend = body.get("weekend_channels")  # channel names are checked by the planner (PlanningError → 400)
+        if not (weekend is None or isinstance(weekend, bool) or (isinstance(weekend, str) and len(weekend) <= 200) or (
+                isinstance(weekend, list) and len(weekend) <= 20 and all(isinstance(c, str) and len(c) <= 40 for c in weekend))):
+            raise RequestError(400, '주말 게시 채널(weekend_channels)은 ["naver_blog", "instagram"] 같은 목록이나 '
+                                    '"all", "none", true, false로 보내 주세요')
+        plan, mode, replaced = self.server.manager.plan_week(
+            theme, start.strip(), end.strip(), counts, parse_options(body.get("options")), weekend_channels=weekend,
+            replace=_opt_bool(body, "replace"))
         self._send_json(201, {"summary": plan.summary, "slots": [s.model_dump(mode="json") for s in plan.slots],
-                              "notices": list(plan.notices), "mode": mode, "start": start.strip(), "end": end.strip()})
+                              "notices": list(plan.notices), "mode": mode, "start": start.strip(), "end": end.strip(),
+                              "replaced": replaced})
 
     def _h_generate_slot(self, slot_id: str, *, query: dict[str, list[str]]) -> None:
         body = self._read_json(MAX_BODY)
@@ -2375,10 +2649,60 @@ def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, w
         raise
 
 
+@contextmanager
+def sigterm_as_interrupt() -> Iterator[bool]:
+    """While serving, SIGTERM (``docker stop``, systemd, ``kill``) raises ``KeyboardInterrupt`` like Ctrl+C.
+
+    So a stopped container shuts down the normal way: live runs are cancelled
+    at their next step and recorded ``cancelled`` (resumable) instead of being
+    left ``running`` when the process is killed. Only in the main thread
+    (``signal.signal`` works nowhere else); on platforms without SIGTERM, or
+    when the handler cannot be installed, it does nothing. Yields whether the
+    handler is installed; the previous handler is restored afterwards.
+    """
+    signum = getattr(signal, "SIGTERM", None)
+    if signum is None or threading.current_thread() is not threading.main_thread():
+        yield False
+        return
+
+    def interrupt(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signum, interrupt)
+    except (ValueError, OSError, RuntimeError):  # pragma: no cover - embedded interpreters, unusual platforms
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            signal.signal(signum, previous if previous is not None else signal.SIG_DFL)
+        except (ValueError, OSError, RuntimeError):  # pragma: no cover
+            pass
+
+
+def stop_serving(server: InsiaServer | Any, echo: Callable[[str], None] = print) -> None:
+    """Shut a serving server down after Ctrl+C / SIGTERM: say what is being stopped, cancel and wait for live runs
+    (up to ``SHUTDOWN_GRACE`` seconds), close the workspace."""
+    manager = getattr(server, "manager", None)
+    active = manager.active_count() if manager is not None and hasattr(manager, "active_count") else 0
+    planning = manager.planning_count() if manager is not None and hasattr(manager, "planning_count") else 0
+    if hasattr(server, "shutdown_timeout"):
+        server.shutdown_timeout = SHUTDOWN_GRACE
+    if active:
+        echo(f"진행 중인 작업 {active}개를 멈추는 중이에요 (최대 {SHUTDOWN_GRACE:g}초). 끝낸 채널은 저장되고, "
+             "나중에 '이어서 실행'할 수 있어요.")
+    if planning:
+        echo(f"세우고 있는 캘린더 계획 {planning}개를 최대 {SHUTDOWN_GRACE:g}초 기다려요. 그 안에 못 끝내면 저장하지 않고, "
+             "새로 짜려고 건너뜀으로 바꿨던 기존 계획은 되돌려요.")
+    server.server_close()
+
+
 def serve(settings: Settings, host: str = "127.0.0.1", port: int = 8765, web_dir: str | Path | None = None,
           quiet: bool = True, *, token: str | None = None, public_hosts: Sequence[str] | str = (),
           trust_proxy: bool = False) -> None:
-    """Run the server until Ctrl+C (raises ``ServerConfigError`` / ``OSError`` like ``make_server``)."""
+    """Run the server until Ctrl+C or SIGTERM (raises ``ServerConfigError`` / ``OSError`` like ``make_server``)."""
     server = make_server(settings, host, port, web_dir, quiet=quiet, token=token, public_hosts=public_hosts,
                          trust_proxy=trust_proxy)
     health = server.manager.health()
@@ -2393,9 +2717,10 @@ def serve(settings: Settings, host: str = "127.0.0.1", port: int = 8765, web_dir
         print(f"지난번에 끝나지 못한 실행 {server.manager.interrupted_on_start}개를 '중단됨'으로 정리했어요. "
               "대시보드나 'insia resume <run_id>'로 이어서 실행할 수 있어요.")
     print("종료하려면 Ctrl+C를 누르세요.", flush=True)
-    try:
-        server.serve_forever(poll_interval=0.5)
-    except KeyboardInterrupt:
-        print("\n서버를 종료해요.")
-    finally:
-        server.server_close()
+    with sigterm_as_interrupt():
+        try:
+            server.serve_forever(poll_interval=0.5)
+        except KeyboardInterrupt:
+            print("\n서버를 종료해요.", flush=True)
+        finally:
+            stop_serving(server)

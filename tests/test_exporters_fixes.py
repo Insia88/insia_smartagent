@@ -710,3 +710,60 @@ def test_linkedin_and_instagram_txt_convert_br():
     assert export_item(detail("linkedin", "첫 줄<br>둘째 줄"), "txt").data.decode("utf-8") == "첫 줄\n둘째 줄\n"
     caption = export_item(detail("instagram", _slide("- 문구: a") + "\n## 캡션\n첫 줄<br>둘째 줄\n#a #b #c"), "txt")
     assert caption.data.decode("utf-8").startswith("첫 줄\n둘째 줄\n")
+
+
+# ---------------------------------------------------------------------------
+# Blind box also warns about school/employer names from the team backgrounds
+# ---------------------------------------------------------------------------
+
+
+@needs_docx
+def test_bizplan_docx_blind_box_warns_about_schools_and_employers():
+    import docx
+
+    profile = Profile(company_name="인시아", team=[TeamMember(role="대표", name="김철수",
+                                                         background="카카오 출신 PM 7년, 고려대학교 경영학 졸업")])
+
+    def box_text(content: str) -> str:
+        exported = export_item(detail("bizplan", content), "docx", profile)
+        document = docx.Document(io.BytesIO(exported.data))
+        return "\n".join(c.text for t in document.tables for row in t.rows for c in row.cells)
+
+    leaked = box_text("## 4. 팀 구성\n- 대표: 카카오 출신 PM 7년, 고려대학교 경영학 졸업 (자사 자료)")
+    assert "블라인드 확인 필요 — 팀 배경의 학교·직장명 2개가 본문에 보여요: 고려대학교, 카카오." in leaked
+    assert "학교명·직장명을 쓸 수 없으니" in leaked
+    both = box_text("대표 김철수는 카카오 출신 PM이에요.")
+    assert "팀원 실명 1개가 본문에 보여요: 김철수. 팀 배경의 학교·직장명 1개도 보여요: 카카오." in both
+    assert "실명·학교명·직장명을" in both
+    # masked text and platform mentions are fine: no box (same rule as the reviewer's blind check)
+    assert "블라인드" not in box_text("- 대표: ○○ 출신 PM 7년, ○○대학교 졸업\n- 인시아는 카카오톡 채널과 네이버 블로그로 알려요")
+
+
+def test_blind_warning_text_is_shared_by_the_word_box_and_the_export_notes():
+    """``docx_writer.blind_warning``: one wording for the Word red box and (via the export API) the X-Insia-Notes line."""
+    from insia_agents.exporters.docx_writer import blind_warning
+
+    profile = Profile(company_name="인시아", team=[TeamMember(role="대표", name="김철수",
+                                                         background="카카오 출신 PM 7년, 고려대학교 경영학 졸업")])
+    draft = detail("bizplan", "- 대표: 카카오 출신 PM 7년, 고려대학교 경영학 졸업 (자사 자료)").versions[-1].draft
+    assert blind_warning(draft, profile) == ("블라인드 확인 필요 — 팀 배경의 학교·직장명 2개가 본문에 보여요: 고려대학교, 카카오. "
+                                             "사업계획서 제출본에는 학교명·직장명을 쓸 수 없으니 ○○로 가려 주세요.")
+    named = draft.model_copy(update={"content": "대표 김철수가 만들어요."})
+    assert blind_warning(named, profile).startswith("블라인드 확인 필요 — 팀원 실명 1개가 본문에 보여요: 김철수.")
+    assert blind_warning(named.model_copy(update={"content": "대표 ○○가 만들어요."}), profile) == ""
+    assert blind_warning(draft, None) == ""
+
+
+def test_bizplan_docx_export_notes_carry_the_word_box_warning():
+    """The docx export's notes (X-Insia-Notes) name school/employer leaks too, in the Word box's own words."""
+    pytest.importorskip("docx")
+    from insia_agents.exporters.docx_writer import blind_warning
+
+    profile = Profile(company_name="인시아", team=[TeamMember(role="대표", name="김철수",
+                                                         background="카카오 출신 PM 7년, 고려대학교 경영학 졸업")])
+    leak = detail("bizplan", "- 대표: 카카오 출신 PM 7년, 고려대학교 경영학 졸업 (자사 자료)")
+    exported = export_item(leak, "docx", profile)
+    assert exported.notes == (blind_warning(leak.versions[-1].draft, profile),)
+    assert "고려대학교" in exported.notes[0]
+    assert export_item(detail("bizplan", "- 대표: ○○ 분야 7년 (자사 자료)"), "docx", profile).notes == ()
+    assert export_item(detail("linkedin", "카카오 출신 PM 7년, 고려대학교 졸업"), "docx", profile).notes == ()

@@ -24,7 +24,6 @@ posted the item (and where).
 from __future__ import annotations
 
 import argparse
-import hashlib
 import inspect
 import ipaddress
 import json
@@ -37,25 +36,24 @@ import traceback
 import typing
 import unicodedata
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from . import __version__
 from .agents.common import STATUS_LABELS, channel_label
 from .backends.base import BackendError
-from .channels import check_format, finalize_review
+from .channels import check_format
 from .config import KST, Settings, has_credentials, load_sample_brief, resolve_mode
-from .models import (ALL_CHANNELS, Brief, ChannelResult, ContentItem, ContentItemDetail, Draft, Plan, Profile,
-                     ResearchPack, Review, UserDocument)
+from .models import ALL_CHANNELS, Brief, ContentItem, ContentItemDetail, Draft, Profile, Review
 # Moved to library modules (the server can use them too); re-exported here for existing callers.
 from .documents import (DOC_EXTENSIONS, DOCS_EXTRA_HINT, IMAGE_EXTENSIONS, UNSUPPORTED_DOCS,  # noqa: F401
                         _docx_text, _parse_json_text, _parse_yaml_text, _pdf_text, _yaml_module, clean_text,
                         extract_document, load_structured_file, read_text_file)
 from .errors import CommandError, UsageError
+from .errors import error_text as _error_text  # the CLI's old name (same function)
 from .importer import (PROFILE_FIELDS, TEAM_FIELDS, ImportReport, _field_label, _list_fields,  # noqa: F401
                        _SAFE_RUN_ID, _scalar_text, _team, _text_list, import_run_folder, import_run_id,
                        profile_from_data)
@@ -1053,8 +1051,9 @@ def cmd_items_export(args: argparse.Namespace) -> int:
 
 def cmd_runs_list(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
+    item_id = (args.item or "").strip() or None
     with open_workspace(settings) as ws:
-        runs = ws.list_runs(limit=args.limit, kind=args.kind, status=args.status)
+        runs = ws.list_runs(limit=args.limit, kind=args.kind, status=args.status, parent_item_id=item_id)
         home = _home(settings)
         # 'running' rows whose process is gone (killed, crashed): resume/run-due/serve close them
         orphaned = [r for r in runs if r["status"] == "running" and not (ws.run_owner(r["run_id"]) or {}).get("live")]
@@ -1062,7 +1061,10 @@ def cmd_runs_list(args: argparse.Namespace) -> int:
         _print_json(runs)
         return 0
     if not runs:
-        print(f"실행 기록이 없어요. 워크스페이스: {home}")
+        if item_id:
+            print(f"콘텐츠 {item_id}에 돌린 작업(재검수·수정 요청·직접 수정)이 없어요. 워크스페이스: {home}")
+        else:
+            print(f"실행 기록이 없어요. 워크스페이스: {home}")
         return 0
     rows = []
     for run in runs:
@@ -1390,9 +1392,21 @@ def _slot_rows(slots: Sequence[Any]) -> list[list[Any]]:
              s.angle or "-", ", ".join(s.keywords[:3]) or "-", s.id] for s in slots]
 
 
+def _weekend_arg(value: str | None) -> str | list[str] | None:
+    """``--weekend``: ``None`` (weekdays only), ``"all"`` / ``"none"``, or channel ids (CLI aliases such as
+    블로그·인스타 resolved; the planner checks the names)."""
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text in ("all", "none", "", "전체", "모두", "없음"):
+        return text or "none"
+    return [CHANNEL_ALIASES.get(part, part) for part in re.split(r"[,\s]+", text) if part]
+
+
 def cmd_plan_week(args: argparse.Namespace) -> int:
     from .backends import create_backend
-    from .planner import plan_week
+    from .planner import PlanningError, plan_week, weekend_channel_set
+    from .server import replacing_planned_slots, sigterm_as_interrupt
 
     settings = _settings_from_args(args)
     start = _resolve_day(args.start, settings) or _next_monday(settings.today)
@@ -1404,14 +1418,16 @@ def cmd_plan_week(args: argparse.Namespace) -> int:
               if getattr(args, attr) is not None}
     if not counts:
         counts = dict(DEFAULT_PLAN_COUNTS)
+    weekend = _weekend_arg(args.weekend)
+    try:
+        weekend_channel_set(weekend)  # a wrong --weekend stops here, before --replace touches any slot
+    except PlanningError as exc:
+        raise UsageError(f"--weekend: {exc}") from None
     mode, note = resolve_mode(settings.mode)
     backend = create_backend(mode, settings)
     quiet = args.json
     with open_workspace(settings) as ws:
         existing = [s for s in ws.list_slots(date_from=start, date_to=end) if s.status == "planned"]
-        if existing and args.replace:
-            for slot in existing:
-                ws.update_slot(slot.id, status="skipped")
         sink = _UsageSink(ws)
         backend.on_usage = sink  # type: ignore[attr-defined]
         if not quiet:
@@ -1419,9 +1435,19 @@ def cmd_plan_week(args: argparse.Namespace) -> int:
             wanted = " · ".join(f"{channel_label(c)} {n}편" for c, n in counts.items() if n)
             print(f"{start}({_weekday(start)}) ~ {end}({_weekday(end)}) 계획을 세우는 중이에요 · {wanted}"
                   + (" (live 모드는 1분쯤 걸려요)" if mode == "live" else ""), flush=True)
-        week = plan_week(ws, backend, args.theme or "", start, end, counts)
+        try:
+            # --replace: the range's planned slots are skipped first, and put back if planning fails or is
+            # stopped (Ctrl+C, or SIGTERM from a service manager / `kill`, which would otherwise end the process
+            # before they are put back)
+            with sigterm_as_interrupt(), replacing_planned_slots(ws, start, end, enabled=args.replace) as replaced:
+                week = plan_week(ws, backend, args.theme or "", start, end, counts, weekend_channels=weekend)
+        except PlanningError as exc:  # wrong dates or counts: a usage error (exit 2)
+            raise UsageError(str(exc)) from None
+        except KeyboardInterrupt:
+            print("\n계획을 멈췄어요. 새 계획은 저장하지 않았고, 기존 계획은 그대로예요.", file=sys.stderr)
+            return 130
     if quiet:
-        _print_json(week.model_dump(mode="json"))
+        _print_json({**week.model_dump(mode="json"), "replaced": [slot.id for slot in replaced]})
         return 0
     if week.summary:
         print(f"\n전략: {week.summary}")
@@ -1431,10 +1457,10 @@ def cmd_plan_week(args: argparse.Namespace) -> int:
                     max_widths=[0, 0, 0, 40, 18, 24, 0])
     for notice in week.notices:
         print(f"참고: {notice}")
-    if existing and args.replace:
-        print(f"참고: 이 기간에 있던 계획 {len(existing)}개는 건너뜀으로 바꿨어요.")
+    if replaced:
+        print(f"참고: 이 기간에 있던 계획 {len(replaced)}개는 건너뜀으로 바꿨어요.")
     elif existing:
-        print(f"참고: 이 기간에 이미 계획 {len(existing)}개가 있어 함께 남아 있어요 (다시 짜려면 --replace).")
+        print(f"참고: 이 기간의 기존 계획 {len(existing)}개는 그대로 두었어요. 지우고 새로 짜려면 --replace를 붙여 다시 실행하세요.")
     print(_cost_line(sink.cost, mode))
     if week.slots:
         print(f"\n초안 만들기: insia run-due (오늘까지 예정분) · insia run-due --until {end} (이번 계획 전부)")
@@ -1492,6 +1518,15 @@ def cmd_run_due(args: argparse.Namespace) -> int:
         for index, slot in enumerate(due, 1):
             print(f"\n[{index}/{len(due)}] {slot.date}({_weekday(slot.date)}) {channel_label(slot.channel)} · {slot.topic}",
                   flush=True)
+            current = ws.get_slot(slot.id)
+            if current is None or current.status != "planned":
+                # changed while earlier slots were being drafted (skipped by hand, set aside by a re-plan with
+                # --replace, deleted, drafted elsewhere): never spend a paid draft on it
+                reason = "그사이 캘린더에서 지워졌어요" if current is None else \
+                    f"그사이 '{SLOT_STATUS_LABELS.get(current.status, current.status)}' 상태로 바뀌었어요"
+                skipped.append((slot, reason))
+                print(f"→ 건너뛰었어요: {reason}")
+                continue
             backend, bus, _ = prepare_run(settings)
             try:
                 job = generate_slot(ws, slot.id, settings=settings, backend=backend, bus=bus, listener=printer)
@@ -1790,13 +1825,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print(f"  지난번에 끝나지 못한 실행 {interrupted}개를 '중단됨'으로 정리했어요. 'insia runs list'로 보고 "
               "'insia resume <실행 id>'로 이어서 할 수 있어요.")
     print("종료하려면 Ctrl+C를 누르세요.", flush=True)
-    try:
-        server.serve_forever(poll_interval=0.5)
-    except KeyboardInterrupt:
-        print("\n서버를 종료해요.")
-    finally:
-        server.server_close()
+    # SIGTERM (docker stop, systemd) takes the Ctrl+C path: live runs are cancelled and saved, not left 'running'
+    sigterm = getattr(server_module, "sigterm_as_interrupt", nullcontext)
+    stop = getattr(server_module, "stop_serving", lambda srv: srv.server_close())
+    with sigterm():
+        try:
+            server.serve_forever(poll_interval=0.5)
+        except KeyboardInterrupt:
+            print("\n서버를 종료해요.", flush=True)
+        finally:
+            stop(server)
     return 0
+
+
+def _health_url(host: str | None, port: int) -> str:
+    """``/api/health`` on ``host``: an IPv6 literal gets brackets; a wildcard bind (0.0.0.0, ::) is asked on loopback."""
+    name = (host or "127.0.0.1").strip().strip("[]") or "127.0.0.1"
+    name = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(name, name)
+    if ":" in name:
+        name = f"[{name}]"
+    return f"http://{name}:{port}/api/health"
 
 
 def cmd_healthcheck(args: argparse.Namespace) -> int:
@@ -1807,7 +1855,7 @@ def cmd_healthcheck(args: argparse.Namespace) -> int:
     if port is None:
         raw = (os.environ.get("INSIA_PORT") or "").strip()
         port = int(raw) if raw.isdigit() else 8765
-    url = args.url or f"http://127.0.0.1:{port}/api/health"
+    url = args.url or _health_url(args.host, port)
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     token = (os.environ.get("INSIA_ACCESS_TOKEN") or "").strip()
     if token:
@@ -2048,6 +2096,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=_type_positive, default=30, help="최대 개수 (기본 30)")
     p.add_argument("--kind", choices=list(RUN_KIND_LABELS), help="종류: " + ", ".join(f"{k}={v}" for k, v in RUN_KIND_LABELS.items()))
     p.add_argument("--status", choices=list(RUN_STATUS_LABELS), help="상태")
+    p.add_argument("--item", metavar="콘텐츠ID", help="이 콘텐츠에 돌린 작업만 (재검수·수정 요청·직접 수정, 예: it_…)")
     p.set_defaults(func=cmd_runs_list)
     p = runs_sub.add_parser("show", parents=[ws, js], help="실행 하나 보기")
     p.add_argument("run_id", help="실행 id")
@@ -2065,7 +2114,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- calendar -------------------------------------------------------------------
     plan = sub.add_parser("plan-week", parents=[ws, js], help="한 주 콘텐츠 계획을 세워 캘린더에 넣어요",
-                          description="회사 프로필·테마·지난 게시물을 바탕으로 날짜별 주제·관점·키워드를 정해요 (평일에 배치). "
+                          description="회사 프로필·테마·지난 게시물을 바탕으로 날짜별 주제·관점·키워드를 정해요 "
+                                      "(기본은 평일에 배치, --weekend로 채널별 주말 허용). 채널마다 이미 계획이 있는 날은 "
+                                      "비워 두고, 지난 게시물·기존 계획과 겹치는 주제는 넣지 않아요. "
                                       f"채널 개수를 하나도 안 적으면 블로그 {DEFAULT_PLAN_COUNTS['naver_blog']} · 링크드인 "
                                       f"{DEFAULT_PLAN_COUNTS['linkedin']} · 인스타그램 {DEFAULT_PLAN_COUNTS['instagram']}편이에요.")
     plan.add_argument("--theme", "-t", default="", help="이번 주 테마 (비우면 회사 프로필로 정해요)")
@@ -2075,7 +2126,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--linkedin", type=_type_count, help="링크드인 편수")
     plan.add_argument("--instagram", type=_type_count, help="인스타그램 편수")
     plan.add_argument("--bizplan", type=_type_count, help="사업계획서 편수 (보통 0)")
-    plan.add_argument("--replace", action="store_true", help="이 기간에 이미 있는 계획(초안 전)은 건너뜀으로 바꾸고 새로 짜요")
+    plan.add_argument("--replace", action="store_true",
+                      help="이 기간에 이미 있는 계획(초안 전)은 건너뜀으로 바꾸고 새로 짜요 (계획에 실패하거나 도중에 멈추면 되돌려요)")
+    plan.add_argument("--weekend", metavar="채널",
+                      help="주말(토·일)에도 올릴 채널 (예: blog,instagram · all · none, 기본: 평일만). "
+                           "주말 슬롯이 있으면 run-due도 주말에 돌도록 cron을 매일로 바꿔 주세요")
     plan.add_argument("--mode", choices=["auto", "live", "mock"], help="기본 auto")
     plan.add_argument("--model", help="모델 ID")
     plan.set_defaults(func=cmd_plan_week)
@@ -2193,8 +2248,10 @@ def build_parser() -> argparse.ArgumentParser:
     srv.set_defaults(func=cmd_serve)
 
     health = sub.add_parser("healthcheck", help="서버가 살아 있는지 확인해요 (Docker HEALTHCHECK용)")
+    health.add_argument("--host", default="127.0.0.1",
+                        help="서버 주소 (기본 127.0.0.1, IPv6는 ::1처럼; insia serve --host와 같게)")
     health.add_argument("--port", type=int, help="포트 (기본 INSIA_PORT 또는 8765)")
-    health.add_argument("--url", help="확인할 주소 (기본 http://127.0.0.1:<port>/api/health)")
+    health.add_argument("--url", help="확인할 주소 (기본 http://<host>:<port>/api/health, 주면 --host·--port는 무시)")
     health.add_argument("--timeout", type=float, default=5.0, help="기다릴 초 (기본 5)")
     health.add_argument("--quiet", action="store_true", help="정상일 때는 아무것도 출력하지 않아요")
     health.set_defaults(func=cmd_healthcheck)
@@ -2210,24 +2267,6 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
-
-
-def _error_text(exc: BaseException) -> str:
-    """Korean messages pass through; unknown exceptions keep their type name."""
-    from .db import WorkspaceError
-
-    known: tuple[type[BaseException], ...] = (WorkspaceError, BackendError, UsageError, CommandError)
-    try:
-        from .exporters import ExportError
-        from .pipeline import PipelineError
-        from .planner import PlanningError
-
-        known += (ExportError, PipelineError, PlanningError)
-    except ImportError:  # pragma: no cover
-        pass
-    if isinstance(exc, known):
-        return str(exc)
-    return f"{type(exc).__name__}: {exc}"
 
 
 def _report_error(exc: BaseException) -> int:

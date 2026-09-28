@@ -3,7 +3,8 @@
 Covers the weekly journey a founder runs: 브랜드·자료 (profile + documents) → 스튜디오 run →
 보관함 (blind check, review panel, edit, 재검수, 수정 요청, approval gate, schedule, publish) →
 exports → 캘린더 (plan, generate, move, skip) → 사용량 → restart (replay + resume an interrupted
-run) → token login/logout → phone width.
+run) → token login/logout → phone width → agent results vs. a person's edit (kept in history or not),
+an edit refused (409) while a job runs and restored afterwards, the bizplan blind preview.
 
 Needs Playwright and a Chromium build. The browser comes from ``INSIA_CHROMIUM``, else
 ``/opt/pw-browsers/chromium`` when it exists, else Playwright's own download. Without them the
@@ -34,9 +35,12 @@ except ImportError as exc:  # includes ModuleNotFoundError
         raise
     pytest.skip(f"Playwright가 없어서 대시보드 E2E를 건너뛰어요 ({exc})", allow_module_level=True)
 
+from insia_agents import actions  # noqa: E402
+from insia_agents.backends.mock_backend import MockBackend  # noqa: E402
 from insia_agents.config import Settings, today_kst  # noqa: E402
 from insia_agents.db import Workspace  # noqa: E402
 from insia_agents.exporters import capabilities  # noqa: E402
+from insia_agents.models import Draft  # noqa: E402
 from insia_agents.server import make_server  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -193,6 +197,31 @@ def wait_job(page, timeout: int = TIMEOUT_MS) -> str:
 
 def no_js_errors(page) -> None:
     assert not page.js_errors, page.js_errors
+
+
+def wait_run(srv: Server, run_id: str, timeout: float = 30.0) -> dict:
+    deadline = time.monotonic() + timeout
+    run = srv.api(f"/api/runs/{run_id}")
+    while run["status"] == "running" and time.monotonic() < deadline:
+        time.sleep(0.1)
+        run = srv.api(f"/api/runs/{run_id}")
+    assert run["status"] != "running", f"실행 {run_id}가 끝나지 않았어요"
+    return run
+
+
+def fresh_item(srv: Server, channel: str, topic: str) -> dict:
+    """A new single-channel mock run (speed 0) → its content item."""
+    started = srv.api("/api/runs", {"topic": topic, "channels": [channel], "options": {"speed": 0}})
+    assert wait_run(srv, started["run_id"])["status"] == "completed"
+    return srv.item(channel, started["run_id"])
+
+
+def start_revise(page, instructions: str) -> str:
+    page.click('[data-key="act-revise"]')
+    page.fill("#reviseText", instructions)
+    page.click(".action-panel .btn--primary")
+    page.wait_for_function("location.hash === '#/studio'")  # the banner now shows this job (running)
+    return wait_job(page)
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +418,18 @@ def test_06_approval_gate_schedule_publish(e2e, page):
     forced = srv.api(f"/api/items/{item_id}")["item"]
     assert forced["status"] == "approved" and forced["note"].startswith("그래도 승인")
     assert "그래도 승인" in page.inner_text(".actions-card .item-note")
+    # the forced approval stays visible: a '강제 승인' label with the approved version and its score
+    assert forced["approval_forced"] is True and forced["approved_version"] == latest["version"]
+    page.wait_for_selector('.detail-head [data-key="forced-approval"]')
+    assert "강제 승인" in page.inner_text(".detail-head .detail-state")
+    record = page.inner_text(".actions-card .forced-note")
+    assert "강제 승인 기록" in record and f"v{forced['approved_version']}" in record
+    assert f"{forced['approved_score']}점" in record
+    nav(page, "library")
+    card = page.locator(f'.item-card[href$="{item_id}"]')
+    card.wait_for()
+    assert "강제 승인" in card.locator(".forced-pill").inner_text()
+    shot(e2e, page, "06_forced_label")
 
     bizplan = srv.item("bizplan")
     assert bizplan["passed"] is True
@@ -396,6 +437,7 @@ def test_06_approval_gate_schedule_publish(e2e, page):
     page.wait_for_selector('[data-key="act-approve"]')
     page.click('[data-key="act-approve"]')
     page.wait_for_selector('.detail-head .status-pill[data-status="approved"]')
+    assert page.locator(".detail-head .forced-pill").count() == 0  # a passed review: a normal approval
     day = (date.fromisoformat(today_kst()) + timedelta(days=3)).isoformat()
     page.click('[data-key="act-schedule"]')
     page.fill("#schedDate", day)
@@ -464,7 +506,12 @@ def test_08_calendar_plan_generate_move_skip(e2e, page):
     page.fill("#planStart", monday.isoformat())
     for channel in ("naver_blog", "linkedin", "instagram"):
         page.fill(f"#planCount-{channel}", "1")
-    page.click("#planForm button[type=submit]")
+    assert page.is_hidden("#planWeekendHint")
+    page.check("#planWeekend-instagram")  # 주말에도 올리기: Instagram only
+    assert page.is_visible("#planWeekendHint") and "매일" in page.inner_text("#planWeekendHint")
+    with page.expect_request(lambda r: r.url.endswith("/api/calendar/plan") and r.method == "POST") as sent:
+        page.click("#planForm button[type=submit]")
+    assert json.loads(sent.value.post_data)["weekend_channels"] == ["instagram"]
     page.wait_for_selector("#view-calendar .notice:has-text('계획을 세웠어요')")
     sunday = monday + timedelta(days=6)
     slots = srv.api(f"/api/calendar?from={monday}&to={sunday}")["slots"]
@@ -472,7 +519,8 @@ def test_08_calendar_plan_generate_move_skip(e2e, page):
     page.wait_for_selector(f'[data-key="slot-{slots[0]["id"]}"]')
     for slot in slots:
         day = date.fromisoformat(slot["date"])
-        assert monday <= day <= sunday and day.weekday() < 5, f"평일이 아닌 날에 배치됐어요: {slot}"
+        weekend_ok = slot["channel"] == "instagram"  # the only channel allowed on Saturday/Sunday
+        assert monday <= day <= sunday and (day.weekday() < 5 or weekend_ok), f"평일이 아닌 날에 배치됐어요: {slot}"
         cell = page.locator(".cal-day").nth((day - monday).days)  # week view: 월 … 일
         assert cell.locator(f'[data-key="slot-{slot["id"]}"]').count() == 1, slot
     shot(e2e, page, "08_planned")
@@ -595,3 +643,173 @@ def test_12_phone_width_has_no_sideways_scroll(e2e):
         assert width == [390, 390], (route, width)
         shot(e2e, page, "12_phone_" + route.split("/")[1])
     no_js_errors(page)
+
+
+# ---------------------------------------------------------------------------
+# Agent results vs. a person's edit, edits refused while an agent writes, the blind preview
+# (the server runs in this process: the mock backend is patched to act at a precise moment)
+# ---------------------------------------------------------------------------
+
+
+def test_13_revise_kept_in_history_when_a_person_edits_meanwhile(e2e, page, monkeypatch):
+    need(e2e, "run")
+    srv = e2e["server"]
+    item = srv.item("naver_blog", e2e["run_id"])
+    base = srv.api(f"/api/items/{item['id']}")["versions"][-1]
+    original, fired = MockBackend.revise, []
+
+    def revise_while_a_person_edits(self, brief, plan, research, draft, review, *args, **kwargs):
+        out = original(self, brief, plan, research, draft, review, *args, **kwargs)
+        if draft.channel == "naver_blog" and not fired:  # `insia` in a terminal saves an edit meanwhile
+            fired.append(True)
+            with Workspace(e2e["settings"].home) as cli:
+                latest = cli.get_item(item["id"]).versions[-1].draft
+                actions.edit_item(cli, item["id"], "터미널에서 사람이 고친 제목", latest.content, latest.hashtags,
+                                  settings=e2e["settings"])
+        return out
+
+    monkeypatch.setattr(MockBackend, "revise", revise_while_a_person_edits)
+    page.goto(srv.base + "#/library/" + item["id"])
+    page.wait_for_selector('[data-key="act-revise"]')
+    assert start_revise(page, "소제목을 더 구체적으로") == "done"
+    kept = page.locator('#jobBanner [data-key="job-kept"]')
+    assert kept.count() == 1 and "사람이 고친 버전" in kept.inner_text() and "기록" in kept.inner_text()
+    shot(e2e, page, "13_kept_banner")
+    detail = srv.api(f"/api/items/{item['id']}")
+    revision, current = detail["versions"][-2], detail["versions"][-1]
+    assert revision["source"] == "agent" and revision["version"] == base["version"] + 2
+    assert current["source"] == "human" and current["draft"]["title"] == "터미널에서 사람이 고친 제목"
+
+    page.click("#jobBanner a")  # 보관함에서 보기
+    notice = page.wait_for_selector(".kept-notice")
+    assert "에이전트 결과를 기록에만 남겼어요" in notice.inner_text() and "사람이 고친 버전" in notice.inner_text()
+    page.click('[data-key="kept-view"]')
+    page.wait_for_selector(f".notice:has-text('이전 버전(v{revision['version']})을 보고 있어요')")
+    shot(e2e, page, "13_kept_notice")
+    no_js_errors(page)
+
+
+def test_14_revise_kept_current_by_a_cli_round_is_not_reported_as_kept(e2e, page, monkeypatch):
+    """A CLI run's next round lands while the job re-reviews its revision: the run keeps the revision current (a
+    copy on top that gets the job's review), so the dashboard must not say the result was only kept in history."""
+    need(e2e, "run")
+    srv = e2e["server"]
+    item = srv.item("instagram", e2e["run_id"])
+    original, fired = MockBackend.review, []
+
+    def review_while_a_cli_round_lands(self, brief, research, draft, format_checks):
+        out = original(self, brief, research, draft, format_checks)
+        if draft.channel == "instagram" and any("[사람 지시]" in c for c in draft.change_log) and not fired:
+            fired.append(True)
+            with Workspace(e2e["settings"].home) as cli:  # `insia run-due` in a terminal: invisible to the server
+                cli.add_run_version(item["id"], Draft(channel="instagram", round=draft.round + 1, title="CLI 라운드",
+                                                      content="CLI 실행이 만든 다음 라운드"), run_id=e2e["run_id"])
+        return out
+
+    monkeypatch.setattr(MockBackend, "review", review_while_a_cli_round_lands)
+    page.goto(srv.base + "#/library/" + item["id"])
+    page.wait_for_selector('[data-key="act-revise"]')
+    assert start_revise(page, "캡션 첫 줄을 더 짧게") == "done"
+    assert fired and page.locator('#jobBanner [data-key="job-kept"]').count() == 0
+    assert "기록에만" not in page.inner_text("#jobBanner")
+    detail = srv.api(f"/api/items/{item['id']}")
+    revision, cli_round, current = detail["versions"][-3:]
+    assert cli_round["draft"]["title"] == "CLI 라운드" and current["draft"]["content"] == revision["draft"]["content"]
+    assert current["review"] is not None and current["review"] == revision["review"]  # the job's review followed the copy
+    assert detail["item"]["score"] == revision["review"]["score"]
+    page.click("#jobBanner a")
+    page.wait_for_selector(".detail-head")
+    page.wait_for_function("document.querySelector('.fold-meta') && !/검수 전/.test(document.querySelector('.fold-meta').textContent)")
+    assert page.locator(".kept-notice").count() == 0
+    no_js_errors(page)
+
+
+def test_15_edit_refused_while_a_job_runs_keeps_the_text_and_restores_it_later(e2e, page, monkeypatch):
+    need(e2e, "run")
+    srv = e2e["server"]
+    item = fresh_item(srv, "linkedin", "동네 세탁소 수거 예약")
+    entered, release = threading.Event(), threading.Event()
+    original = MockBackend.revise
+
+    def slow_revise(self, brief, plan, research, draft, review, *args, **kwargs):
+        if draft.channel == "linkedin" and not entered.is_set():
+            entered.set()
+            release.wait(20)  # the revise job stays active until the test lets it go
+        return original(self, brief, plan, research, draft, review, *args, **kwargs)
+
+    monkeypatch.setattr(MockBackend, "revise", slow_revise)
+    try:
+        page.goto(srv.base + "#/library/" + item["id"])
+        page.wait_for_selector('[data-key="edit"]')
+        page.click('[data-key="edit"]')
+        page.fill("#edTitle", "사람이 작업 중에 고친 제목")
+        job = srv.api(f"/api/items/{item['id']}/revise", {"instructions": "짧게", "options": {"speed": 0}})
+        assert entered.wait(10)
+        page.click(".editor button[type=submit]")
+        err = page.wait_for_selector(".editor .form-error:not([hidden])")
+        assert err.get_attribute("data-status") == "409"
+        assert "에이전트가 이 콘텐츠를" in err.inner_text() and "고친 내용은 편집창과 이 브라우저에 그대로 남아 있어요" in err.inner_text()
+        assert page.input_value("#edTitle") == "사람이 작업 중에 고친 제목"  # nothing typed is lost
+        shot(e2e, page, "15_edit_409")
+    finally:
+        release.set()
+    assert wait_run(srv, job["run_id"])["status"] == "completed"
+    newer = srv.api(f"/api/items/{item['id']}")["versions"][-1]
+    assert newer["source"] == "agent" and newer["draft"]["title"] != "사람이 작업 중에 고친 제목"
+
+    page.reload()  # the job added a newer version: the unsaved edit (kept for the older version) comes back
+    page.wait_for_selector('[data-key="edit"]')
+    page.click('[data-key="edit"]')
+    page.wait_for_selector("#edTitle")
+    assert page.input_value("#edTitle") == "사람이 작업 중에 고친 제목"
+    restored = page.inner_text(".editor .notice")
+    assert "저장하지 않은 편집을 되살렸어요" in restored and f"새 버전(v{newer['version']})" in restored
+    page.click(".editor button[type=submit]")
+    page.wait_for_selector(".save-result")
+    saved = srv.api(f"/api/items/{item['id']}")["versions"][-1]
+    assert (saved["source"], saved["draft"]["title"]) == ("human", "사람이 작업 중에 고친 제목")
+    leftovers = page.evaluate("id => Object.keys(localStorage).filter(k => k.indexOf('insia.unsaved.' + id + '.') === 0 && localStorage.getItem(k))",
+                              item["id"])
+    assert leftovers == []  # the restored draft is cleared once saved
+    no_js_errors(page)
+
+
+def test_16_blind_preview_of_school_and_employer_names_is_never_shown_as_passed(e2e, page):
+    need(e2e, "profile")
+    srv = e2e["server"]
+    before = srv.api("/api/profile")["profile"]
+    team = [dict(m) for m in before["team"]]
+    team[0]["background"] = "카카오 출신 PM 7년, 고려대학교 경영학 졸업"
+    srv.api("/api/profile", {**before, "team": team}, method="PUT")
+    try:
+        item = fresh_item(srv, "bizplan", "동네 세탁소 수거 예약 서비스")
+        page.goto(srv.base + "#/library/" + item["id"])
+        page.reload()  # the dashboard caches the profile per page load; the team background was added via the API
+        page.wait_for_selector('[data-key="edit"]')
+        page.click('[data-key="edit"]')
+        page.wait_for_selector('#edMeters li:has-text("블라인드")')
+        page.fill("#edContent", page.input_value("#edContent") + "\n\n- 대표: 카카오 출신 PM 7년, 고려대학교 경영학 졸업 (자사 자료)")
+        meter = page.locator('#edMeters li:has-text("블라인드")')
+        page.wait_for_function("(() => { const li = [...document.querySelectorAll('#edMeters li')].find(x => x.textContent.includes('블라인드')); return li && li.dataset.ok === 'partial'; })()")
+        assert meter.locator(".m-mark").inner_text() == "…" and "저장하면 서버가 확인" in meter.inner_text()
+        page.click(".editor button[type=submit]")
+        page.wait_for_selector(".save-result")
+        server_row = page.locator('.save-result .checks-list li[data-check="blind_names"]')
+        assert server_row.get_attribute("data-state") == "no" and "고려대학교" in server_row.inner_text()
+        # the same session: the review card of the saved (unreviewed) version shows the server's verdict
+        card_row = page.locator('.review-body .checks-list li[data-check="blind_names"]')
+        assert "저장할 때 서버 계산" in page.inner_text(".review-body")
+        assert card_row.get_attribute("data-state") == "no"
+        shot(e2e, page, "16_blind_saved")
+
+        page.reload()  # after a reload only the browser preview is left: partial, never "통과"
+        page.wait_for_selector('.review-body .checks-list li[data-check="blind_names"]')
+        row = page.locator('.review-body .checks-list li[data-check="blind_names"]')
+        mark = row.locator("span").first
+        assert row.get_attribute("data-state") == "part"
+        assert (mark.inner_text(), mark.get_attribute("aria-label")) == ("…", "일부만 확인")
+        assert "재검수하면 서버가 확인" in row.inner_text() and "✓" not in row.inner_text()
+        shot(e2e, page, "16_blind_preview")
+        no_js_errors(page)
+    finally:
+        srv.api("/api/profile", before, method="PUT")

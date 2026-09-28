@@ -5,6 +5,8 @@
 #   docker build --build-arg WITH_RENDER=1 -t insia-smartagent .    # + 인스타그램 카드뉴스 PNG (Chromium, 이미지가 커져요)
 #
 # 데이터(워크스페이스)는 /data 볼륨에 쌓여요. 0.0.0.0으로 열리므로 INSIA_ACCESS_TOKEN이 꼭 필요해요.
+# docker run으로 직접 띄울 때는 --init과 --stop-timeout 30을 붙여 주세요(docker-compose.yml은 이미 설정돼 있어요):
+# 멈출 때 SIGTERM을 받으면 진행 중인 실행을 멈추고 저장한 뒤 끝나요(최대 20초).
 FROM python:3.11-slim
 
 ARG WITH_RENDER=0
@@ -54,4 +56,5 @@ EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD ["insia", "healthcheck", "--quiet"]
 
+STOPSIGNAL SIGTERM
 CMD ["insia", "serve", "--host", "0.0.0.0", "--port", "8765"]

@@ -44,6 +44,8 @@
     saveResult: null,     // {version, checks}
     diff: null,           // {from, to}
     jobs: {},             // itemId -> {runId, label}
+    kept: {},             // itemId -> {text, runId}: a job's result was kept in the history only (a person saved a version meanwhile)
+    savedChecks: {},      // '<itemId>.v<N>' -> the server's format checks from saving that version (this session)
     profile: null         // company profile for the editor's brand checks (live only)
   };
 
@@ -158,6 +160,9 @@
 
   ws.onJobEnd(function (job) {
     Object.keys(S.jobs).forEach(function (k) { if (S.jobs[k].runId === job.runId) delete S.jobs[k]; });
+    var data = job.ok && job.event && job.event.data;
+    var kept = data ? job.kept || '' : '';  // confirmed against the item (ws.confirmKept)
+    if (kept && job.itemId) S.kept[job.itemId] = { text: kept, runId: job.runId, current: Number(data.current_version) || 0, version: ws.versionNumber(data.version) };
     S.items = null;
     if (!isDemo()) loadList(true).catch(function () { /* ignore */ });
     if (S.detailId && job.itemId === S.detailId && isShown()) refreshDetail(false);
@@ -250,6 +255,7 @@
       el('span', { class: 'ic-title', text: it.title || '(제목 없음)' }),
       el('span', { class: 'ic-meta' }, [
         ui.scoreBadge(it.score, it.passed),
+        ui.forcedBadge(it),
         el('span', { class: 'ic-ver', text: 'v' + (it.version || 1) }),
         when ? el('span', { class: 'ic-when', text: when }) : null
       ])
@@ -309,11 +315,12 @@
         el('p', { class: 'eyebrow', text: [U.chName(item.channel), 'v' + (item.version || (latest && latest.version) || 1), item.updated_at ? ws.date.dateTime(item.updated_at) + ' 수정' : ''].filter(Boolean).join(' · ') }),
         el('h2', { class: 'view-title detail-title', id: 'libraryTitle', tabindex: '-1', text: item.title || (v && v.draft.title) || '(제목 없음)' })
       ]),
-      el('div', { class: 'detail-state' }, [ui.statusPill(item.status), ui.scoreBadge(item.score, item.passed)])
+      el('div', { class: 'detail-state' }, [ui.statusPill(item.status), ui.forcedBadge(item), ui.scoreBadge(item.score, item.passed)])
     ]);
 
     var main = el('div', { class: 'detail-main' }, [
       jobNotice(item),
+      keptNotice(item),
       saveResultNotice(),
       v && latest && v.version !== latest.version ? ui.notice('info', [
         el('b', { text: '이전 버전(v' + v.version + ')을 보고 있어요' }), ' · 최신 버전은 v' + latest.version + '예요.',
@@ -353,6 +360,25 @@
       el('b', { text: job.label + ' 중이에요' }), ' · 끝나면 이 화면이 새 결과로 바뀌어요.',
       el('a', { class: 'btn btn--small notice-action', href: '#/studio', text: '스튜디오에서 보기' })
     ], 'notice--live');
+  }
+
+  /** After a 재검수/수정 요청 whose result did not become current because a person saved a version meanwhile. */
+  function keptNotice(item) {
+    var k = S.kept[item.id];
+    if (!k) return null;
+    var vs = versions();
+    var mine = k.version ? vs.filter(function (x) { return x.version === k.version; })[0] : null;
+    return ui.notice('warn', [
+      el('div', { class: 'notice-row' }, [
+        el('b', { text: '에이전트 결과를 기록에만 남겼어요' }),
+        el('button', { type: 'button', class: 'btn btn--small btn--ghost notice-action', text: '닫기', onclick: function () { delete S.kept[item.id]; renderDetail(false); } })
+      ]),
+      el('p', { class: 'notice-foot', text: k.text }),
+      mine ? el('button', {
+        type: 'button', class: 'btn btn--small', 'data-key': 'kept-view', text: '에이전트 결과(v' + mine.version + ') 보기',
+        onclick: function () { S.viewVersion = mine.version; S.editing = false; renderDetail(false); }
+      }) : null
+    ], 'kept-notice');
   }
 
   function saveResultNotice() {
@@ -416,10 +442,33 @@
 
   // ------------------------------------------------------------------ editor
   function unsavedKey(item, latest) { return DRAFT_KEY + item.id + '.v' + (latest ? latest.version : 0); }
+  /** Unsaved edits of this item kept for an older version (a job or run added a version while the person edited). */
+  function olderUnsaved(item, latest) {
+    var prefix = DRAFT_KEY + item.id + '.v';
+    var best = null;
+    try {
+      for (var i = 0; i < window.localStorage.length; i++) {
+        var k = window.localStorage.key(i);
+        if (!k || k.indexOf(prefix) !== 0 || k === unsavedKey(item, latest)) continue;
+        var n = parseInt(k.slice(prefix.length), 10);
+        var raw = window.localStorage.getItem(k);
+        if (!raw || isNaN(n) || (best && best.version > n)) continue;
+        var val = JSON.parse(raw);
+        if (val && typeof val === 'object') best = { key: k, version: n, value: val };
+      }
+    } catch (e) { return null; }
+    return best;
+  }
+  function clearUnsaved(item, latest, older) {
+    U.storageSet(unsavedKey(item, latest), '');
+    if (older) U.storageSet(older.key, '');
+  }
   function editorCard(item, latest) {
     var d = (latest && latest.draft) || { title: '', content: '', hashtags: [] };
     var saved = null;
     try { saved = JSON.parse(U.storageGet(unsavedKey(item, latest)) || 'null'); } catch (e) { saved = null; }
+    var older = saved ? null : olderUnsaved(item, latest);
+    if (older) saved = older.value;
     var start = saved || { title: d.title || '', content: d.content || '', tags: (d.hashtags || []).join(' ') };
     var ch = item.channel;
     var withTags = ch !== 'bizplan';
@@ -434,8 +483,10 @@
     var meters = el('ul', { class: 'meters', id: 'edMeters', 'aria-label': '실시간 형식 확인' });
     var err = el('p', { class: 'form-error', role: 'alert', hidden: true });
     var restored = saved ? ui.notice('warn', [
-      el('b', { text: '저장하지 않은 편집을 되살렸어요' }), ' · 이 브라우저에 임시로 남아 있던 내용이에요.',
-      el('button', { type: 'button', class: 'btn btn--small notice-action', text: '원래 내용으로', onclick: function () { U.storageSet(unsavedKey(item, latest), ''); renderDetail(false); } })
+      el('b', { text: '저장하지 않은 편집을 되살렸어요' }),
+      older && latest ? ' · 이전 버전(v' + older.version + ')을 고치던 내용이에요. 그 사이 새 버전(v' + latest.version + ')이 생겼으니, 버전 기록에서 바뀐 부분을 확인한 뒤 저장해 주세요.'
+        : ' · 이 브라우저에 임시로 남아 있던 내용이에요.',
+      el('button', { type: 'button', class: 'btn btn--small notice-action', text: '원래 내용으로', onclick: function () { clearUnsaved(item, latest, older); renderDetail(false); } })
     ]) : null;
 
     var queued = false;
@@ -448,20 +499,22 @@
       var checks = ws.measure(ch, cur, S.detail.brief, S.profile);
       meters.textContent = '';
       checks.forEach(function (c) {
-        meters.appendChild(el('li', { 'data-ok': String(c.passed) }, [
-          el('span', { class: 'm-mark', 'aria-hidden': 'true', text: c.passed ? '✓' : '!' }),
+        meters.appendChild(el('li', { 'data-ok': c.partial ? 'partial' : String(c.passed), title: c.partial ? c.note || null : null }, [
+          el('span', { class: 'm-mark', 'aria-hidden': 'true', text: c.partial ? '…' : c.passed ? '✓' : '!' }),
           el('span', { class: 'm-label', text: c.label }),
           el('span', { class: 'm-val', text: c.value }),
-          el('span', { class: 'm-exp', text: '기준 ' + c.expected }),
-          el('span', { class: 'sr-only', text: c.passed ? '기준 충족' : '기준 벗어남' })
+          el('span', { class: 'm-exp', text: '기준 ' + c.expected + (c.partial ? ' · 학교·직장명은 저장하면 서버가 확인' : '') }),
+          el('span', { class: 'sr-only', text: c.partial ? '일부만 확인. ' + (c.note || '') : c.passed ? '기준 충족' : '기준 벗어남' })
         ]));
       });
       var tl = ws.text.charsWithSpace(cur.title);
       titleCount.textContent = ch === 'naver_blog' ? tl + ' / ' + ws.LIMITS.naver_blog.maxTitle + '자' : tl + '자';
       titleCount.dataset.ok = ch === 'naver_blog' ? String(tl > 0 && tl <= ws.LIMITS.naver_blog.maxTitle) : '';
       var dirty = cur.title !== (d.title || '') || cur.content !== (d.content || '') || (withTags && tags.value !== (d.hashtags || []).join(' '));
-      if (dirty) U.storageSet(unsavedKey(item, latest), JSON.stringify({ title: cur.title, content: cur.content, tags: withTags ? tags.value : '' }));
-      else U.storageSet(unsavedKey(item, latest), '');
+      if (dirty) {
+        U.storageSet(unsavedKey(item, latest), JSON.stringify({ title: cur.title, content: cur.content, tags: withTags ? tags.value : '' }));
+        if (older) { U.storageSet(older.key, ''); older.key = unsavedKey(item, latest); }  // moved to the current version's key
+      } else clearUnsaved(item, latest, older);
       // the main length check stays next to the textarea label (the full list sits below it)
       var main = checks.filter(function (c) { return c.id === (ch === 'instagram' ? 'caption_length' : 'length'); })[0];
       contentCount.textContent = main ? (ch === 'instagram' ? '캡션 ' : '') + main.value + ' · 기준 ' + main.expected.replace(/ \(.*\)$/, '') + (ch === 'bizplan' || ch === 'naver_blog' ? ' (공백 제외)' : ' (공백 포함)') : '';
@@ -481,7 +534,7 @@
         cancelZone.textContent = '';
         U.appendChildren(cancelZone, [
           el('span', { text: '고친 내용을 버릴까요?' }),
-          el('button', { type: 'button', class: 'btn btn--small btn--danger', text: '버리기', onclick: function () { U.storageSet(unsavedKey(item, latest), ''); stopEditing(); } }),
+          el('button', { type: 'button', class: 'btn btn--small btn--danger', text: '버리기', onclick: function () { clearUnsaved(item, latest, older); stopEditing(); } }),
           el('button', { type: 'button', class: 'btn btn--small', text: '계속 편집', onclick: function () { cancelZone.textContent = ''; content.focus(); } })
         ]);
         cancelZone.querySelector('.btn--danger').focus();
@@ -524,7 +577,8 @@
         var ver = resp && (resp.version && typeof resp.version === 'object' ? resp.version : null);
         var checks = (resp && (resp.format_checks || resp.checks)) || (ver && ver.review && ver.review.format_checks) || [];
         S.saveResult = { version: (ver && ver.version) || ((latest ? latest.version : 0) + 1), checks: checks };
-        U.storageSet(unsavedKey(item, latest), '');
+        if (checks.length) S.savedChecks[item.id + '.v' + S.saveResult.version] = checks;
+        clearUnsaved(item, latest, older);
         S.editing = false;
         S.viewVersion = null;
         S.busy = false;
@@ -539,7 +593,12 @@
         saveBtn.disabled = false;
         saveBtn.textContent = '저장 (새 버전)';
         if (ex.auth) return;
-        err.textContent = '저장하지 못했어요: ' + ex.message;
+        // 409: an agent is still writing this item (its run, or a 재검수/수정 요청). The text stays in the editor and in
+        // this browser (it comes back even after the run adds a newer version), so the person can save again later.
+        err.textContent = ex.status === 409
+          ? ex.message + ' 고친 내용은 편집창과 이 브라우저에 그대로 남아 있어요.'
+          : '저장하지 못했어요: ' + ex.message;
+        err.dataset.status = String(ex.status || '');
         err.hidden = false;
       });
     });
@@ -599,6 +658,10 @@
     return el('section', { class: 'card actions-card', 'aria-labelledby': 'actTitle' }, [
       el('h3', { class: 'card-title', id: 'actTitle', text: '검토와 게시' }),
       el('p', { class: 'card-sub', text: S.editing ? '편집 중에는 승인·게시·재검수를 할 수 없어요. 먼저 저장하거나 편집을 취소해 주세요.' : stateLine }),
+      ws.isForcedApproval(item) ? el('p', { class: 'forced-note' }, [
+        el('b', { text: '강제 승인 기록 ' }),
+        ws.forcedWhy(item) + (item.approved_at ? ' (' + ws.date.dateTime(item.approved_at) + ')' : '') + '. 게시 전에 한 번 더 읽어 주세요.'
+      ]) : null,
       item.note ? el('p', { class: 'item-note' }, [el('b', { text: '메모 ' }), item.note]) : null,
       buttons.length ? el('div', { class: 'action-row' }, buttons) : null,
       S.editing ? null : actionPanel(item, latest, passed)
@@ -722,6 +785,7 @@
 
   function startReview() {
     var id = S.detailId;
+    delete S.kept[id];
     S.busy = true;
     renderDetail(false);
     ws.post('/api/items/' + encodeURIComponent(id) + '/review', { options: ws.jobOptions() }).then(function (resp) {
@@ -743,6 +807,7 @@
 
   function startRevise(text) {
     var id = S.detailId;
+    delete S.kept[id];
     S.busy = true;
     ws.post('/api/items/' + encodeURIComponent(id) + '/revise', { instructions: text, options: ws.jobOptions() }).then(function (resp) {
       S.busy = false;
@@ -797,9 +862,14 @@
     if (r) {
       body = U.reviewDetails(r);
     } else {
-      var preview = v && v.draft && v.draft.content ? ws.measure(item.channel, v.draft, S.detail.brief, isDemo() ? null : S.profile) : [];
+      // the server's checks from saving this version in this session (they include the full blind rule), else the
+      // browser preview, whose partial checks say so (ws.measure opts.saved)
+      var server = v ? S.savedChecks[item.id + '.v' + v.version] : null;
+      var preview = !server && v && v.draft && v.draft.content
+        ? ws.measure(item.channel, v.draft, S.detail.brief, isDemo() ? null : S.profile, { saved: true }) : [];
       body = [
         el('p', { class: 'empty', text: v ? '이 버전(v' + v.version + ')은 아직 검수하지 않았어요.' + (isDemo() ? '' : ' 재검수하면 루브릭 점수와 사실 확인을 받아요.') : '검수 기록이 없어요.' }),
+        server && server.length ? U.formatChecksBlock(server, '형식 검사 (저장할 때 서버 계산)') : null,
         preview.length ? U.formatChecksBlock(preview, '형식 미리 확인 (브라우저 계산 · 참고용)') : null
       ];
     }

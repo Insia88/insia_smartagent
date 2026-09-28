@@ -109,6 +109,8 @@ Docker Desktop(Windows·macOS) 또는 Linux의 Docker Engine + Compose가 필요
 
    <http://127.0.0.1:8765>를 열고 `.env`의 토큰으로 로그인합니다. 카드뉴스 PNG까지 원하면 `.env`에 `INSIA_WITH_RENDER=1`을 넣고 다시 빌드하세요(이미지가 약 600MB 커집니다).
 
+   `docker compose stop`·`down`이나 업데이트(`up -d --build`)로 컨테이너가 멈출 때는 Ctrl+C를 누른 것처럼 정리돼요. 진행 중이던 실행은 다음 단계에서 멈추고 **멈춘 실행으로 저장**되며(대시보드 '멈춤', 터미널 '중단'), 끝낸 채널은 남아 있어서 나중에 대시보드나 `insia resume <실행 id>`로 이어서 할 수 있어요. `docker-compose.yml`의 `init: true`(신호를 제대로 전달하는 작은 init 프로세스)와 `stop_grace_period: 30s`(진행 중인 호출이 끝날 때까지 기다리는 여유)가 이 일을 해요. 두 줄을 지우지 마세요.
+
 4. 컨테이너 안에서 명령을 쓸 때는 앞에 `docker compose exec insia`를 붙입니다.
 
    ```bash
@@ -194,7 +196,7 @@ insia docs list
 
 | 언제 | 할 일 | 명령 | 대시보드 |
 |---|---|---|---|
-| 월요일 아침 | 한 주 계획 세우기 | `insia plan-week --theme "…"` | 캘린더 → 이번 주 계획 세우기 |
+| 월요일 아침 | 한 주 계획 세우기 | `insia plan-week --theme "…"` (주말에도: `--weekend instagram`) | 캘린더 → 이번 주 계획 세우기 (주말에도 올리기 체크) |
 | 매일 아침(자동) | 그날 올릴 초안 만들기 | `insia run-due` | 캘린더 → 초안 만들기 |
 | 초안이 생기면 | 검토 · 수정 요청 · 승인 | `insia items show` · `revise` · `items approve` | 보관함 |
 | 게시 직전 | 붙여넣기용 파일 받기 → 직접 게시 | `insia items export` | 보관함 → 내보내기 |
@@ -207,8 +209,11 @@ insia plan-week --theme "AI로 콘텐츠 마케팅 시간 줄이기" --blog 2 --
 ```
 
 - 기간은 기본 **이번 주 월요일부터 7일**(오늘이 월요일이 아니면 다음 월요일부터)이고, 게시일은 평일에 나눠 둡니다. `--start 2026-10-05 --days 7`로 바꿀 수 있습니다.
+- **주말에도 올리고 싶은 채널**이 있으면 `--weekend instagram`(여러 개는 `--weekend blog,instagram`, 모두는 `--weekend all`)을 붙입니다. 대시보드에서는 계획 폼의 **"주말(토·일)에도 올리기"**에서 채널을 체크합니다. 기본은 모든 채널이 평일만이에요.
+  - 주말 게시를 켰다면 **`insia run-due` 자동 실행을 매일 돌게** 바꿔 주세요. 평일에만 돌면 토·일 슬롯의 초안이 게시일이 지난 월요일에야 만들어집니다 → [8. 자동 실행](#8-자동-실행-cron--작업-스케줄러)의 "주말에도 올린다면".
+- 같은 채널에 이미 계획이 있는 날은 비워 두고, 지난 게시물·기존 계획과 겹치는 주제는 넣지 않습니다. 그래서 요청한 개수보다 적게 계획될 수 있고, 그 이유는 계획 결과에 안내로 나옵니다.
 - 채널 개수를 하나도 안 적으면 블로그 2 · 링크드인 2 · 인스타그램 2편입니다.
-- 테마를 비우면 회사 프로필로 주제를 정합니다. 이미 게시한 주제는 피합니다(그래서 6단계 "게시 완료 표시"가 중요합니다).
+- 테마를 비우면 회사 프로필로 주제를 정합니다. 이미 게시한 주제는 피합니다(그래서 ⑤ "게시 완료 표시"가 중요합니다).
 - 마음에 들지 않으면 `--replace`로 다시 짭니다. 개별 슬롯은 `insia calendar move <슬롯> --date …`, `insia calendar skip <슬롯>`.
 - 계획 확인: `insia calendar list`.
 
@@ -236,7 +241,9 @@ insia items approve <id>
 
 - id는 길어서 **겹치지 않는 일부만** 적어도 됩니다(예: `items show 0928-1015_linkedin`).
 - 직접 문장을 고치고 싶으면 대시보드 **보관함 → 편집**이 가장 편합니다. 저장하면 글자 수·형식 검사를 바로 다시 해 줍니다.
-- 승인은 **최신 버전이 검수를 통과(80점 이상, 치명적 이슈 없음)**해야 됩니다. 내용을 직접 확인했다면 `--force`(대시보드: "그래도 승인")로 승인할 수 있습니다.
+- **에이전트가 아직 그 콘텐츠를 쓰는 동안에는 저장이 거절돼요**(HTTP 409). 그 콘텐츠를 만든 실행이 아직 돌고 있거나, 그 콘텐츠에 재검수·수정 요청이 진행 중일 때예요. 고친 내용은 편집창과 브라우저에 그대로 남으니, 작업이 끝난 뒤 최신 버전을 확인하고 다시 저장하세요(그 사이 새 버전이 생겨도 고치던 내용을 되살려 줘요).
+- 사람이 고친 버전은 에이전트 결과에 **묻히지 않아요.** 멈춘 실행을 고친 뒤 이어서 실행하거나, 터미널에서 돌던 실행(`insia run`·`resume`·`run-due`)이 끝나기 전에 대시보드에서 고쳐도, 에이전트가 그 뒤에 만든 결과는 버전 기록에만 남고 사람이 고친 내용이 현재 버전으로 유지돼요. 승인·게시 예정·게시 완료로 바꿔 둔 콘텐츠도 마찬가지예요. 터미널 실행이 도는 동안 대시보드에서 수정 요청을 보낸 경우에도 수정 결과가 현재 버전으로 남고, 재검수 점수도 그 버전에 붙어서 바로 승인할 수 있어요(터미널 실행의 결과는 기록에만 남아요). 실행 기록에 "사람이 고친 버전이 있어서 … 기록에만 남기고"라는 안내가 남고, 재검수·수정 요청이면 대시보드에 같은 안내가 떠요.
+- 승인은 **최신 버전이 검수를 통과(80점 이상, 치명적 이슈 없음)**해야 됩니다. 내용을 직접 확인했다면 `--force`(대시보드: "그래도 승인")로 승인할 수 있습니다. 이렇게 승인한 콘텐츠는 보관함 목록과 상세 화면에 **"강제 승인"** 표시가 붙고(승인한 버전과 그때 점수도 남아요), 게시 예정·게시 완료로 넘어가도 표시가 남아요.
 - 승인 전에 꼭 확인할 것: `[대표자 성명]`·`[확인 필요: …]`·`○○` 같은 **자리표시를 모두 채웠는지**, 핵심 수치의 **원문 출처**를 열어 봤는지, 과장 표현·금지 표현이 없는지.
 
 ### ④ 내보내기와 게시
@@ -312,7 +319,7 @@ workspace/
 업데이트 전에 [백업](#6-백업과-복원)을 먼저 하세요. DB 구조가 바뀌면 처음 열 때 자동으로 올라가고(되돌릴 수 없음), 실패하면 변경 없이 멈춥니다.
 
 - **파이썬 설치**: 새 ZIP으로 파일을 덮어쓰거나 `git pull` 한 뒤, 가상환경을 켜고 `pip install -e ".[export,docs]"`를 다시 실행합니다. `insia doctor`로 확인합니다.
-- **Docker**: `git pull && docker compose up -d --build`.
+- **Docker**: `git pull && docker compose up -d --build`. 이때 진행 중이던 실행은 깔끔하게 멈춘 실행으로 저장되고, 새 컨테이너가 뜬 뒤 대시보드나 `docker compose exec insia insia resume <실행 id>`로 이어서 할 수 있어요([1-2](#1-2-docker로-설치-늘-켜-두는-서버) 참고). 급하지 않으면 실행이 끝난 뒤 업데이트하세요.
 - "이 워크스페이스는 더 새 버전의 INSIA로 만들어졌어요"가 나오면 INSIA를 최신으로 올리세요(옛 버전으로 새 DB를 열 수 없습니다).
 
 ## 8. 자동 실행 (cron · 작업 스케줄러)
@@ -343,6 +350,8 @@ workspace/
 
    macOS에서 cron이 문서 폴더에 접근하지 못하면 "시스템 설정 → 개인정보 보호 및 보안 → 전체 디스크 접근 권한"에 `/usr/sbin/cron`을 추가하세요.
 
+   **주말에도 올린다면**(계획할 때 `--weekend`나 "주말에도 올리기"를 켰다면) 요일 칸을 `*`로 바꿔 매일 돌게 합니다: `50 7 * * * . $HOME/.insia.env; …`
+
 ### Windows (작업 스케줄러)
 
 1. INSIA 폴더에 `run-due.bat` 파일을 만듭니다.
@@ -365,6 +374,12 @@ workspace/
 
    (사용자 폴더 이름에 공백이 있으면 아래 화면 방식으로 등록하세요.) 또는 "작업 스케줄러 → 기본 작업 만들기 → 매주 → 월~금 → 프로그램 시작 → run-due.bat"을 골라도 됩니다. PC가 꺼져 있으면 돌지 않으니, 작업 속성에서 "예약된 시작 시간을 놓친 경우 가능한 대로 빨리 작업 시작"을 켜 두세요.
 
+   **주말에도 올린다면** 매일 돌게 등록합니다(이미 등록했다면 `/F`로 덮어써요).
+
+   ```powershell
+   schtasks /Create /F /TN "INSIA run-due" /SC DAILY /ST 07:50 /TR "$HOME\Documents\insia\run-due.bat"
+   ```
+
 ### Docker
 
 호스트의 cron에서 컨테이너 안의 명령을 부릅니다.
@@ -372,6 +387,8 @@ workspace/
 ```cron
 50 7 * * 1-5 cd /srv/insia && docker compose exec -T insia insia run-due --limit 3 --quiet >> /srv/insia/workspace/logs/run-due.log 2>&1
 ```
+
+주말에도 올린다면 `1-5`를 `*`로 바꿔 매일 돌게 합니다.
 
 ## 9. 보안
 
@@ -422,11 +439,14 @@ workspace/
 | 보관함이 비어 있어요 / 어제 만든 게 안 보여요 | 다른 폴더의 워크스페이스를 봄 | `insia doctor`로 위치 확인, `INSIA_HOME`을 절대 경로로 |
 | "다른 기기에서 접속할 수 있는 주소…접근 토큰이 필요해요" | `--host 0.0.0.0`인데 토큰 없음 | `INSIA_ACCESS_TOKEN` 설정 ([9. 보안](#9-보안)) |
 | "도메인(--public-host / INSIA_PUBLIC_HOSTS)으로 열면…접근 토큰이 꼭 필요해요" | 리버스 프록시 뒤인데 토큰 없음 | `INSIA_ACCESS_TOKEN` 설정 |
+| "리버스 프록시(--trust-proxy / INSIA_TRUST_PROXY) 뒤에서 열면 … 접근 토큰이 꼭 필요해요" | 프록시 옵션을 켰는데 토큰 없음 (프록시를 거치면 바깥에서 들어올 수 있어요) | `INSIA_ACCESS_TOKEN` 설정 ([9. 보안](#9-보안)). 프록시를 쓰지 않는다면 `--trust-proxy`·`INSIA_TRUST_PROXY`를 빼기 |
+| "이 컴퓨터에서는 IPv6 주소(…)로 서버를 열 수 없어요" | IPv6가 꺼진 컴퓨터에서 `--host ::1`·`::` | `--host 127.0.0.1`로 열기 (`insia healthcheck`도 같은 `--host`) |
 | "접근 토큰이 너무 짧아요" | 토큰이 12자 미만 | `secrets.token_urlsafe(32)`로 새로 만들기 |
 | 대시보드가 계속 로그인 화면이에요 | 토큰이 다름 / 서버 토큰을 바꿈 | 서버에 설정한 토큰을 그대로 입력 |
 | "서버를 시작하지 못했어요 … Address already in use" | 8765 포트를 이미 씀 | 켜 둔 `insia serve`를 끄거나 `--port 8766` |
 | "예산 상한 $X를 넘어 실행을 멈췄어요" | 편당 예산 초과 | `insia resume <실행 id> --max-cost-usd <더 큰 값>` |
-| "아직 실행 중으로 표시된 작업이에요" | 서버가 갑자기 꺼져 상태가 남음 | 서버를 다시 켜면 "중단됨"으로 정리돼요. 그 뒤 `insia resume`. 서버 없이 확실하면 `--force` |
+| "다른 곳에서 아직 실행 중인 작업이에요 (…)" | 다른 프로그램(터미널의 `insia run`·`run-due`, 대시보드 서버, 다른 컴퓨터·컨테이너)이 그 실행을 아직 하고 있음 | 끝날 때까지 기다리세요. 그 프로그램이 이미 꺼졌다면 `insia resume`·`run-due`·`serve`가 알아서 '중단됨'으로 정리해요(프로세스가 사라졌거나 컴퓨터를 다시 켰으면 바로, 신호가 10분 넘게 끊기면 그때). 정말 멈춘 게 확실하면 `insia resume <실행 id> --force` |
+| "에이전트가 아직 이 콘텐츠를 쓰고 검수하는 중이에요" · "에이전트가 이 콘텐츠를 수정하는 중이에요" (편집 저장) | 그 콘텐츠의 실행이나 재검수·수정 요청이 아직 진행 중 (409) | 고친 내용은 편집창에 남아 있어요. 작업이 끝나면 최신 버전을 확인하고 다시 저장 |
 | "최신 버전(vN)이 검수를 통과하지 못했어요" | 승인 조건 미달 | `insia revise <id> -i "…"`로 고치거나, 직접 확인했다면 `items approve <id> --force` |
 | "'초안' 상태에서 '게시 완료'(으)로 바꿀 수 없어요. 먼저 승인해 주세요." | 승인 전에 게시 표시 | `insia items approve <id>` 먼저 |
 | "PDF에서 글자를 찾지 못했어요" | 스캔한 이미지 PDF | 글자를 복사해 `.txt`로 올리거나 OCR PDF 사용 |
@@ -448,20 +468,20 @@ workspace/
 | 명령 | 하는 일 |
 |---|---|
 | `insia doctor` | 설치·설정 점검 |
-| `insia serve` | 대시보드 (`--host`, `--port`, `--token`, `--public-host`, `--trust-proxy`) |
+| `insia serve` | 대시보드 (`--host`, `--port`, `--token`, `--public-host`, `--trust-proxy`; 바깥·프록시에 열면 토큰 필수) |
 | `insia profile show / edit-template / import <파일> / export` | 회사 프로필 |
 | `insia docs add <파일> / list / show <id> / rm <id>` | 참고 자료 |
-| `insia plan-week --theme … [--start] [--days] [--blog N --linkedin N --instagram N]` | 한 주 계획 |
+| `insia plan-week --theme … [--start] [--days] [--blog N --linkedin N --instagram N] [--weekend 채널] [--replace]` | 한 주 계획 (기본 평일만, `--weekend`로 채널별 주말 허용) |
 | `insia calendar list / generate <슬롯> / skip <슬롯> / move <슬롯> --date` | 캘린더 |
 | `insia run-due [--until] [--limit] [--dry-run]` | 예정된 초안 만들기 (자동 실행용) |
 | `insia run --topic … [--channels] [--docs] [--max-cost-usd] [--no-profile]` | 바로 실행 |
 | `insia items list / show / approve / schedule / publish / archive / restore / export` | 보관함 |
 | `insia review <id>` · `insia revise <id> -i "…"` | 재검수 · 수정 요청 |
-| `insia resume <실행 id>` | 멈춘 실행 이어서 |
-| `insia runs list / show / export` | 실행 기록 |
+| `insia resume <실행 id> [--max-cost-usd] [--force]` | 멈춘 실행 이어서 |
+| `insia runs list [--item <콘텐츠 id>] / show / export` | 실행 기록 (`--item`: 그 콘텐츠에 돌린 작업만) |
 | `insia usage [--since] [--until]` | 사용량·비용 |
 | `insia import-run <폴더>` | Claude Code 실행 폴더 가져오기 |
 | `insia check <draft.json>` | 초안 형식 검사 (프로필 규칙 포함) |
-| `insia healthcheck` | 서버 상태 확인 (Docker용) |
+| `insia healthcheck [--host] [--port]` | 서버 상태 확인 (Docker용) |
 
 종료 코드: `0` 성공 · `1` 작업 실패 · `2` 명령을 잘못 씀 · `130` 중단(Ctrl+C).

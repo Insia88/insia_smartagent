@@ -16,7 +16,12 @@ Production behaviour (all optional, the CLI/server pass them):
   every event, the plan and research pack as soon as they exist, every draft
   round as a content-item version and every review attached to it, usage
   records. A crash loses at most the step in flight; ``resume_run`` picks up
-  from there without redoing finished work.
+  from there without redoing finished work. A person's edit is never buried:
+  when an item was edited (or approved) after the run's last stored round —
+  while the run was stopped, or from the dashboard while a CLI run was going —
+  the run's later rounds are kept in the history only and the edit stays the
+  current version (``Workspace.add_run_version``; ``run.completed`` reports
+  ``superseded`` / ``superseded_by_human_edit`` / ``superseded_channels``).
 - ``context`` (``RunContext``): company profile, user documents, reference
   date; handed to the backend (``backend.context``) and to the reviewer's
   deterministic brand checks.
@@ -492,17 +497,56 @@ class _Recorder:
     """Persists pipeline progress to the workspace as it happens (no-op without one).
 
     Thread-safe: live channels record from worker threads.
+
+    A person's work is never buried: when an item moved on after the run's
+    last stored round (edited while the run was stopped, edited from the
+    dashboard while a CLI run was going, approved, …), the run's rounds are
+    kept in the history only (``Workspace.add_run_version``), the channel is
+    listed in ``superseded`` (saved in the run's progress as
+    ``superseded_channels`` and reported in ``run.completed``) and ``notify`` gets a Korean warning once per channel.
     """
 
     def __init__(self, workspace: "Workspace | None", run_id: str, brief: Brief, *, progress: dict[str, Any] | None = None,
-                 version_ids: dict[tuple[str, int], str] | None = None) -> None:
+                 version_ids: dict[tuple[str, int], str] | None = None,
+                 notify: Callable[[str, str], None] | None = None) -> None:
         self.workspace = workspace
         self.run_id = run_id
         self.brief = brief
         self.progress: dict[str, Any] = {"channels": {}, "followups": {}, "questions": [], **(progress or {})}
         self.version_ids: dict[tuple[str, int], str] = dict(version_ids or {})
         self.lease: "RunLease | None" = None  # set once the run is claimed: no more writes after a takeover
+        self.notify = notify  # (channel, message): a warning for the run's event stream
+        self._warned: set[str] = set()
         self._lock = threading.RLock()
+
+    @property
+    def superseded(self) -> dict[str, dict[str, Any]]:
+        """Channels whose item a person (or another job) moved on after the run's rounds: ``{channel: info}``."""
+        with self._lock:
+            return {ch: dict(info) for ch, info in (self.progress.get("superseded_channels") or {}).items()}
+
+    def _mark_superseded(self, channel: str, info: dict[str, Any], round_: int | None = None) -> None:
+        with self._lock:
+            known = dict((self.progress.get("superseded_channels") or {}).get(channel) or {})
+            merged = {**known, **info,
+                      "superseded_by_human_edit": bool(known.get("superseded_by_human_edit") or info.get("superseded_by_human_edit"))}
+            self.progress.setdefault("superseded_channels", {})[channel] = merged
+            warn = channel not in self._warned
+            self._warned.add(channel)
+        if warn and self.notify is not None:
+            label = channel_label(channel)
+            what = f"R{round_} 결과" if round_ is not None else "최종 결과"
+            if merged.get("superseded_by_human_edit"):
+                why = "사람이 고친 버전이 있어서"
+            elif merged.get("reason") == "status" or merged.get("status") in ("approved", "scheduled", "published"):
+                why = "이미 승인·게시 단계라서"
+            else:
+                why = "다른 작업이 저장한 새 버전이 있어서"
+            try:
+                self.notify(channel, f"{label}: {why} 에이전트의 {what}(v{merged.get('version')})는 기록에만 남기고, "
+                                     f"현재 버전은 v{merged.get('current_version')} 그대로 둬요. 보관함 기록에서 비교할 수 있어요.")
+            except Exception:  # noqa: BLE001 - a warning line must never stop the run
+                log.debug("superseded notice failed", exc_info=True)
 
     @property
     def enabled(self) -> bool:
@@ -552,8 +596,13 @@ class _Recorder:
         with self._lock:
             self._guard()
             self.workspace.ensure_item(item_id, draft.channel, draft.title, run_id=self.run_id, brief=self.brief)
-            version = self.workspace.add_version(item_id, draft, source="agent", run_id=self.run_id)
-            self.version_ids[(draft.channel, draft.round)] = version.id
+            stored = self.workspace.add_run_version(item_id, draft, run_id=self.run_id)
+            self.version_ids[(draft.channel, draft.round)] = stored.version.id
+        if stored.restored is not None:  # a person's edit or decision stays current; this round is history only
+            self._mark_superseded(draft.channel, {"version": stored.version.version,
+                                                  "current_version": stored.restored.version,
+                                                  "superseded_by_human_edit": stored.by_human,
+                                                  "reason": stored.reason}, draft.round)
 
     def review(self, draft: Draft, review: Review) -> None:
         if self.workspace is None:
@@ -581,6 +630,9 @@ class _Recorder:
         with self._lock:
             self._guard()
             self.workspace.upsert_item_from_result(self.run_id, result, self.brief)
+            moved = self.workspace.run_item_superseded(self.run_id, result.channel)
+            if moved is not None:  # e.g. a person edited the item after the last round: the final draft is history only
+                self._mark_superseded(result.channel, moved)
             self.progress["channels"][result.channel] = "completed"
             self._save_progress()
 
@@ -710,6 +762,10 @@ def _replay_research(ctx: AgentContext, store: researcher.ResearchStore) -> None
     ctx.status(researcher.AGENT, "idle", "추가 조사 요청이 오면 다시 찾아볼게요")
 
 
+def _nothing_to_restore() -> None:
+    """``run_pipeline``'s hook restorer until the backend hooks are installed."""
+
+
 def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settings, *,
                  runner: SimRunner | ThreadRunner | None = None, out_dir: str | Path | None = None,
                  mode_note: str | None = None, workspace: "Workspace | None" = None,
@@ -727,7 +783,7 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
     started_at = _iso_now()
     run_id = bus.run_id
     target_dir: Path | None = None
-    restore_hooks: Callable[[], None] = lambda: None
+    restore_hooks: Callable[[], None] = _nothing_to_restore
     sink: Callable[[dict[str, Any]], None] | None = None
     lease: "RunLease | None" = None
 
@@ -743,7 +799,8 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
                            checkpoint=make_checkpoint(runner, meter, lost), wait=make_wait(runner, bus))
         recorder = _Recorder(workspace, run_id, brief,
                              progress=resume_state.progress if resume_state else None,
-                             version_ids=resume_state.version_ids if resume_state else None)
+                             version_ids=resume_state.version_ids if resume_state else None,
+                             notify=lambda channel, message: ctx.log(message, "warn", "orchestrator"))
         if hasattr(backend, "on_notice"):
             backend.on_notice = lambda agent, level, message: bus.emit("log", agent, {"level": level, "message": message})  # type: ignore[attr-defined]
         restore_hooks = install_backend_hooks(backend, context, meter)
@@ -887,6 +944,11 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
             completed["errors"] = errors
         if workspace is not None:
             completed["items"] = recorder.item_ids()
+            superseded = recorder.superseded
+            if superseded:  # a person's edit (or decision) stayed current over these channels' results
+                completed["superseded"] = True  # same flags as an item job's run.completed
+                completed["superseded_by_human_edit"] = any(i.get("superseded_by_human_edit") for i in superseded.values())
+                completed["superseded_channels"] = superseded
         if meter.spent:
             completed["cost_usd"] = round(meter.spent, 6)
         if lost():  # taken over at the very end: the new owner finishes and records the run

@@ -287,7 +287,7 @@ def _superseded(workspace: Workspace, item_id: str, base_version: int, own_versi
     (any ``human`` version after ``base_version`` other than the job's own).
     """
     detail = workspace.get_item(item_id)
-    if detail is None or not detail.versions or detail.versions[-1].version == own_version:
+    if detail is None or not detail.versions or workspace.version_is_current(item_id, own_version):
         return None, False
     by_human = any(v.source == "human" for v in detail.versions if v.version > base_version and v.version != own_version)
     return detail.versions[-1], by_human

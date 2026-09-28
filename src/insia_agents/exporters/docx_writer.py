@@ -401,13 +401,9 @@ class _Builder:
             self._blind_notice()
 
     def _blind_notice(self) -> None:
-        exposed = exposed_names(self.draft, self.profile)
-        if not exposed:
-            return
-        names = ", ".join(exposed)
-        text = (f"블라인드 확인 필요 — 팀원 실명 {len(exposed)}개가 본문에 보여요: {names}. "
-                "사업계획서 제출본에는 실명을 쓸 수 없으니 ○○로 가려 주세요.")
-        self._box(text, fill="FDECEA", border_color="D92D20", border_val="single", color="912018", bold=True)
+        text = blind_warning(self.draft, self.profile)
+        if text:
+            self._box(text, fill="FDECEA", border_color="D92D20", border_val="single", color="912018", bold=True)
 
     def _box(self, text: str, *, fill: str, border_color: str, border_val: str, color: str,
              bold: bool = False, italic: bool = False, align=None, label: str = "") -> None:
@@ -625,6 +621,38 @@ def exposed_names(draft: Draft, profile: Profile | None) -> list[str]:
         if len(name) >= 2 and key and key in flat and name not in names:
             names.append(name)
     return names
+
+
+def exposed_schools_and_employers(draft: Draft, profile: Profile | None) -> list[str]:
+    """School and employer names from the team backgrounds that the draft
+    shows in a career context ("카카오 출신", "고려대 졸업") — the other half of
+    the business-plan blind rule. Same matching as ``channels.profile_checks``
+    (``prompt_loader.blind_leaks``; the applicant's own company and service
+    names may appear)."""
+    if profile is None or not profile.team:
+        return []
+    from ..prompt_loader import blind_leaks
+
+    return blind_leaks(f"{draft.title}\n{draft.content}", [m.background for m in profile.team],
+                       keep=[profile.company_name, profile.service_name])
+
+
+def blind_warning(draft: Draft, profile: Profile | None) -> str:
+    """The business-plan blind warning (Korean, one line), or "" when nothing is exposed: team member names
+    (``exposed_names``) and school/employer names from the team backgrounds (``exposed_schools_and_employers``).
+    The Word file shows it as a red box; the export API can send the same text as a note."""
+    exposed = exposed_names(draft, profile)
+    leaks = exposed_schools_and_employers(draft, profile)
+    if not exposed and not leaks:
+        return ""
+    parts: list[str] = []
+    if exposed:
+        parts.append(f"팀원 실명 {len(exposed)}개가 본문에 보여요: {', '.join(exposed)}.")
+    if leaks:
+        where = "도" if exposed else "가 본문에"
+        parts.append(f"팀 배경의 학교·직장명 {len(leaks)}개{where} 보여요: {', '.join(leaks)}.")
+    what = "·".join(w for w, on in (("실명", exposed), ("학교명·직장명", leaks)) if on)
+    return f"블라인드 확인 필요 — {' '.join(parts)} 사업계획서 제출본에는 {what}을 쓸 수 없으니 ○○로 가려 주세요."
 
 
 def build_docx(draft: Draft, *, meta: str = "", profile: Profile | None = None, channel_label: str = "") -> bytes:

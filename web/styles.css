@@ -873,10 +873,14 @@ dialog::backdrop { background: var(--backdrop); backdrop-filter: blur(2px); }
 .issue .sev { font-family: var(--f-mono); font-size: var(--fs-xs); color: var(--muted); }
 .issue .fix { color: var(--ink-2); }
 .checks-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
-.checks-list li { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 8px; font-size: var(--fs-sm); align-items: baseline; padding: 4px 0; border-bottom: 1px dashed var(--line); }
+.checks-list li { display: grid; grid-template-columns: 18px minmax(min(7em, 40%), 1fr) auto; gap: 8px; font-size: var(--fs-sm); align-items: baseline; padding: 4px 0; border-bottom: 1px dashed var(--line); }
 .checks-list .ok { color: var(--res-ink); font-weight: 700; }
 .checks-list .no { color: var(--danger-ink); font-weight: 700; }
-.checks-list .val { font-family: var(--f-mono); font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; }
+/* the value wraps (right-aligned) before the label is squeezed to a column of single letters on a phone */
+.checks-list .val { font-family: var(--f-mono); font-size: var(--fs-xs); color: var(--muted); text-align: right; overflow-wrap: anywhere; }
+/* a browser preview that could check only part of a rule (never shown as passed) */
+.checks-list .part { color: var(--muted); font-weight: 700; }
+.checks-list .note { grid-column: 2 / -1; color: var(--ink-2); font-size: var(--fs-xs); }
 .facts { display: flex; flex-wrap: wrap; gap: 8px; }
 .facts .stat { padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--r-sm); }
 .review-summary { font-size: var(--fs-sm); color: var(--ink-2); padding: 10px 12px; background: var(--surface-2); border-radius: var(--r-sm); }
@@ -990,6 +994,7 @@ a.btn--primary { color: var(--accent-ink); }
 .job-banner[data-kind="done"] { border-color: color-mix(in srgb, var(--c-gold) 55%, var(--line)); background: color-mix(in srgb, var(--c-gold) 9%, var(--surface)); }
 .job-banner[data-kind="failed"] { border-color: color-mix(in srgb, var(--c-danger) 55%, var(--line)); background: color-mix(in srgb, var(--c-danger) 9%, var(--surface)); }
 .job-banner .btn { margin-left: 4px; }
+.job-banner .jb-kept { color: var(--rev-ink); font-weight: 600; }
 .run-bar .rb-topic { color: var(--ink-2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: min(520px, 100%); }
 .run-bar .rb-why { color: var(--ink-2); flex-basis: 100%; }
 .run-bar .rb-error { color: var(--danger-ink); flex-basis: 100%; }
@@ -1047,6 +1052,17 @@ a.btn--primary { color: var(--accent-ink); }
 .score-badge[data-state="pass"] .sb-verdict { color: var(--gold-ink); }
 .score-badge[data-state="fail"] .sb-verdict { color: var(--danger-ink); }
 .score-badge[data-state="none"] { padding: 0 6px; border: 1px dashed var(--line); border-radius: 4px; }
+/* "강제 승인": approved without passing review ("그래도 승인"); stays visible after scheduling/publishing */
+.forced-pill {
+  display: inline-flex; align-items: center; gap: 4px; flex: none; white-space: nowrap;
+  font-size: var(--fs-xs); font-weight: 700; padding: 1px 8px; border-radius: 999px;
+  color: var(--rev-ink); border: 1px solid color-mix(in srgb, var(--c-rev) 55%, var(--line));
+  background: color-mix(in srgb, var(--c-rev) 10%, var(--surface-2));
+}
+.forced-pill > span[aria-hidden] { font-family: var(--f-mono); }
+.forced-note { margin: 0; padding: 8px 10px; border-radius: var(--r-sm); font-size: var(--fs-sm); color: var(--ink-2);
+  border: 1px solid color-mix(in srgb, var(--c-rev) 45%, var(--line)); background: color-mix(in srgb, var(--c-rev) 7%, var(--surface)); }
+.forced-note b { color: var(--rev-ink); }
 
 /* 보관함 list */
 .chip-filter { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: thin; padding-bottom: 2px; }
@@ -1157,6 +1173,8 @@ a.btn--primary { color: var(--accent-ink); }
 .meters .m-mark { grid-row: 1 / span 2; font-weight: 700; color: var(--res-ink); }
 .meters li[data-ok="false"] { border-color: color-mix(in srgb, var(--c-rev) 55%, var(--line)); }
 .meters li[data-ok="false"] .m-mark { color: var(--rev-ink); }
+.meters li[data-ok="partial"] { border-style: dashed; }
+.meters li[data-ok="partial"] .m-mark { color: var(--muted); }
 .meters .m-label { color: var(--ink-2); font-weight: 600; }
 .meters .m-val { font-family: var(--f-mono); color: var(--ink); font-variant-numeric: tabular-nums; text-align: right; }
 .meters .m-exp { grid-column: 2 / span 2; color: var(--muted); }
@@ -1259,6 +1277,12 @@ a.btn--primary { color: var(--accent-ink); }
 .count-field .lg-swatch { background: var(--ch); }
 .count-field input { width: 72px; padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); text-align: right; font-variant-numeric: tabular-nums; }
 .count-field .unit { color: var(--muted); font-size: var(--fs-xs); }
+.weekends { display: grid; gap: 6px; max-width: 380px; }
+.weekends legend { margin-bottom: 4px; padding: 0; font-weight: 600; }
+.weekends .field-hint { margin: 0; }
+.weekend-field { display: inline-flex; align-items: center; gap: 8px; min-height: 32px; font-weight: 400; cursor: pointer; }
+.card .field .weekend-field input[type="checkbox"] { width: 18px; min-width: 18px; height: 18px; padding: 0; margin: 0; border: 0; accent-color: var(--ch); flex: none; }
+.weekend-hint { margin: 2px 0 0; font-weight: 400; }
 .slot-dialog { width: min(520px, calc(100% - 2 * var(--gutter))); }
 .slot-eyebrow { display: flex; align-items: center; gap: 6px; }
 .slot-eyebrow .lg-swatch { background: var(--ch); }

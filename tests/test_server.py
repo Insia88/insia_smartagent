@@ -3,8 +3,13 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import os
+import re
+import signal
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -435,14 +440,15 @@ def test_client_that_hangs_up_is_not_an_error(server, monkeypatch, caplog, capfd
         raise BrokenPipeError(32, "Broken pipe")
 
     with caplog.at_level(logging.DEBUG, logger="insia_agents.server"):
-        monkeypatch.setattr(server_module.InsiaHandler, "_error", gone)  # every error answer finds the client gone
-        for path in ("/api/nope", "/nope.js"):
-            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
-            conn.request("GET", path)
-            with pytest.raises((http.client.RemoteDisconnected, ConnectionError)):
-                conn.getresponse()
-            conn.close()
-        monkeypatch.undo()
+        # a scoped patch: monkeypatch.undo() would also undo the env isolation of the conftest/settings fixtures
+        with monkeypatch.context() as patch:
+            patch.setattr(server_module.InsiaHandler, "_error", gone)  # every error answer finds the client gone
+            for path in ("/api/nope", "/nope.js"):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+                conn.request("GET", path)
+                with pytest.raises((http.client.RemoteDisconnected, ConnectionError)):
+                    conn.getresponse()
+                conn.close()
         for _ in range(20):  # real resets: SO_LINGER 0 closes with RST before the answer is written
             sock = socket.create_connection(("127.0.0.1", server.server_address[1]))
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
@@ -655,3 +661,94 @@ def test_ipv6_loopback_bind(settings):
     finally:
         wild.shutdown()
         wild.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown: SIGTERM (docker stop) takes the Ctrl+C path
+# ---------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGTERM") or sys.platform == "win32", reason="POSIX signals")
+def test_sigterm_as_interrupt_raises_keyboard_interrupt_in_the_main_thread_only():
+    before = signal.getsignal(signal.SIGTERM)
+    with server_module.sigterm_as_interrupt() as installed:
+        assert installed is True and signal.getsignal(signal.SIGTERM) is not before
+        with pytest.raises(KeyboardInterrupt):
+            signal.raise_signal(signal.SIGTERM)
+    assert signal.getsignal(signal.SIGTERM) is before  # restored
+
+    seen = []
+
+    def worker():
+        with server_module.sigterm_as_interrupt() as installed:
+            seen.append(installed)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(5)
+    assert seen == [False] and signal.getsignal(signal.SIGTERM) is before
+
+
+SERVE_COMMANDS = {
+    "cli": ["-m", "insia_agents", "serve", "--port", "0", "--mode", "mock"],
+    "library": ["-c", "from insia_agents.config import Settings; from insia_agents.server import serve; "
+                      "serve(Settings.from_env(), port=0)"],
+}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM delivery is POSIX")
+@pytest.mark.parametrize("how", sorted(SERVE_COMMANDS))
+def test_sigterm_stops_insia_serve_cleanly_and_leaves_no_run_running(tmp_path, how):
+    """docker stop sends SIGTERM: the server cancels its live run (saved as 'cancelled', resumable) and exits 0."""
+    from insia_agents.db import Workspace
+
+    home = tmp_path / "ws"
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "INSIA_HOME": str(home), "INSIA_MODE": "mock",
+           "PYTHONUNBUFFERED": "1"}
+    for name in ("INSIA_ACCESS_TOKEN", "INSIA_PUBLIC_HOSTS", "INSIA_TRUST_PROXY", "ANTHROPIC_API_KEY"):
+        env.pop(name, None)
+    proc = subprocess.Popen([sys.executable, *SERVE_COMMANDS[how]], cwd=tmp_path, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    try:
+        port = None
+        deadline = time.monotonic() + 30
+        while port is None and time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if "http://127.0.0.1:" in line:
+                port = int(line.split("http://127.0.0.1:", 1)[1].split("/", 1)[0])
+        assert port, "server did not start"
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        body = json.dumps({"topic": "종료 테스트", "channels": ["linkedin", "instagram"], "options": {"speed": 1}})
+        conn.request("POST", "/api/runs", body=body.encode("utf-8"), headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        run_id = json.loads(resp.read())["run_id"]
+        conn.close()
+        assert resp.status == 201
+        time.sleep(0.5)  # the run is under way (recorded pace: minutes)
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(10)
+    assert proc.returncode == 0, out
+    assert "서버를 종료해요" in out and "진행 중인 작업 1개를 멈추는 중" in out and "Traceback" not in out
+    ws = Workspace(home)
+    try:
+        run = ws.get_run(run_id)
+        assert run["status"] == "cancelled", run["status"]
+        assert ws.list_runs(status="running") == [] and ws.stale_runs() == {}
+        assert ws.list_events(run_id)[-1]["type"] == "run.failed"
+    finally:
+        ws.close()
+
+
+def test_docker_compose_gives_the_server_time_to_stop_its_runs():
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert re.search(r"^\s+init: true\s*$", compose, re.M)
+    grace = re.search(r"^\s+stop_grace_period: (\d+)s\s*$", compose, re.M)
+    assert grace and int(grace.group(1)) > server_module.SHUTDOWN_GRACE

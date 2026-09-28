@@ -47,7 +47,7 @@ claude --agent orchestrator          # 세션 전체를 총괄 에이전트로 �
 - **데이터 계약.** `src/insia_agents/models.py`의 필드 이름·타입은 백엔드, DB, API, 대시보드, 녹화 데모가 함께 쓴다. 새 필드는 기본값과 함께 추가하고, 기존 필드는 바꾸기 전에 전체 영향을 확인한다.
 - **워크스페이스.** `Settings.home` = 환경 변수 `INSIA_HOME`(CLI는 `--home`), 기본 `./workspace`(git 제외). `insia.db`(WAL, 스키마는 `db.MIGRATIONS`에 뒤로만 추가 — 배포된 마이그레이션은 절대 고치지 않는다), `exports/`, `uploads/`, `logs/`, 선택 `prices.json`. `insia run`은 기본으로 워크스페이스에 저장한다(`--no-workspace`로 끔).
 - **비용.** 모든 API 응답의 사용량이 `UsageRecord`로 기록되고, 실행마다 `INSIA_MAX_COST_USD`/`--max-cost-usd` 상한이 걸린다. 가격표는 `costs.py` 기본값 + `prices.json` + `INSIA_PRICE_*`.
-- **보안.** 서버 기본 바인드는 `127.0.0.1`. 루프백이 아닌 주소나 `--public-host`로 열 때는 접근 토큰(`INSIA_ACCESS_TOKEN`/`--token`)이 필수다.
+- **보안.** 서버 기본 바인드는 `127.0.0.1`. 루프백이 아닌 주소, `--public-host`(`INSIA_PUBLIC_HOSTS`), `--trust-proxy`(`INSIA_TRUST_PROXY`)로 열 때는 접근 토큰(`INSIA_ACCESS_TOKEN`/`--token`)이 필수다(없으면 서버가 시작하지 않는다).
 - **테스트는 임시 워크스페이스로.** 테스트와 수동 실행은 항상 `tmp_path`/임시 `INSIA_HOME`을 쓰고 저장소의 `workspace/`를 건드리지 않는다. 테스트는 오프라인(mock 백엔드, 가짜 클라이언트)이고 전체가 1분 안에 끝나야 한다. 선택 라이브러리(pypdf, python-docx, PyYAML, playwright)가 없으면 해당 테스트는 건너뛴다.
 - **`outputs/`와 `workspace/`는 git에 올리지 않는다**(`.gitignore`에 있음). 데모용 녹화 실행은 `examples/sample-run/`에 둔다.
 
@@ -75,12 +75,13 @@ python scripts/build_artifact.py               # 대시보드 단일 페이지 �
 |---|---|
 | `src/insia_agents/models.py` | Brief, Plan, ResearchPack, Draft, Review, Profile, UserDocument, ContentItem, CalendarSlot 등 데이터 계약 |
 | `src/insia_agents/channels.py` | 채널 루브릭, 결정적 형식·브랜드 검사, `finalize_review`(점수 확정) |
-| `src/insia_agents/db.py` | 워크스페이스(SQLite): 프로필, 자료, 실행·이벤트, 콘텐츠·버전, 사용량, 캘린더 |
-| `src/insia_agents/pipeline.py` | 실행 루프, 이어서 실행(`resume_run`), 예산 상한, 실행 컨텍스트(`build_context`) |
+| `src/insia_agents/db.py` | 워크스페이스(SQLite): 프로필, 자료, 실행·이벤트, 콘텐츠·버전, 사용량, 캘린더. 실행 소유권(소유 프로세스·하트비트 `RunLease`, 주인이 사라진 실행만 넘겨받는 `recover_stale`), 사람이 고친 버전을 묻지 않는 `add_run_version`·`add_job_version` |
+| `src/insia_agents/pipeline.py` | 실행 루프, 이어서 실행(`resume_run`: 살아 있는 다른 프로세스의 실행은 거절), 예산 상한, 실행 컨텍스트(`build_context`) |
 | `src/insia_agents/actions.py`, `planner.py` | 재검수·수정 요청·직접 수정·슬롯 초안, 주간 계획 |
 | `src/insia_agents/exporters/` | docx, 네이버 html, txt, 카드뉴스 zip, 실행 묶음 |
 | `src/insia_agents/costs.py` | 토큰 → 비용, 가격표 |
 | `src/insia_agents/cli.py`, `server.py` | 명령줄(`insia`)과 대시보드 서버(REST + SSE, 접근 토큰) |
+| `src/insia_agents/importer.py`, `documents.py`, `errors.py` | Claude Code 실행 폴더·프로필 가져오기(`import_run_folder`), 자료 파일 읽기(PDF·DOCX·YAML), CLI와 라이브러리가 함께 쓰는 한국어 오류(`UsageError`·`CommandError`·`error_text`) |
 | `src/insia_agents/prompts/agents/` | 에이전트 시스템 프롬프트 (planner 포함) |
 | `src/insia_agents/prompts/channels/` | 채널 가이드 (형식의 단일 기준) |
 | `.claude/agents/`, `.claude/skills/` | Claude Code 서브에이전트와 슬래시 명령 |

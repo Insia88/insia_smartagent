@@ -465,6 +465,10 @@ def test_calendar_slots(ws):
     with pytest.raises(WorkspaceError, match="이미 초안"):
         ws.claim_slot(slots[0].id, "run-y")
     assert ws.claim_slot(slots[0].id, "run-y", force=True).run_id == "run-y"
+    with pytest.raises(WorkspaceError, match="건너뛰기"):  # a slot skipped by hand is never drafted by run-due
+        ws.claim_slot(slots[1].id, "run-z")
+    assert ws.get_slot(slots[1].id).status == "skipped"
+    assert ws.claim_slot(slots[1].id, "run-z", force=True).status == "generating"
     with pytest.raises(NotFoundError):
         ws.claim_slot("sl_missing", "run-z")
     with pytest.raises(WorkspaceError):
@@ -961,3 +965,153 @@ def test_acquiring_a_run_taken_over_meanwhile_does_not_take_it_back(ws, live_pro
         ws.acquire_run("run-a")  # e.g. run_pipeline's ensure_run after generate_slot acquired it
     assert lease.lost and ws._owns("run-a", "new-owner")
     lease.release()
+
+
+# ---------------------------------------------------------------------------
+# A run's later rounds never bury a person's edit or decision (pipeline safety net)
+# ---------------------------------------------------------------------------
+
+
+def _run_item(ws, run_id="run-h"):
+    ws.create_run(run_id, _brief())
+    item_id = pipeline_item_id(run_id, "linkedin")
+    ws.ensure_item(item_id, "linkedin", "R0", run_id=run_id)
+    return item_id
+
+
+def test_run_round_after_a_human_edit_stays_in_the_history(ws):
+    item_id = _run_item(ws)
+    first = ws.add_run_version(item_id, _draft(title="R0"), run_id="run-h", review=_review(score=60, passed=False))
+    assert first.restored is None and ws.get_item(item_id).item.version == 1  # nothing moved: a normal append
+    human = _draft(title="사람 제목", content="사람 본문").model_copy(update={"change_log": ["사람이 직접 수정함"]})
+    ws.add_version(item_id, human, source="human", run_id="edit-1")
+    ws.set_item_status(item_id, "needs_changes")  # the person also marked it on purpose
+
+    r1 = ws.add_run_version(item_id, _draft(round=1, title="R1"), run_id="run-h")
+    assert (r1.version.version, r1.restored.version, r1.by_human, r1.reason) == (3, 4, True, dbmod.HELD_HUMAN_EDIT)
+    detail = ws.get_item(item_id)
+    current = detail.versions[-1]
+    assert (current.source, current.draft.title, current.draft.content) == ("human", "사람 제목", "사람 본문")
+    assert "사람이 고친 v2 버전" in current.draft.change_log[0] and "R1 결과는 기록에만 남겨요: v3" in current.draft.change_log[0]
+    assert detail.item.title == "사람 제목" and detail.item.status == "needs_changes"  # the person's status stays
+    ws.attach_review(r1.version.id, _review(round=1, score=95), run_id="run-h")  # a review of the kept round
+    assert ws.get_item(item_id).item.status == "needs_changes" and ws.get_item(item_id).item.score is None
+
+    r2 = ws.add_run_version(item_id, _draft(round=2, title="R2"), run_id="run-h")  # the next round is held too
+    assert (r2.version.version, r2.restored.version) == (5, 6)
+    again = ws.get_item(item_id).versions[-1]
+    assert again.draft.title == "사람 제목" and "R2 결과는 기록에만 남겨요: v5" in again.draft.change_log[0]
+    assert again.draft.change_log[1:] == current.draft.change_log[1:] == ["사람이 직접 수정함"]  # replaced, not stacked
+    assert [v.draft.round for v in ws.list_run_versions("run-h", "linkedin")] == [0, 1, 2]  # resume still finds them
+    moved = ws.run_item_superseded("run-h", "linkedin")
+    assert moved == {"version": 5, "current_version": 6, "superseded_by_human_edit": True, "status": "needs_changes"}
+
+
+def test_run_round_keeps_an_approved_or_published_version_current(ws):
+    item_id = _run_item(ws)
+    ws.add_run_version(item_id, _draft(title="R0 승인본"), run_id="run-h", review=_review(score=70, passed=False))
+    ws.set_item_status(item_id, "approved", force=True)  # e.g. approved from the dashboard while a CLI run went on
+    held = ws.add_run_version(item_id, _draft(round=1, title="R1"), run_id="run-h")
+    assert held.restored is not None and not held.by_human and held.reason == dbmod.HELD_STATUS
+    item = ws.get_item(item_id).item
+    assert (item.status, item.approved_version, item.version, item.title) == ("approved", held.restored.version, 3, "R0 승인본")
+    assert item.approval_forced is True and item.approved_score == 70
+    ws.set_item_status(item_id, "published")
+    ws.add_run_version(item_id, _draft(round=2, title="R2"), run_id="run-h")
+    detail = ws.get_item(item_id)
+    assert detail.item.status == "published" and detail.versions[-1].draft.title == "R0 승인본"
+
+
+def test_run_versions_through_add_version_and_upsert_are_protected_too(ws):
+    """Importer-style writes (``add_version`` with the run's own item) and the channel's final copy."""
+    item_id = _run_item(ws)
+    r0, r1 = _draft(round=0, title="R0"), _draft(round=1, title="R1")
+    ws.add_version(item_id, r0, source="agent", run_id="run-h", review=_review(score=90))
+    ws.add_version(item_id, r1, source="agent", run_id="run-h", review=_review(round=1, score=70, passed=False))
+    ws.add_version(item_id, _draft(title="사람 제목"), source="human", run_id="edit-1")
+    result = ChannelResult(channel="linkedin", final=r0, drafts=[r0, r1],
+                           reviews=[_review(score=90), _review(round=1, score=70, passed=False)], passed=True, rounds=1)
+    item = ws.upsert_item_from_result("run-h", result, _brief())  # the best round (R0) is NOT copied on top
+    assert (item.version, item.title) == (3, "사람 제목")
+    r2 = _draft(round=2, title="R2")
+    ws.add_version(item_id, r2, source="agent", run_id="run-h")  # e.g. a re-import with a new round
+    detail = ws.get_item(item_id)
+    assert [(v.source, v.draft.title) for v in detail.versions][-2:] == [("agent", "R2"), ("human", "사람 제목")]
+    other = ws.create_item("linkedin", "실행 없는 콘텐츠")
+    ws.add_version(other.id, _draft(title="사람"), source="human")
+    ws.add_version(other.id, _draft(title="에이전트"), source="agent")  # not a run's own item: unchanged behavior
+    assert ws.get_item(other.id).item.title == "에이전트"
+    assert ws.run_item_superseded("run-none", "linkedin") is None
+
+
+def test_job_version_over_an_approved_edit_keeps_the_approval(ws):
+    item = ws.create_item("linkedin", "제목")
+    ws.add_version(item.id, _draft(title="에이전트 v1"), source="agent", review=_review(score=70, passed=False))
+    ws.add_version(item.id, _draft(title="사람이 고친 제목"), source="human")  # saved while a revise job ran
+    ws.set_item_status(item.id, "approved", force=True)
+    job, restored = ws.add_job_version(item.id, _draft(round=1, title="수정본"), base_version=1, run_id="job-1")
+    current = ws.get_item(item.id).item
+    assert restored is not None and (current.status, current.approved_version) == ("approved", restored.version)
+
+
+def test_cli_round_over_a_running_revise_job_keeps_the_revision_current_with_its_review(tmp_path):
+    """A CLI run (invisible to the server) and a dashboard 수정 요청 on the same item, interleaved at the DB level:
+    the job's revision stays current as a copy on top, and the job's re-review that lands afterwards follows it."""
+    cli, srv = Workspace(tmp_path / "home"), Workspace(tmp_path / "home")
+    try:
+        item_id = _run_item(cli, "run-x")
+        r0 = cli.add_run_version(item_id, _draft(title="R0"), run_id="run-x").version
+        cli.attach_review(r0.id, _review(score=60, passed=False), run_id="run-x")
+        srv.create_run("job-1", _brief(), kind="revise")
+        job, restored = srv.add_job_version(item_id, _draft(round=1, title="수정 요청 결과"), base_version=1, run_id="job-1")
+        assert restored is None and job.version == 2
+
+        held = cli.add_run_version(item_id, _draft(round=1, title="CLI R1"), run_id="run-x")  # before the job's re-review
+        assert (held.version.version, held.restored.version, held.by_human, held.reason) == (3, 4, False, dbmod.HELD_NEWER_VERSION)
+        srv.attach_review(job.id, _review(round=1, score=90), run_id="job-1")  # the job's re-review of its revision
+
+        detail = srv.get_item(item_id)
+        current = detail.versions[-1]
+        assert (current.version, current.draft.content) == (4, job.draft.content)
+        assert current.review is not None and current.review.score == 90  # the copy shows the job's review
+        assert (detail.item.score, detail.item.passed, detail.item.status) == (90, True, "draft")
+        assert srv.version_is_current(item_id, 2) and not srv.version_is_current(item_id, 3)  # for the job's report
+        assert srv.run_item_superseded("run-x", "linkedin") == {
+            "version": 3, "current_version": 4, "superseded_by_human_edit": False, "status": "draft"}
+        cli.attach_review(held.version.id, _review(round=1, score=70, passed=False), run_id="run-x")  # the CLI's own review
+        assert srv.get_item(item_id).versions[-1].review.score == 90 and srv.get_item(item_id).item.score == 90
+        approved = srv.set_item_status(item_id, "approved")  # no "그래도 승인" needed: the current version passed
+        assert approved.approval_forced is False and approved.approved_version == 4
+    finally:
+        cli.close()
+        srv.close()
+
+
+def test_job_that_kept_a_runs_round_current_does_not_hold_the_runs_next_round(ws):
+    """The other way round: a 수정 요청 made from R0 lands after the run's R1, so the job puts R1 back on top.
+    That copy is the run's own text: the run's review follows it and its R2 goes on top as usual."""
+    item_id = _run_item(ws, "run-x")
+    ws.add_run_version(item_id, _draft(title="R0"), run_id="run-x", review=_review(score=60, passed=False))
+    r1 = ws.add_run_version(item_id, _draft(round=1, title="R1"), run_id="run-x").version
+    ws.create_run("job-1", _brief(), kind="revise")
+    job, restored = ws.add_job_version(item_id, _draft(round=1, title="수정 요청 결과"), base_version=1, run_id="job-1")
+    assert (job.version, restored.version, restored.draft.title) == (3, 4, "R1")
+    ws.attach_review(r1.id, _review(round=1, score=75, passed=False), run_id="run-x")
+    assert ws.get_item(item_id).versions[-1].review.score == 75  # the copy of R1 got the run's review
+    assert ws.run_item_superseded("run-x", "linkedin") is None  # the run's text is current
+    r2 = ws.add_run_version(item_id, _draft(round=2, title="R2"), run_id="run-x")
+    assert r2.restored is None and ws.get_item(item_id).item.title == "R2" and ws.get_item(item_id).item.version == 5
+
+
+def test_review_of_a_version_does_not_overwrite_a_copy_reviewed_on_its_own(ws):
+    item = ws.create_item("linkedin", "제목")
+    v1 = ws.add_version(item.id, _draft(title="에이전트 v1"), source="agent")
+    ws.create_run("job-1", _brief(), kind="revise")
+    ws.add_job_version(item.id, _draft(round=1, title="수정본"), base_version=0, run_id="job-1")  # v2 job, v3 = copy of v1
+    current = ws.get_item(item.id).versions[-1]
+    assert current.version == 3 and current.draft.title == "에이전트 v1"
+    ws.attach_review(current.id, _review(score=88), run_id="")  # 재검수 of the current copy
+    ws.attach_review(v1.id, _review(score=40, passed=False), run_id="")  # a late, older review of v1
+    after = ws.get_item(item.id)
+    assert after.versions[-1].review.score == 88 and after.item.score == 88  # the copy keeps its own review
+    assert after.versions[0].review.score == 40

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
 from datetime import date
 
@@ -9,6 +10,7 @@ import pytest
 from fakes import FakeClient, json_text, message
 from insia_agents.backends.anthropic_backend import AnthropicBackend
 from insia_agents.backends.mock_backend import MockBackend, template_calendar
+from insia_agents.db import Workspace
 from insia_agents.models import CalendarSlot, ContentItem, ContentPlan, PlannedSlot, Profile, UsageRecord
 from insia_agents.planner import (
     PlanningError,
@@ -54,6 +56,22 @@ def test_normalize_counts_aliases_and_validation():
     for bad in ({"tiktok": 1}, {"linkedin": -1}, {"linkedin": 1.5}, {"linkedin": True}, {"linkedin": 0}, {}, ["linkedin"]):
         with pytest.raises(PlanningError):
             normalize_counts(bad)  # type: ignore[arg-type]
+
+
+def test_normalize_counts_handles_huge_and_non_finite_numbers_without_crashing():
+    from decimal import Decimal
+    from fractions import Fraction
+
+    from insia_agents.planner import MAX_PER_CHANNEL
+
+    # whole numbers, however large, are clamped (never converted through float(), which overflows for 10**400)
+    assert normalize_counts({"linkedin": 10**400}) == {"linkedin": MAX_PER_CHANNEL}
+    assert normalize_counts({"linkedin": 1e308}) == {"linkedin": MAX_PER_CHANNEL}
+    assert normalize_counts({"linkedin": 3.0, "blog": Decimal("2"), "instagram": Fraction(4, 2)}) == \
+        {"naver_blog": 2, "linkedin": 3, "instagram": 2}
+    for bad in (float("inf"), float("-inf"), float("nan"), 2.5, -(10**400), Decimal("2.5"), Fraction(5, 2), "1e3", "2.5"):
+        with pytest.raises(PlanningError, match="0 이상의 정수"):
+            normalize_counts({"linkedin": bad})
 
 
 def test_cap_counts_explains_every_cap():
@@ -506,3 +524,33 @@ def test_plan_week_works_with_a_backend_that_does_not_take_days(settings):
     week = plan_week(FakeWorkspace(), OldBackend(settings), "주제", *WEEK, {"linkedin": 1, "instagram": 1},
                      profile=PROFILE, history=[], weekend_channels=["instagram"])
     assert {(s.date, s.channel) for s in week.slots} == {("2026-10-09", "linkedin"), ("2026-10-11", "instagram")}
+
+
+def test_mock_calendar_filler_topics_never_loop_forever(settings, tmp_path):
+    """template_calendar spun forever once it needed a 10th filler topic ("…인사이트 1" is inside "…인사이트 10"):
+    a mock POST /api/calendar/plan then held a server thread and a planning place for good (4 of them → 429)."""
+    ws = Workspace(tmp_path / "ws")
+    backend = MockBackend(replace(settings, home=tmp_path / "ws"))
+    results: list[int] = []
+
+    def plan_all() -> None:
+        results.append(len(plan_week(ws, backend, "주말 테스트", "2026-10-05", "2026-10-11",
+                                     {"instagram": 7, "linkedin": 7, "naver_blog": 7}, weekend_channels="all").slots))
+        for start, end in (("2026-10-12", "2026-10-16"), ("2026-10-19", "2026-10-23"), ("2026-10-26", "2026-10-30"),
+                           ("2026-11-02", "2026-11-06")):  # the same theme week after week
+            results.append(len(plan_week(ws, backend, "주간 테마", start, end,
+                                         {"instagram": 5, "linkedin": 5, "naver_blog": 5}).slots))
+        # a past post titled like the theme is inside every filler topic: still returns
+        history = [ContentItem(id="it_old", run_id="r", channel="linkedin", title="주간 테마 인사이트")]
+        results.append(len(plan_week(ws, backend, "주간 테마", "2026-11-09", "2026-11-13",
+                                     {"instagram": 5, "linkedin": 5, "naver_blog": 5}, history=history).slots))
+
+    thread = threading.Thread(target=plan_all, daemon=True)
+    thread.start()
+    thread.join(30)
+    try:
+        assert not thread.is_alive(), f"template_calendar hangs (plans done: {results})"
+        assert results[:5] == [21, 15, 15, 15, 15], results
+        assert len(results) == 6
+    finally:
+        ws.close()

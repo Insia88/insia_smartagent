@@ -280,7 +280,9 @@ location / {
 
 실행마다 그 실행을 돌리는 프로세스(pid·호스트)와 신호(heartbeat, 30초마다 갱신)가 기록됩니다. 서버가 켜질 때, 그리고 `insia run-due`·`insia resume`이 시작할 때 `running`으로 남은 실행 중 **실행하던 프로세스가 없어진 것만** `interrupted`로 바꿉니다: 같은 컴퓨터에서 그 프로세스가 끝났거나, 컴퓨터가 다시 켜졌거나, 신호가 10분 넘게 끊긴 경우입니다. 다른 프로세스(예: cron의 `insia run-due`)가 돌리는 실행은 그대로 두니, 서버를 켜는 시점이 CLI 실행과 겹쳐도 됩니다. 정리된 실행은 이벤트 스트림 끝에 `run.failed`(`data.interrupted: true`, `data.resumable`)가 붙고, 그 실행이 만들던 캘린더 슬롯만 다시 `planned`로 돌아갑니다(이미 있던 초안이 있으면 `drafted` 유지). `pipeline`/`slot`은 [이어서 실행](#post-apirunsidresume)할 수 있고, 작업(review/revise/edit)은 오류 메시지대로 보관함에서 다시 시작합니다.
 
-서버는 켜진 뒤에도 1분마다 다시 확인해서, 시작할 때는 판단할 수 없던 실행도 실행하던 프로세스가 없어지면 다시 켜지 않아도 `interrupted`로 정리합니다. 두 번 연달아 확인했을 때도 신호가 없어야 정리하니, 잠자기에서 깨어난 노트북의 CLI 실행은 신호를 다시 보낼 시간이 있어요. 예를 들어 Docker로 업데이트해서(`docker compose up -d --build`) 컨테이너가 새로 만들어지면, 이전 컨테이너가 돌리던 실행은 다른 컴퓨터의 실행처럼 보여서 바로 정리되지 않고, 마지막 신호에서 10분쯤 지나면 자동으로 `interrupted`가 됩니다(그동안은 `running`으로 보이고, 이어서 실행은 `force: true`로만 됩니다).
+서버는 켜진 뒤에도 1분마다 다시 확인해서, 시작할 때는 판단할 수 없던 실행도 실행하던 프로세스가 없어지면 다시 켜지 않아도 `interrupted`로 정리합니다. 두 번 연달아 확인했을 때도 신호가 없어야 정리하니, 잠자기에서 깨어난 노트북의 CLI 실행은 신호를 다시 보낼 시간이 있어요. [이어서 실행](#post-apirunsidresume)·[중단](#post-apirunsidcancel)·[슬롯 초안 만들기](#post-apicalendarslotgenerate) 요청도 그 실행을 바로 한 번 확인하니, 같은 컴퓨터에서 강제 종료된 CLI 실행은 1분을 기다리지 않고 그 자리에서 정리됩니다.
+
+서버가 멈출 때(Ctrl+C, `docker compose stop`·`down`·업데이트, systemd의 SIGTERM) 도는 실행은 다음 AI 호출 전에 멈추고 `cancelled`로 저장됩니다(최대 20초 기다림, 끝낸 채널은 남고 이어서 실행 가능). 그 20초 안에 끝나지 않은 live 호출이 있거나 프로세스가 강제로 죽으면(`kill -9`, 정전) 실행은 `running`으로 남습니다. 같은 컴퓨터·컨테이너에서 다시 켜면 바로 정리되고, 컨테이너가 새로 만들어진 경우(`docker compose up -d --build`)에는 이전 컨테이너의 실행이 다른 컴퓨터의 실행처럼 보여서 마지막 신호에서 10분쯤 지나 자동으로 `interrupted`가 됩니다(그동안은 `running`으로 보이고, 이어서 실행은 `force: true`로만 됩니다).
 
 실행이 이렇게 정리되거나 다른 곳에서 `force`로 넘겨받으면, 그 실행을 아직 돌리고 있던 원래 프로세스(예: 잠자기에서 깨어난 노트북)는 다음 AI 호출 전에 멈추고, 그 뒤로는 그 실행의 이벤트·상태·버전·검수를 기록하지 않으며 캘린더 슬롯도 건드리지 않습니다. 새 주인이 만드는 중이거나 이미 초안을 연결한 슬롯이 다시 `planned`로 돌아가 같은 초안이 두 번 만들어지는 일은 없어요.
 
@@ -319,7 +321,7 @@ location / {
 
 ### `GET /api/runs`
 
-쿼리: `kind`, `status`, `limit`(1~200, 기본 50). 최신순입니다.
+쿼리: `kind`, `status`, `limit`(1~200, 기본 50), `parent_item_id`(콘텐츠 id `it_…`: 그 콘텐츠에 돌린 작업 — 재검수·수정 요청·직접 수정 — 만, 형식이 틀리면 400). 최신순입니다. CLI에서는 `insia runs list --item <콘텐츠 id>`.
 
 ```json
 {"runs": [{"run_id": "20260928-101039-7073", "kind": "pipeline", "status": "completed", "topic": "예시 주제",
@@ -330,7 +332,7 @@ location / {
            "active": false, "resumable": false}]}
 ```
 
-- `active`: 이 서버 프로세스에서 지금 돌고 있는지. `status`가 `running`인데 `active: false`면 다른 곳(CLI)에서 돌고 있거나 비정상 종료된 실행입니다.
+- `active`: 이 서버 프로세스에서 지금 돌고 있는지. `status`가 `running`인데 `active: false`면 다른 곳(CLI)에서 돌고 있거나, 실행하던 프로그램이 멈췄는데 아직 정리되기 전인 실행입니다.
 - `resumable`: [이어서 실행](#post-apirunsidresume)할 수 있는지. `pipeline`/`slot` 실행이 `interrupted`·`failed`·`cancelled`로 멈췄거나, `completed`인데 결과 콘텐츠가 없는 채널이 있으면 `true`입니다. 대시보드 스튜디오의 **실행 기록**과 실행 바가 이 값으로 "이어서 실행" 버튼을 보여 줍니다.
 - `items`: 채널 → 콘텐츠 id, `scores`: 채널 → 점수. 작업(review/revise)의 대상 콘텐츠는 `parent_item_id`.
 
@@ -368,6 +370,7 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 - 실행이 끝나면(마지막 이벤트가 `run.completed`/`run.failed`) 서버가 연결을 닫습니다. 끝난 실행에서 더 보낼 것이 없으면 `204`를 돌려줘 `EventSource` 재연결을 멈춥니다.
 - **이어서 실행한 실행**은 저장된 스트림 중간에 앞 시도의 종료 이벤트(`run.failed`)가 있습니다. SSE는 이 이벤트를 빼고 보내므로(그 `seq`는 건너뜀) 스트림은 끝까지 이어지고, 클라이언트는 지금처럼 `run.completed`/`run.failed`를 받으면 `EventSource.close()`하면 됩니다. 앞 시도가 멈춘 이유는 `GET /api/runs/<id>`나 저장된 이벤트(`insia` CLI, `events.jsonl`)에서 볼 수 있습니다.
 - CLI 등 다른 프로세스가 같은 워크스페이스에서 돌리는 실행도 이 주소로 따라갈 수 있습니다(0.5초마다 워크스페이스를 확인).
+- 파이프라인 실행의 `run.completed`에는, 실행하는 동안(또는 멈춰 있던 동안) 사람이 콘텐츠를 고쳤거나 승인·게시 예정·게시 완료로 바꿨거나 다른 작업(예: 수정 요청)이 새 버전을 저장한 채널이 있으면 `superseded: true`가 붙습니다. 그중 사람이 저장한 버전이 있으면 `superseded_by_human_edit: true`도 붙고, 채널별 내용은 `superseded_channels: {"<채널>": {"version": 기록에만 남긴 에이전트 버전, "current_version": 현재 버전, "superseded_by_human_edit": bool, "reason": "human_edit" | "status" | "newer_version", "status": 콘텐츠 상태}}`로 옵니다. 그 채널의 에이전트 결과는 버전 기록에만 남고, 그때 현재였던 버전의 내용이 다시 맨 위로 올라갑니다(`change_log` 첫 줄에 이유). 같은 값이 `GET /api/runs/<id>`의 `progress.superseded_channels`에도 저장됩니다.
 - 이벤트가 한동안 없으면 `: ping` 주석 줄을 보냅니다(기본 15초).
 
 ### `POST /api/runs/<id>/resume`
@@ -376,7 +379,8 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 
 요청(모두 선택): `{"force": false, "options": {"speed": 0, "max_cost_usd": 5, "mode": "live"}}`
 
-- `options.max_cost_usd`: 이 실행의 새 예산 상한. 예산 초과로 멈췄다면 상한을 올려서 이어가세요. 안 주면 **그 실행을 시작할 때의 상한**을 그대로 씁니다. 서버 기본값은 시작할 때 상한이 없었거나, 예산 초과로 멈춘 실행인데 서버 기본값이 그 상한보다 높을 때만 씁니다.
+- `options.max_cost_usd`: 이 실행의 새 예산 상한(USD, `0`이면 상한 없음). 예산 초과로 멈췄다면 상한을 올려서 이어가세요. 낮추거나 없앨 수도 있어요. 안 주면 **그 실행을 시작할 때의 상한**을 그대로 씁니다. 서버 기본값은 시작할 때 상한이 없었거나, 예산 초과로 멈춘 실행인데 서버 기본값이 그 상한보다 높을 때만 씁니다.
+- `running`으로 남은 실행은 먼저 실행하던 프로세스를 확인합니다. 그 프로세스가 없어졌으면(같은 컴퓨터에서 종료됨, 컴퓨터 재시작, 신호가 10분 넘게 없음) `interrupted`로 정리한 뒤 바로 이어서 실행합니다. `force`는 필요 없어요.
 - `mode`를 안 주면 원래 실행의 모드를 씁니다(서버 기본값이 `auto`일 때).
 - `force: true`: 다른 곳에서 `running`으로 표시된 실행을 억지로 넘겨받아 이어갑니다. 원래 프로세스가 살아 있으면 다음 AI 호출 전에 멈추고, 이벤트·상태·버전·검수·슬롯을 더는 기록하지 않습니다(그때까지 쓴 비용은 사용량에 남아요). 정말 멈춘 게 확실할 때만 쓰세요(실행하던 프로세스가 없어진 실행은 서버·CLI가 알아서 `interrupted`로 정리합니다).
 - `slot` 실행은 이어서 도는 동안 슬롯을 다시 `generating`으로 잡아 같은 슬롯의 초안이 두 번 만들어지지 않게 하고, 실패하면 슬롯을 원래 상태로 돌려놓습니다. 그사이 다른 실행이 슬롯을 만드는 중이면 이어서 실행하지 않고, 더 나중에 만든 초안이 슬롯에 있으면 슬롯은 그대로 두고 이 실행의 콘텐츠만 끝냅니다.
@@ -388,7 +392,7 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 | 없는 실행 | 404 |
 | review/revise/edit 작업 | 400 |
 | 이 서버에서 이미 실행 중 | 409 |
-| 다른 곳에서 `running`으로 표시됨 | 409 (`"can_force": true`) |
+| 다른 곳에서 아직 실행 중(프로세스가 살아 있음) | 409 (`"can_force": true`, 메시지에 프로세스·마지막 신호와 언제 정리되는지: 같은 컴퓨터의 프로세스면 꺼진 뒤 다시 요청할 때 바로, 다른 컴퓨터·컨테이너면 마지막 신호에서 10분쯤 뒤) |
 | 모든 채널을 이미 마침 | 409 |
 | 이 실행의 콘텐츠에 재검수·수정 요청이 도는 중 | 409 (`run_id`는 그 작업, `item_id`) |
 | 이 실행의 콘텐츠를 사람이 저장하는 중 | 409 (잠시 뒤 다시 시도) |
@@ -399,7 +403,14 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 
 응답 `202`: `{"run_id": "…", "status": "cancelling", "cancel_requested": true, "events_url": "…"}`
 
-오류: 없는 실행 404, 이미 끝난 실행 409(`run_status` 포함), 다른 프로세스의 실행 409.
+재검수·수정 요청·슬롯 초안 작업도 파이프라인 실행과 같은 방식으로 멈춥니다(live 모드에서 AI 호출 재시도를 기다리는 중이어도 바로 멈춰요). 멈춘 슬롯 초안은 `cancelled`(이어서 실행 가능)가 되고 슬롯은 `planned`로 돌아갑니다.
+
+| 오류 | 코드 |
+|---|---|
+| 없는 실행 | 404 |
+| 이미 끝난 실행 | 409 (`run_status`) |
+| 다른 곳(CLI 등)에서 아직 실행 중 | 409 (`"run_status": "running"`) — 그 프로그램에서 멈춰 주세요(Ctrl+C). 언제 정리되는지는 이어서 실행의 409와 같아요 |
+| 실행하던 프로그램이 이미 멈춘 실행 | 409 (`"recovered": true`, `"run_status": "interrupted"`, `resumable`) — 멈출 게 없어서 409지만, 그 자리에서 `interrupted`로 정리했어요(`error`는 "이미 멈춰 있던 실행이에요. …"). `pipeline`/`slot`은 이어서 실행할 수 있어요. 클라이언트는 `recovered`를 보고 오류 대신 안내로 보여 주면 돼요 |
 
 ### `GET /api/runs/<id>/export`
 
@@ -551,7 +562,7 @@ X-Insia-Notes: PNG%20%EB%8C%80%EC%8B%A0%20slides.html%EC%9D%84%20%EB%84%A3%EC%97
 ```
 
 - 파일 이름은 `<YYYY-MM-DD>_<채널>_<제목 슬러그>_v<버전>.<확장자>`이고(예전 버전을 받아도 현재 버전 파일과 이름이 겹치지 않아요), 한글 이름은 `filename*`(RFC 5987)에 있습니다. 대시보드는 `<a href="/api/items/<id>/export?format=…" download>`로 받으면 됩니다(같은 출처라 쿠키 인증도 됩니다).
-- `X-Insia-Notes`: 함께 보여 줄 한국어 안내(예: PNG 대신 slides.html을 넣음, 사업계획서에 팀원 실명이 있음). 여러 줄을 `\n`으로 이은 뒤 퍼센트 인코딩했으니 `decodeURIComponent(value).split("\n")`로 읽으세요. 안내가 없으면 헤더도 없습니다.
+- `X-Insia-Notes`: 함께 보여 줄 한국어 안내(예: PNG 대신 slides.html을 넣음, 사업계획서에 팀원 실명·학교명·직장명이 있음). 여러 줄을 `\n`으로 이은 뒤 퍼센트 인코딩했으니 `decodeURIComponent(value).split("\n")`로 읽으세요. 안내가 없으면 헤더도 없습니다.
 - `?info=1` → `{"filename": "2026-09-28_instagram_데모-…_v2.zip", "content_type": "application/zip", "size": 5175, "notes": ["PNG 대신 slides.html을 넣었어요 — …"]}`
 
 오류: 채널에 없는 형식·없는 버전(400), 없는 콘텐츠(404), python-docx 미설치(501 `{"error": "… pip install \"insia-smartagent[export]\" …", "package": "python-docx", "extra": "export"}`).
@@ -576,28 +587,35 @@ X-Insia-Notes: PNG%20%EB%8C%80%EC%8B%A0%20slides.html%EC%9D%84%20%EB%84%A3%EC%97
 
 ### `POST /api/calendar/plan`
 
-프로필, 주제, 지난 게시물(겹치는 주제 피하기)을 보고 기간 안의 평일에 게시물을 배치해 저장합니다. **동기 요청**이라 계획이 끝나야 응답합니다(live 모드는 수십 초 걸릴 수 있어요).
+프로필, 주제, 지난 게시물(겹치는 주제 피하기)을 보고 기간 안에 게시물을 배치해 저장합니다. 기본은 평일만이고, `weekend_channels`로 채널별로 주말(토·일)도 허용할 수 있어요. **동기 요청**이라 계획이 끝나야 응답합니다(live 모드는 수십 초 걸릴 수 있어요).
 
 요청:
 
 ```json
-{"theme": "AI로 콘텐츠 운영 시간 줄이기", "start": "2026-10-05", "end": "2026-10-09",
- "counts": {"naver_blog": 2, "linkedin": 1, "instagram": 1}, "options": {"mode": "mock"}}
+{"theme": "AI로 콘텐츠 운영 시간 줄이기", "start": "2026-10-05", "end": "2026-10-11",
+ "counts": {"naver_blog": 2, "linkedin": 1, "instagram": 1}, "weekend_channels": ["instagram"],
+ "replace": false, "options": {"mode": "mock"}}
 ```
 
 - `end` 대신 `days`(1~31, 기본 7)를 줄 수 있습니다. 기간은 최대 31일.
-- `counts` 키는 `naver_blog`/`blog`, `linkedin`, `instagram`/`ig`, `bizplan`. 채널마다 하루 한 편까지라 넘치면 줄이고 `notices`로 알려 줍니다.
+- `counts` 키는 `naver_blog`/`blog`, `linkedin`, `instagram`/`ig`, `bizplan`. 채널마다 하루 한 편까지라 넘치면 줄이고 `notices`로 알려 줍니다(주말을 빼서 줄었는지, 이미 계획된 날이 있어서인지 이유도 함께).
+- `weekend_channels`(선택): 주말에도 올릴 채널. 채널 id 목록(`["naver_blog", "instagram"]`, 별칭 `blog`·`ig`도 됨), `"all"`(모든 채널), `"none"`, `true`/`false`, 없으면(`null`) 평일만. 모르는 채널이면 400. 주말 슬롯을 만들면 예정일에 초안이 만들어지도록 `insia run-due` 예약도 매일 돌게 바꿔 주세요(운영 안내 참고).
+- `replace`(선택, 기본 `false`): `true`면 기간 안의 `planned` 슬롯(초안 전)을 먼저 `skipped`로 바꾸고 새로 짭니다(`insia plan-week --replace`와 같음). 입력이 틀리거나, AI 호출이 실패하거나, 계획하는 도중 서버가 꺼지면(Ctrl+C, SIGTERM) 바꾼 슬롯은 다시 `planned`로 돌아가요. 초안을 만드는 중이거나 초안이 있는 슬롯은 건드리지 않습니다. 바꾸기와 되돌리기는 한 번에(한 트랜잭션으로) 하니, 같은 순간 `insia run-due`가 잡은 슬롯을 덮어쓰지 않고, 도중에 실패하면 아무것도 바뀌지 않아요. `insia run-due`도 초안을 만들기 직전에 슬롯 상태를 다시 확인해서, 그사이 건너뜀이 된 슬롯은 만들지 않아요.
+- 같은 기간을 다시 계획해도 겹치지 않습니다: 채널마다 이미 슬롯(`planned`·`generating`·`drafted`)이 있는 날은 비워 두고 나머지 날에만 배치하며, 빈 날이 없으면 AI를 부르지 않고(비용 없음) `notices`로 알려 줍니다. 건너뛴(`skipped`) 슬롯의 날은 다시 쓸 수 있어요.
+- 지난 게시물이나 기존 계획과 주제가 겹치는 슬롯, 새 계획 안에서 서로 겹치는 슬롯은 저장하지 않고 이유별로 `notices`에 적습니다. 그래서 요청한 개수보다 적게 계획될 수 있어요(그때도 `notices`에 나와요).
 
 응답 `201`:
 
 ```json
-{"summary": "2026-10-05~2026-10-09 평일에 네이버 블로그 2편, 링크드인 1편, 인스타그램 1편을 배치했어요. …",
- "slots": [{"id": "sl_…", "date": "2026-10-05", "channel": "instagram", "topic": "…", "status": "planned", "...": "..."}],
- "notices": ["네이버 블로그은(는) 3편을 요청했지만 2편만 계획됐어요."],
- "mode": "mock", "start": "2026-10-05", "end": "2026-10-09"}
+{"summary": "2026-10-05~2026-10-11에 네이버 블로그 2편, 링크드인 1편, 인스타그램 1편을 배치했어요. …",
+ "slots": [{"id": "sl_…", "date": "2026-10-10", "channel": "instagram", "topic": "…", "status": "planned", "...": "..."}],
+ "notices": ["이 기간에 이미 계획된 일정 2개(링크드인 2)가 있어, 같은 채널은 그날을 비워 두고 계획했어요."],
+ "mode": "mock", "start": "2026-10-05", "end": "2026-10-11", "replaced": []}
 ```
 
-오류: 날짜·개수 형식(400), 동시 작업 초과(429), AI 호출 실패(502).
+`replaced`: `replace: true`로 `skipped`가 된 기존 슬롯 id(그때는 `notices` 맨 앞에도 "…건너뜀으로 바꾸고 새로 짰어요"가 붙어요).
+
+오류: 날짜·개수·`weekend_channels` 형식(400), 동시 작업 초과(429), AI 호출 실패(502), 서버를 끄는 중(503 — 서버가 꺼질 때 도는 계획은 최대 20초 기다렸다가, 못 끝내면 저장하지 않고 멈춰요. 기존 계획은 그대로예요).
 
 ### `POST /api/calendar/<slot>/generate`
 
@@ -614,12 +632,13 @@ X-Insia-Notes: PNG%20%EB%8C%80%EC%8B%A0%20slides.html%EC%9D%84%20%EB%84%A3%EC%97
  "slot": {"id": "sl_fbd138f1587d", "status": "generating", "run_id": "20260928-101040-0398", "...": "..."}}
 ```
 
-`item_id`는 미리 정해지는 id라 작업이 끝나면 보관함에서 바로 열 수 있습니다.
+`item_id`는 미리 정해지는 id라 작업이 끝나면 보관함에서 바로 열 수 있습니다. 실행하던 프로그램이 멈춰 `generating`으로 남은 슬롯은 이 요청이 먼저 정리하니(그 실행은 `interrupted`) `force` 없이 다시 만들 수 있어요.
 
 | 오류 | 코드 |
 |---|---|
 | 없는 슬롯 | 404 |
-| 이미 만드는 중 | 409 (`run_id`) |
+| 다른 곳에서 살아 있는 실행이 만드는 중 | 409 (`run_id`) — `force: true`여도 두 번 만들지 않아요 |
+| 방금 끝난 실행이 남긴 `generating`(1분 안) | 409 (`run_id`) — `force: true`로 다시 만들 수 있어요 |
 | 이미 초안이 있음 | 409 (`item_id`, `"can_force": true`) — `force: true`로 다시 만들기 |
 | 건너뛴 슬롯 | 409 (`"can_force": true`) — 먼저 `planned`로 되돌리기 |
 
@@ -684,5 +703,5 @@ except OSError as exc:                         # 포트 사용 중 등
 ```
 
 - `make_server(settings, host="127.0.0.1", port=8765, web_dir=None, heartbeat=15.0, quiet=True, *, token=None, public_hosts=(), trust_proxy=False, workspace=None, max_live=None, max_mock=None)`는 서버 객체만 만듭니다(`serve_forever()`로 시작, `server_close()`로 정리 — 도는 작업을 중단하고 워크스페이스를 닫습니다). 루프백이 아닌 `host`, `public_hosts`, `trust_proxy` 중 하나라도 있는데 토큰이 없으면 `ServerConfigError`입니다. `host`는 IPv6 주소(`::1`, `::`)도 됩니다.
-- `serve()`는 시작 안내(주소, 모드, 워크스페이스, 토큰 여부, 정리한 중단 실행 수)를 출력하고 Ctrl+C까지 돕니다.
+- `serve()`는 시작 안내(주소, 모드, 워크스페이스, 토큰 여부, 정리한 중단 실행 수)를 출력하고 Ctrl+C나 SIGTERM까지 돕니다. SIGTERM(`docker stop`, systemd)도 Ctrl+C와 똑같이 처리해서(`sigterm_as_interrupt()`, 메인 스레드에서만) 도는 실행을 멈추고 저장한 뒤 종료 코드 0으로 끝납니다(`stop_serving()`: 최대 `SHUTDOWN_GRACE` = 20초 기다림). 직접 `serve_forever()`를 돌릴 때도 `with sigterm_as_interrupt():`로 감싸고 끝에 `stop_serving(server)`를 부르면 같아요.
 - 서버가 켜질 때 `running`으로 남은 실행 중 실행하던 프로세스가 없어진 것만 `interrupted`로 정리합니다([실행](#실행) 참고). 같은 워크스페이스에서 CLI 실행(`insia run`, `insia run-due`)이 도는 중에 서버를 켜도 그 실행은 그대로 이어집니다.

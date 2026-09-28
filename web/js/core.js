@@ -71,6 +71,7 @@
         var msg = (j && (j.error || j.detail)) || httpMessage(r.status);
         var err = new Error(msg);
         err.status = r.status;
+        err.data = j || null;  // the JSON body: e.g. a 409's can_force / recovered / run_status
         if (r.status === 401) {
           err.auth = true;
           ws.requireLogin(msg);
@@ -173,6 +174,76 @@
       el('b', { text: String(score) }), '점', el('span', { class: 'sb-verdict', text: passed ? ' 통과' : ' 미통과' })
     ]);
   }
+  /** An approval that skipped the review gate ("그래도 승인") stays on record while the item is approved, scheduled or published. */
+  function isForcedApproval(item) {
+    return !!(item && item.approval_forced && (item.status === 'approved' || item.status === 'scheduled' || item.status === 'published'));
+  }
+  function forcedWhy(item) {
+    var v = Number(item.approved_version) || 0;
+    var score = typeof item.approved_score === 'number' ? item.approved_score + '점, 통과 기준 미달' : '검수 전';
+    return '검수를 통과하지 않은 버전(' + (v ? 'v' + v + ', ' : '') + score + ')을 사람이 그래도 승인했어요';
+  }
+  function forcedBadge(item) {
+    if (!isForcedApproval(item)) return null;
+    var why = forcedWhy(item);
+    return el('span', { class: 'forced-pill', 'data-key': 'forced-approval', title: why }, [
+      el('span', { 'aria-hidden': 'true', text: '!' }), '강제 승인', el('span', { class: 'sr-only', text: ' · ' + why })
+    ]);
+  }
+  ws.isForcedApproval = isForcedApproval;
+  ws.forcedWhy = forcedWhy;
+
+  /**
+   * Korean explanation when a job's or run's result did not become the item's current version because a
+   * person (or another job) saved a version meanwhile (run.completed / JobResult: superseded,
+   * superseded_by_human_edit, version, current_version; pipeline runs: superseded_channels). '' otherwise.
+   */
+  /** run.completed carries the job's version number; a JobResult (GET /api/runs/<id> → job) carries the DraftVersion. */
+  ws.versionNumber = function (v) { return Number(v && typeof v === 'object' ? v.version : v) || 0; };
+  ws.supersededText = function (data) {
+    if (!data || !(data.superseded || data.superseded_by_human_edit)) return '';
+    var who = data.superseded_by_human_edit ? '사람이 고친 버전' : '새 버전';
+    var cur = Number(data.current_version) || 0;
+    var ver = ws.versionNumber(data.version);
+    function num(n) { return n ? '(v' + n + ')' : ''; }  // "버전(v5)이": the particle follows the word, not the number
+    if (data.kind === 'review') {
+      return '검수하는 동안 ' + who + num(cur) + '이 저장됐어요. 이 점수는 검수한 버전' + num(ver) + '에만 붙었고, 현재 버전' + num(cur) +
+        '은 아직 검수 전이에요.';
+    }
+    if (data.kind === 'revise') {
+      return '수정하는 동안 ' + who + '이 저장돼서, 에이전트의 수정 결과는 버전 기록' + num(ver) + '에만 남겼어요. 현재 버전' + num(cur) + '은 ' +
+        (data.superseded_by_human_edit ? '사람이 고친 내용' : '그 새 버전') + ' 그대로예요. 수정 결과를 쓰려면 버전 기록에서 비교한 뒤 직접 옮겨 주세요.';
+    }
+    var chans = data.superseded_channels && typeof data.superseded_channels === 'object' ? Object.keys(data.superseded_channels) : [];
+    var names = chans.map(function (c) { return U.chName(c); }).join(', ');
+    return (names ? names + ': ' : '') + '실행하는 동안 ' + who + '이 있어서, 에이전트 결과는 기록에만 남기고 현재 버전은 그대로 뒀어요. 보관함 버전 기록에서 비교할 수 있어요.';
+  };
+  /** Same draft text from the same source (the change log aside: a copy put back on top starts with a note). */
+  ws.sameVersionText = function (a, b) {
+    if (!a || !b || !a.draft || !b.draft || a.source !== b.source) return false;
+    var x = Object.assign({}, a.draft), y = Object.assign({}, b.draft);
+    delete x.change_log; delete y.change_log;
+    return JSON.stringify(x) === JSON.stringify(y);
+  };
+  /**
+   * Resolves with ws.supersededText(data) once the item confirms it, else ''. A review/revise job can report
+   * "superseded" while its own text is in fact current: a run (e.g. `insia run-due` in a terminal) kept the job's
+   * version current by putting a copy of it on top (same text, change-log note), and the job's review follows the
+   * copy. Pipeline runs are judged by the server already.
+   */
+  ws.confirmKept = function (data, itemId) {
+    var text = ws.supersededText(data);
+    var ver = ws.versionNumber(data && data.version);
+    if (!text || !itemId || !ver || ws.mode !== 'live' || !data || (data.kind !== 'review' && data.kind !== 'revise')) return Promise.resolve(text);
+    return ws.get('/api/items/' + encodeURIComponent(itemId)).then(function (detail) {
+      var vs = (detail && detail.versions) || [];
+      var latest = vs[vs.length - 1];
+      var mine = vs.filter(function (x) { return x.version === ver; })[0];
+      if (latest && mine && (latest.version === mine.version || ws.sameVersionText(latest, mine))) return '';
+      return text;
+    }, function () { return text; });
+  };
+
   function channelIcon(ch, cls) {
     var m = (U.manifest().channels || {})[ch] || {};
     var fallback = function () {
@@ -250,7 +321,7 @@
   }
 
   ws.ui = {
-    statusPill: statusPill, scoreBadge: scoreBadge, channelIcon: channelIcon, viewHead: viewHead, notice: notice,
+    statusPill: statusPill, scoreBadge: scoreBadge, forcedBadge: forcedBadge, channelIcon: channelIcon, viewHead: viewHead, notice: notice,
     cmdBlock: cmdBlock, demoExplainer: demoExplainer, errorState: errorState, loading: loading, toast: toast, focusHeading: focusHeading
   };
 
@@ -291,7 +362,7 @@
 
   function normSpace(t) { return String(t || '').replace(/\s/g, '').toLowerCase(); }
   /** channels.profile_checks: banned words (all), required phrases (SNS only; title + body, not the tag list), blind names (bizplan). */
-  function profileChecks(channel, draft, profile) {
+  function profileChecks(channel, draft, profile, opts) {
     var out = [];
     if (!profile) return out;
     var flat = normSpace(String(draft.title || '') + '\n' + String(draft.content || ''));
@@ -307,9 +378,22 @@
         out.push(chk('required_phrases', '필수 문구 포함', !missing.length, missing.length ? '누락: ' + missing.join(', ') : '모두 포함', '프로필의 필수 문구를 넣음'));
       }
     } else {
-      var names = (profile.team || []).map(function (m) { return String((m && m.name) || '').trim(); }).filter(function (n) { return n.length >= 2; });
+      var team = profile.team || [];
+      var names = team.map(function (m) { return String((m && m.name) || '').trim(); }).filter(function (n) { return n.length >= 2; });
       var exposed = names.filter(function (n) { return flat.indexOf(normSpace(n)) >= 0; });
-      out.push(chk('blind_names', '블라인드(실명 미노출)', !exposed.length, exposed.length ? '실명 ' + exposed.length + '개 노출' : '노출 없음', '팀원 실명은 ○○로 가림'));
+      // The browser only checks team names. School and employer names from the team backgrounds ("카카오 출신",
+      // "고려대 졸업") are matched by the server's rules (prompt_loader.blind_leaks, a large heuristic that is not
+      // ported): the check is marked partial (never "통과") and says where the full verdict comes from — the save
+      // result for an edit, a 재검수 for a saved version (opts.saved).
+      var backgrounds = team.some(function (m) { return String((m && m.background) || '').trim(); });
+      var value = exposed.length ? '실명 ' + exposed.length + '개 노출' : backgrounds ? '실명 노출 없음' : '노출 없음';
+      var c = chk('blind_names', '블라인드(실명 미노출)', !exposed.length, value, '팀원 실명은 ○○로 가림');
+      if (backgrounds && !exposed.length) {
+        c.partial = true;
+        c.note = '팀 배경의 학교·직장명 노출은 아직 확인 전이에요 (브라우저는 팀원 실명만 확인해요). ' +
+          (opts && opts.saved ? '재검수하면 서버가 확인해요.' : '저장하면 서버가 확인해서 결과를 보여 줘요.');
+      }
+      out.push(c);
     }
     return out;
   }
@@ -317,9 +401,11 @@
   /**
    * Same checks and units as channels.check_format: 공백 제외 for bizplan/naver_blog content,
    * 공백 포함 for linkedin and the instagram caption, plus the company-profile brand checks
-   * when `profile` is given. Returns FormatCheck-shaped objects.
+   * when `profile` is given. Returns FormatCheck-shaped objects; a check the browser can only do in part
+   * (the bizplan blind rule's school/employer names) has `partial: true` and a Korean `note`.
+   * opts.saved: the draft is an already saved version (the note then points to 재검수, not to saving).
    */
-  function measure(channel, draft, brief, profile) {
+  function measure(channel, draft, brief, profile, opts) {
     var content = String(draft.content || '');
     var tags = (draft.hashtags || []).filter(function (x) { return String(x).trim(); });
     var L = LIMITS[channel];
@@ -368,7 +454,7 @@
       out.push(chk('hook_length', '캡션 첫 줄 길이', ch > 0 && ch <= L.maxHook, ch + '자', L.maxHook + '자 이하'));
       out.push(chk('hashtags', '해시태그 수', inRange(tags.length, L.minTags, L.maxTags), tags.length + '개', L.minTags + '~' + L.maxTags + '개'));
     }
-    return out.concat(profileChecks(channel, draft, profile));
+    return out.concat(profileChecks(channel, draft, profile, opts));
   }
   ws.measure = measure;
 
@@ -503,16 +589,22 @@
         var ch = chans && chans.length === 1 ? state.channels[chans[0]] : null;
         var result = ch && typeof ch.score === 'number' ? ' · ' + ch.score + '점 ' + (ch.passed ? '통과' : '미통과') : '';
         var why = ev && ev.data && ev.data.error ? ev.data.error : '';
-        showBanner(banner, ok ? 'done' : 'failed', [
-          el('b', { text: (opts.label || '작업') + (ok ? ' 완료' : ' 실패') }),
-          ok ? result + ' · 결과는 보관함에 저장됐어요.' : ' · ' + (why || '원인을 알 수 없어요'),
-          itemId ? el('a', { class: 'btn btn--small', href: '#/library/' + encodeURIComponent(itemId), text: '보관함에서 보기' }) : null,
-          el('button', { type: 'button', class: 'btn btn--small btn--ghost', text: '닫기', onclick: function () { banner.hidden = true; } })
-        ]);
-        toast((opts.label || '작업') + (ok ? ' 완료' + result : ' 실패'), ok ? 'success' : 'error');
-        jobListeners.forEach(function (fn) {
-          try { fn({ runId: runId, itemId: itemId, slotId: opts.slotId || '', ok: ok, state: state, event: ev }); } catch (e) { if (window.console) console.warn(e); }
-        });
+        function finish(kept) {
+          showBanner(banner, ok ? 'done' : 'failed', [
+            el('b', { text: (opts.label || '작업') + (ok ? ' 완료' : ' 실패') }),
+            ok ? result + ' · 결과는 보관함에 저장됐어요.' : ' · ' + (why || '원인을 알 수 없어요'),
+            kept ? el('span', { class: 'jb-kept', 'data-key': 'job-kept', text: ' ' + kept }) : null,
+            itemId ? el('a', { class: 'btn btn--small', href: '#/library/' + encodeURIComponent(itemId), text: '보관함에서 보기' }) : null,
+            el('button', { type: 'button', class: 'btn btn--small btn--ghost', text: '닫기', onclick: function () { banner.hidden = true; } })
+          ]);
+          toast((opts.label || '작업') + (ok ? ' 완료' + result : ' 실패') + (kept ? ' · 에이전트 결과는 기록에만 남았어요' : ''),
+            ok ? (kept ? 'info' : 'success') : 'error');
+          jobListeners.forEach(function (fn) {
+            try { fn({ runId: runId, itemId: itemId, slotId: opts.slotId || '', ok: ok, state: state, event: ev, kept: kept }); } catch (e) { if (window.console) console.warn(e); }
+          });
+        }
+        if (ok) ws.confirmKept(ev.data, itemId).then(finish);
+        else finish('');
       }
     });
     if (opts.goStudio) ws.go('studio');

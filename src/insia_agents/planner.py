@@ -21,6 +21,7 @@ day in it.
 from __future__ import annotations
 
 import inspect
+import math
 import re
 from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
@@ -174,14 +175,20 @@ def normalize_counts(counts: Mapping[str, Any]) -> dict[ChannelId, int]:
     merged: dict[str, int] = {}
     for raw_key, raw_value in counts.items():
         channel = _channel_key(raw_key)
+        invalid = PlanningError(f"{CHANNELS[channel].label} 개수는 0 이상의 정수여야 해요.")
         if isinstance(raw_value, bool):
-            raise PlanningError(f"{CHANNELS[channel].label} 개수는 0 이상의 정수여야 해요.")
+            raise invalid
         try:
             value = int(raw_value)
-        except (TypeError, ValueError):
-            raise PlanningError(f"{CHANNELS[channel].label} 개수는 0 이상의 정수여야 해요.") from None
-        if value < 0 or value != float(raw_value):
-            raise PlanningError(f"{CHANNELS[channel].label} 개수는 0 이상의 정수여야 해요.")
+        except (TypeError, ValueError, OverflowError):  # OverflowError: int(float('inf'))
+            raise invalid from None
+        # exact checks only: a huge int (10**400) must never go through float(), which overflows
+        if isinstance(raw_value, float) and (not math.isfinite(raw_value) or not raw_value.is_integer()):
+            raise invalid
+        if not isinstance(raw_value, (str, bytes, int, float)) and value != raw_value:  # Decimal("2.5"), Fraction
+            raise invalid
+        if value < 0:
+            raise invalid
         merged[channel] = merged.get(channel, 0) + value
     result = {c: min(merged[c], MAX_PER_CHANNEL) for c in ALL_CHANNELS if merged.get(c, 0) > 0}
     if not result:

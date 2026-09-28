@@ -5,19 +5,23 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
 import zipfile
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 import pytest
 
+from insia_agents import db as dbmod
 from insia_agents import server as server_module
-from insia_agents.db import Workspace, pipeline_item_id
+from insia_agents.db import Workspace, WorkspaceError, pipeline_item_id
 from insia_agents.exporters import capabilities
-from insia_agents.models import Brief
+from insia_agents.models import Brief, PlannedSlot
 from insia_agents.server import COOKIE_NAME, LoginLimiter, ServerConfigError, client_key, make_server
 
 TOKEN = "unit-test-token-0123456789"
@@ -1060,3 +1064,428 @@ def test_port_in_use_raises_oserror_without_a_cleanup_traceback(srv, settings, c
         with pytest.raises(OSError):
             make_server(other, host="127.0.0.1", port=srv.server_address[1])
     assert not [r for r in caplog.records if "작업 정리" in r.getMessage()]
+
+
+# ---------------------------------------------------------------------------
+# P3 integration: stale-run takeover from the API, resume caps, jobs by item, cancellable jobs, weekend plans
+# ---------------------------------------------------------------------------
+
+
+def _dead_pid() -> int:
+    return int(subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True, text=True,
+                              check=True).stdout)
+
+
+def _owned_by(ws, run_id, pid):
+    """Make ``run_id`` look like another process on this machine is (or was) running it."""
+    beat = dbmod.utc_now()
+    with ws._tx() as conn:
+        conn.execute("UPDATE runs SET owner_pid = ?, owner_host = ?, owner_boot = ?, owner_token = 'elsewhere', "
+                     "heartbeat_at = ?, updated_at = ? WHERE id = ?", (pid, dbmod.this_host(), dbmod.boot_marker(), beat, beat,
+                                                                      run_id))
+
+
+@pytest.fixture
+def live_process():
+    proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
+    yield proc.pid
+    proc.stdin.close()
+    proc.wait(timeout=10)
+
+
+def _started_budgets(srv, run_id):
+    return [e["data"].get("budget_usd") for e in srv.manager.workspace.list_events(run_id) if e["type"] == "run.started"]
+
+
+def test_resume_options_max_cost_usd_is_the_runs_new_cap(servers, settings):
+    """options.max_cost_usd on POST resume sets the run's cap (0 = none); without it the run keeps its own."""
+    ws = Workspace(settings.home)
+    try:
+        for suffix in ("0001", "0002", "0003"):
+            ws.create_run(f"20260928-030000-{suffix}", Brief(topic="예산 이어서", channels=["linkedin"]), kind="pipeline",
+                          options={"max_rounds": 1, "pass_score": 80, "max_cost_usd": 0.6}, mode="mock", model="mock")
+    finally:
+        ws.close()
+    srv = servers(replace(settings, max_cost_usd=2.0))
+    assert srv.manager.interrupted_on_start == 3
+    for suffix, options, cap in (("0001", {"max_cost_usd": 5}, 5.0), ("0002", {}, 0.6), ("0003", {"max_cost_usd": 0}, None)):
+        run_id = f"20260928-030000-{suffix}"
+        ok(srv, "POST", f"/api/runs/{run_id}/resume", {"options": {"speed": 0, **options}}, status=202)
+        assert wait_run(srv, run_id)["status"] == "completed"
+        assert _started_budgets(srv, run_id)[-1] == cap, (options, _started_budgets(srv, run_id))
+        stored = srv.manager.workspace.get_run(run_id)["options"]["max_cost_usd"]
+        assert stored == (cap or 0.0), (options, stored)
+
+
+def test_resume_and_cancel_take_over_a_run_whose_process_died(srv):
+    """A killed CLI run is cleaned up by the request itself: no restart, no force (lead notes 2 and 3)."""
+    ws = srv.manager.workspace
+    brief = Brief(topic="죽은 CLI 실행", channels=["linkedin"])
+    for run_id, kind in (("20260928-040000-dead", "pipeline"), ("20260928-040001-gone", "pipeline"),
+                         ("20260928-040002-jobx", "review")):
+        ws.create_run(run_id, brief, kind=kind, mode="mock", model="mock")
+        _owned_by(ws, run_id, _dead_pid())
+
+    resumed = ok(srv, "POST", "/api/runs/20260928-040000-dead/resume", {"options": {"speed": 0}}, status=202)
+    assert resumed["resumed"] is True and wait_run(srv, "20260928-040000-dead")["status"] == "completed"
+    types = [e["type"] for e in ws.list_events("20260928-040000-dead")]
+    assert types.count("run.failed") == 1 and types[-1] == "run.completed"  # closed as interrupted, then resumed
+
+    resp, data = request(srv, "POST", "/api/runs/20260928-040001-gone/cancel", {})
+    assert resp.status == 409 and data["recovered"] is True and data["run_status"] == "interrupted", data
+    assert data["resumable"] is True and "이어서 실행" in data["error"] and "다시 시작" not in data["error"]
+    # reads right on its own and after the dashboard's "멈추지 못했어요: " (it was already stopped, not a failure)
+    assert data["error"].startswith("이미 멈춰 있던 실행이에요.") and "정리했어요" in data["error"]
+    detail = ok(srv, "GET", "/api/runs/20260928-040001-gone")
+    assert detail["status"] == "interrupted" and detail["resumable"] is True
+
+    resp, data = request(srv, "POST", "/api/runs/20260928-040002-jobx/cancel", {})
+    assert resp.status == 409 and data["recovered"] is True and data["resumable"] is False
+    assert "보관함에서 같은 작업을 다시 시작" in data["error"]
+
+
+def test_resume_and_cancel_of_a_run_alive_elsewhere_explain_without_restart_advice(srv, live_process):
+    """409s name the owner and say when the run gets cleaned up: a process on this machine right after it exits
+    (checked by pid on the next click), another machine/container only ~10 minutes after its last heartbeat."""
+    ws = srv.manager.workspace
+    ws.create_run("20260928-050000-live", Brief(topic="살아 있는 CLI 실행", channels=["linkedin"]), kind="pipeline",
+                  mode="mock", model="mock")
+    _owned_by(ws, "20260928-050000-live", live_process)
+    resp, data = request(srv, "POST", "/api/runs/20260928-050000-live/resume", {"options": {"speed": 0}})
+    assert resp.status == 409 and data["can_force"] is True, data
+    assert f"프로세스 {live_process}" in data["error"] and "force: true" in data["error"]
+    assert "서버를 다시 시작" not in data["error"]
+    assert "꺼지면 다시 누를 때 바로" in data["error"] and "10분" not in data["error"], data["error"]
+    resp, data = request(srv, "POST", "/api/runs/20260928-050000-live/cancel", {})
+    assert resp.status == 409 and "다른 곳(CLI 등)에서 실행 중이에요" in data["error"] and data["run_status"] == "running"
+    assert "서버를 다시 시작" not in data["error"]
+    assert "꺼지면 다시 누를 때 바로" in data["error"] and "10분" not in data["error"], data["error"]
+    assert ws.get_run("20260928-050000-live")["status"] == "running"  # a live owner is never taken over
+
+    # another machine/container: only its heartbeat can tell, so the 10-minute hint is the right one
+    ws.create_run("20260928-050001-away", Brief(topic="다른 컨테이너 실행", channels=["linkedin"]), kind="review",
+                  mode="mock", model="mock")
+    _owned_by(ws, "20260928-050001-away", live_process)
+    with ws._tx() as conn:
+        conn.execute("UPDATE runs SET owner_host = 'old-container' WHERE id = '20260928-050001-away'")
+    resp, data = request(srv, "POST", "/api/runs/20260928-050001-away/cancel", {})
+    assert resp.status == 409 and "다른 컴퓨터·컨테이너(old-container)" in data["error"], data
+    assert "10분쯤 지나" in data["error"] and "꺼지면 다시 누를 때" not in data["error"]
+    assert "보관함에서 같은 작업을 다시 시작" in data["error"]  # a review job is started again, not resumed
+    assert ws.get_run("20260928-050001-away")["status"] == "running"
+
+
+def _generating_slot(ws, run_id, pid, day="2026-10-06", channel="linkedin"):
+    slot = ws.add_slots([PlannedSlot(date=day, channel=channel, topic=f"{run_id} 슬롯", angle="사례", keywords=["AI"],
+                                     goal="인지")])[0]
+    ws.create_run(run_id, Brief(topic=slot.topic, channels=[channel]), kind="slot", options={"slot_id": slot.id},
+                  mode="mock", model="mock")
+    ws.claim_slot(slot.id, run_id)
+    _owned_by(ws, run_id, pid)
+    return slot
+
+
+def test_generate_slot_recovers_a_dead_runs_slot_and_never_doubles_a_live_one(srv, live_process):
+    ws = srv.manager.workspace
+    stuck = _generating_slot(ws, "20260928-060000-dead", _dead_pid())
+    started = ok(srv, "POST", f"/api/calendar/{stuck.id}/generate", {"options": {"speed": 0}}, status=201)  # no force
+    assert wait_run(srv, started["run_id"])["status"] == "completed"
+    assert ws.get_run("20260928-060000-dead")["status"] == "interrupted"
+    assert ws.get_slot(stuck.id).status == "drafted" and ws.get_slot(stuck.id).run_id == started["run_id"]
+
+    busy = _generating_slot(ws, "20260928-060001-live", live_process, day="2026-10-07")
+    for body in ({}, {"force": True}):
+        resp, data = request(srv, "POST", f"/api/calendar/{busy.id}/generate", {**body, "options": {"speed": 0}})
+        assert resp.status == 409 and data["run_id"] == "20260928-060001-live", (body, data)
+    assert "다른 실행(20260928-060001-live)" in data["error"]
+    assert ws.get_slot(busy.id).status == "generating" and ws.get_slot(busy.id).run_id == "20260928-060001-live"
+    assert [r["run_id"] for r in ok(srv, "GET", "/api/runs?kind=slot")["runs"]].count("20260928-060001-live") == 1
+
+
+def test_runs_can_be_listed_by_content_item(srv):
+    run_id, _ = finished_run(srv, ("linkedin", "instagram"))
+    item_id, other_id = pipeline_item_id(run_id, "linkedin"), pipeline_item_id(run_id, "instagram")
+    review = ok(srv, "POST", f"/api/items/{item_id}/review", {"options": {"speed": 0}}, status=201)
+    wait_run(srv, review["run_id"])
+    ok(srv, "PUT", f"/api/items/{item_id}/draft", {"title": "사람이 고친 제목", "content": "사람이 고친 본문이에요. " * 5})
+    rows = ok(srv, "GET", f"/api/runs?parent_item_id={item_id}")["runs"]
+    assert {r["kind"] for r in rows} == {"review", "edit"} and all(r["parent_item_id"] == item_id for r in rows)
+    assert run_id not in [r["run_id"] for r in rows]
+    assert ok(srv, "GET", f"/api/runs?parent_item_id={other_id}")["runs"] == []
+    assert [r["kind"] for r in ok(srv, "GET", f"/api/runs?parent_item_id={item_id}&kind=review")["runs"]] == ["review"]
+    for bad in ("x", "it_", "it_a/b", "it_" + "a" * 121, "../it_a"):
+        resp, data = request(srv, "GET", "/api/runs?parent_item_id=" + urllib.parse.quote(bad))
+        assert resp.status == 400 and "parent_item_id" in data["error"], bad
+
+    # a job that has not written its run row yet (pending in memory) is filtered by its item too
+    pending = server_module.RunRecord(run_id="20260928-070000-pend", kind="revise", bus=server_module.EventBus("x"),
+                                      mode="mock", model="mock", item_id=item_id)
+    with srv.manager._lock:
+        srv.manager._active[pending.run_id] = pending
+    try:
+        mine = [r["run_id"] for r in srv.manager.list(parent_item_id=item_id)]
+        assert mine[0] == pending.run_id and pending.run_id not in [r["run_id"] for r in srv.manager.list(parent_item_id=other_id)]
+    finally:
+        with srv.manager._lock:
+            srv.manager._active.pop(pending.run_id, None)
+
+
+def test_item_and_slot_jobs_are_cancelled_through_their_runner(srv, monkeypatch):
+    """Jobs get the same cancellable runner as pipeline runs (F12b): the cancel endpoint reaches the job's own
+    runner, which is what stops a live job's retry waits and parallel steps; a cancelled slot run ends 'cancelled'."""
+    from insia_agents import actions
+
+    handed: dict[str, object] = {}
+
+    def spy(name):
+        real = getattr(actions, name)
+
+        def wrapper(*args, **kwargs):
+            handed[name] = kwargs.get("runner")
+            return real(*args, **kwargs)
+
+        return wrapper
+
+    for name in ("generate_slot", "review_item", "revise_item"):
+        monkeypatch.setattr(actions, name, spy(name))
+    plan = ok(srv, "POST", "/api/calendar/plan", {"start": "2026-10-05", "days": 5, "counts": {"linkedin": 1}}, status=201)
+    slot_id = plan["slots"][0]["id"]
+    started = ok(srv, "POST", f"/api/calendar/{slot_id}/generate", {"options": {"speed": 1}}, status=201)  # slow
+    record = srv.manager.get(started["run_id"])
+    assert isinstance(record.runner, server_module.CancellableSimRunner) and not record.runner.cancelled
+    time.sleep(0.3)
+    ok(srv, "POST", started["cancel_url"], {}, status=202)
+    begun = time.monotonic()
+    detail = wait_run(srv, started["run_id"])
+    assert detail["status"] == "cancelled" and detail["resumable"] is True and time.monotonic() - begun < 10, detail
+    assert handed["generate_slot"] is record.runner and record.runner.cancelled
+    assert srv.manager.workspace.get_slot(slot_id).status == "planned"
+
+    run_id, _ = finished_run(srv)
+    item_id = pipeline_item_id(run_id, "linkedin")
+    for job, body, action in (("review", {}, "review_item"), ("revise", {"instructions": "짧게"}, "revise_item")):
+        created = ok(srv, "POST", f"/api/items/{item_id}/{job}", {**body, "options": {"speed": 1}}, status=201)
+        record = srv.manager.get(created["run_id"])
+        ok(srv, "POST", created["cancel_url"], {}, status=202)
+        assert wait_run(srv, created["run_id"])["status"] == "cancelled", job
+        assert handed[action] is record.runner and record.runner.cancelled, job
+
+
+def test_calendar_plan_weekend_channels(srv):
+    body = {"theme": "주말 운영 점검", "start": "2026-10-05", "days": 7, "counts": {"instagram": 7, "linkedin": 7}}
+    weekdays = ok(srv, "POST", "/api/calendar/plan", body, status=201)
+    assert len(weekdays["slots"]) == 10 and all(date.fromisoformat(s["date"]).weekday() < 5 for s in weekdays["slots"])
+    assert any("주말" in n for n in weekdays["notices"]) and weekdays["replaced"] == []
+    weekend = ok(srv, "POST", "/api/calendar/plan", {**body, "theme": "평일 마케팅 루틴", "start": "2026-10-12",
+                                                     "weekend_channels": ["ig"]}, status=201)
+    days = {(s["channel"], date.fromisoformat(s["date"]).weekday()) for s in weekend["slots"]}
+    assert ("instagram", 5) in days and ("instagram", 6) in days and not {("linkedin", 5), ("linkedin", 6)} & days
+    everything = ok(srv, "POST", "/api/calendar/plan", {**body, "theme": "고객 인터뷰 방법", "start": "2026-10-19",
+                                                        "weekend_channels": "all"}, status=201)
+    assert len(everything["slots"]) == 14
+    for value in (["tiktok"], "tiktok", 3, {"instagram": True}, ["x"] * 21, [1]):
+        resp, data = request(srv, "POST", "/api/calendar/plan", {**body, "start": "2026-10-26", "weekend_channels": value})
+        assert resp.status == 400 and data["error"], value
+    assert ok(srv, "GET", "/api/calendar?from=2026-10-26&to=2026-11-01")["slots"] == []
+
+
+def test_calendar_plan_replace_skips_planned_slots_and_puts_them_back_when_planning_fails(srv, monkeypatch):
+    from insia_agents.backends.base import BackendError
+    from insia_agents.backends.mock_backend import MockBackend
+
+    week = {"start": "2026-10-05", "days": 7}
+    first = ok(srv, "POST", "/api/calendar/plan", {**week, "counts": {"linkedin": 2}}, status=201)
+    old_ids = {s["id"] for s in first["slots"]}
+
+    def statuses():
+        return {s["id"]: s["status"] for s in ok(srv, "GET", "/api/calendar?from=2026-10-05&to=2026-10-11")["slots"]}
+
+    # bad input: nothing is touched
+    resp, _ = request(srv, "POST", "/api/calendar/plan", {**week, "counts": {"linkedin": 1}, "replace": True,
+                                                          "weekend_channels": ["tiktok"]})
+    assert resp.status == 400 and statuses() == {i: "planned" for i in old_ids}
+    resp, _ = request(srv, "POST", "/api/calendar/plan", {**week, "counts": {"linkedin": 1}, "replace": "yes"})
+    assert resp.status == 400 and statuses() == {i: "planned" for i in old_ids}
+
+    def broken(self, *args, **kwargs):
+        raise BackendError("AI 호출에 실패했어요 (테스트)")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(MockBackend, "plan_calendar", broken)
+        resp, data = request(srv, "POST", "/api/calendar/plan", {**week, "counts": {"linkedin": 1}, "replace": True})
+    assert resp.status == 502 and statuses() == {i: "planned" for i in old_ids}, data  # put back
+
+    replaced = ok(srv, "POST", "/api/calendar/plan", {**week, "counts": {"linkedin": 1}, "replace": True}, status=201)
+    assert set(replaced["replaced"]) == old_ids and "건너뜀으로 바꾸고" in replaced["notices"][0]
+    now = statuses()
+    assert all(now[i] == "skipped" for i in old_ids) and [s["status"] for s in replaced["slots"]] == ["planned"]
+
+
+def _planned_slots(ws, *days, channel="linkedin"):
+    return ws.add_slots([PlannedSlot(date=day, channel=channel, topic=f"{day} 기존 계획", angle="사례", keywords=["AI"],
+                                     goal="인지") for day in days])
+
+
+def test_replace_never_overwrites_a_slot_another_process_claims_at_that_moment(settings):
+    """--replace / replace: true checks and marks slots in one transaction, so a cron run-due claiming a slot right
+    then never ends up generating a slot the re-plan set aside: its claim waits for the transaction and is then
+    refused (the slot is 'skipped'), with no run left behind. A claim that lands first keeps its slot."""
+    ws = Workspace(settings.home)
+    other = Workspace(settings.home)  # another process's connection (a cron `insia run-due`)
+    try:
+        first, second = _planned_slots(ws, "2026-10-05", "2026-10-06")
+        errors: list[Exception] = []
+
+        def claim() -> None:
+            try:
+                other.claim_slot(first.id, "20260928-080000-cron")
+            except WorkspaceError as exc:
+                errors.append(exc)
+
+        claimer = threading.Thread(target=claim)
+        real_list = ws.list_slots
+
+        def list_then_claim(**kwargs):
+            listed = real_list(**kwargs)
+            claimer.start()
+            claimer.join(0.3)  # without one transaction the claim lands here, between the check and the change
+            return listed
+
+        ws.list_slots = list_then_claim
+        replacement = server_module.PlannedSlotReplacement(ws, "2026-10-05", "2026-10-11")
+        try:
+            replacement.mark()
+        finally:
+            del ws.list_slots
+        claimer.join(10)
+        assert not claimer.is_alive()
+        assert len(errors) == 1 and "건너뛰기" in str(errors[0])  # the claim came after the re-plan's change
+        assert [ws.get_slot(s.id).status for s in (first, second)] == ["skipped", "skipped"]
+        assert ws.get_slot(first.id).run_id == ""
+        assert sorted(replacement.restore()) == sorted([first.id, second.id])
+        assert [ws.get_slot(s.id).status for s in (first, second)] == ["planned", "planned"]
+        assert replacement.restore() == []  # once
+
+        # a claim that lands before the re-plan keeps its slot: marking leaves it alone, restoring too
+        ws.create_run("20260928-080001-cron", Brief(topic="cron", channels=["linkedin"]), kind="slot", mode="mock",
+                      model="mock")
+        other.claim_slot(first.id, "20260928-080001-cron")
+        again = server_module.PlannedSlotReplacement(ws, "2026-10-05", "2026-10-11")
+        again.mark()
+        claimed = ws.get_slot(first.id)
+        assert (claimed.status, claimed.run_id) == ("generating", "20260928-080001-cron")
+        assert ws.get_slot(second.id).status == "skipped"
+        assert again.restore() == [second.id]
+        assert ws.get_slot(first.id).status == "generating" and ws.get_slot(second.id).status == "planned"
+    finally:
+        other.close()
+        ws.close()
+
+
+def test_replace_changes_nothing_when_marking_fails_half_way(settings):
+    import sqlite3
+
+    ws = Workspace(settings.home)
+    try:
+        slots = _planned_slots(ws, "2026-10-05", "2026-10-06", "2026-10-07")
+        real_update = ws.update_slot
+        calls = []
+
+        def locked_on_the_second(slot_id, **fields):
+            calls.append(slot_id)
+            if len(calls) == 2:
+                raise sqlite3.OperationalError("database is locked")
+            return real_update(slot_id, **fields)
+
+        ws.update_slot = locked_on_the_second
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                with server_module.replacing_planned_slots(ws, "2026-10-05", "2026-10-11"):
+                    pytest.fail("the new plan must not start when setting the old one aside failed")
+        finally:
+            del ws.update_slot
+        assert len(calls) == 2 and [ws.get_slot(s.id).status for s in slots] == ["planned"] * 3
+    finally:
+        ws.close()
+
+
+def _slow_mock_plan(monkeypatch):
+    """MockBackend.plan_calendar waits like a live call still in flight: returns (entered, release)."""
+    from insia_agents.backends.mock_backend import MockBackend
+
+    entered, release = threading.Event(), threading.Event()
+    real_plan = MockBackend.plan_calendar
+
+    def slow_plan(self, *args, **kwargs):
+        entered.set()
+        release.wait(20)
+        return real_plan(self, *args, **kwargs)
+
+    monkeypatch.setattr(MockBackend, "plan_calendar", slow_plan)
+    return entered, release
+
+
+def _plan_in_thread(manager, outcome, theme="종료 중 계획"):
+    def plan():
+        try:
+            outcome["plan"] = manager.plan_week(theme, "2026-10-05", "2026-10-11", {"linkedin": 2}, {"mode": "mock"},
+                                                replace=True)
+        except server_module.RequestError as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=plan, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_shutdown_during_a_plan_puts_the_set_aside_slots_back_and_saves_nothing(settings, monkeypatch):
+    """A plan still waiting on the AI when the server stops (Ctrl+C, SIGTERM) runs in a request thread that dies
+    with the process: shutdown waits the grace period, then stops the plan and puts back what replace set aside."""
+    ws = Workspace(settings.home)
+    manager = server_module.RunManager(settings, workspace=ws, recover=False)
+    entered, release = _slow_mock_plan(monkeypatch)
+    try:
+        old = _planned_slots(ws, "2026-10-05", "2026-10-06")
+        outcome: dict = {}
+        thread = _plan_in_thread(manager, outcome)
+        assert entered.wait(10)
+        assert {ws.get_slot(s.id).status for s in old} == {"skipped"} and manager.planning_count() == 1
+        begun = time.monotonic()
+        manager.shutdown(timeout=0.3)
+        assert time.monotonic() - begun < 5
+        assert {ws.get_slot(s.id).status for s in old} == {"planned"}  # back before the process would exit
+        release.set()  # the AI answers after all: the plan is not saved
+        thread.join(10)
+        assert outcome["error"].status == 503 and "기존 계획은 그대로" in outcome["error"].message, outcome
+        assert sorted((s.id, s.status) for s in ws.list_slots()) == sorted((s.id, "planned") for s in old)
+        with pytest.raises(server_module.RequestError) as refused:  # no new plan once closing
+            manager.plan_week("늦은 계획", "2026-10-12", "2026-10-18", {"linkedin": 1}, {"mode": "mock"})
+        assert refused.value.status == 503 and manager.planning_count() == 0
+    finally:
+        release.set()
+        ws.close()
+
+
+def test_shutdown_lets_a_plan_that_answers_in_time_save(settings, monkeypatch):
+    ws = Workspace(settings.home)
+    manager = server_module.RunManager(settings, workspace=ws, recover=False)
+    entered, release = _slow_mock_plan(monkeypatch)
+    try:
+        old = _planned_slots(ws, "2026-10-05", "2026-10-06")
+        outcome: dict = {}
+        thread = _plan_in_thread(manager, outcome, theme="제시간에 끝나는 계획")
+        assert entered.wait(10)
+        stopper = threading.Thread(target=manager.shutdown, kwargs={"timeout": 10}, daemon=True)
+        stopper.start()
+        time.sleep(0.2)
+        assert stopper.is_alive()  # waiting for the plan
+        release.set()
+        stopper.join(10)
+        thread.join(10)
+        plan, mode, replaced = outcome["plan"]
+        assert mode == "mock" and sorted(replaced) == sorted(s.id for s in old) and len(plan.slots) == 2
+        assert {ws.get_slot(s.id).status for s in old} == {"skipped"}
+        assert {ws.get_slot(s.id).status for s in plan.slots} == {"planned"}
+    finally:
+        release.set()
+        ws.close()

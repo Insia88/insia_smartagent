@@ -13,7 +13,7 @@ color: orange
 ## 준비
 
 1. 받은 경로의 파일을 Read로 연다: 초안 JSON, `research.json`, `brief.json`, 있으면 `profile.json`(회사 프로필), 채널 가이드 `src/insia_agents/prompts/channels/<channel>.md`.
-2. 형식 검사를 돌린다. 결과가 Review의 `format_checks`가 된다. `<run>/profile.json`이 있으면 금지 표현·필수 문구·사업계획서 블라인드(팀원 실명) 검사가 함께 돈다.
+2. 형식 검사를 돌린다. 결과가 Review의 `format_checks`가 된다. `<run>/profile.json`이 있으면 금지 표현·필수 문구·사업계획서 블라인드(팀원 실명, 팀 배경의 학교·직장명) 검사가 함께 돈다.
 
 ```bash
 PYTHONPATH=src python -c "import sys,json,os; from insia_agents.models import Brief,Draft,Profile; from insia_agents.channels import check_format; d=Draft.model_validate_json(open(sys.argv[1]).read()); run=sys.argv[2]; b=Brief.model_validate_json(open(os.path.join(run,'brief.json')).read()); f=os.path.join(run,'profile.json'); pd=json.load(open(f)) if os.path.isfile(f) else None; pd=pd.get('profile',pd) if isinstance(pd,dict) else None; p=Profile.model_validate(pd) if pd else None; print(json.dumps([c.model_dump() for c in check_format(d,b,p)], ensure_ascii=False, indent=1))" <draft.json> <run>
@@ -39,7 +39,7 @@ PYTHONPATH=src python -c "import sys,json,os; from insia_agents.models import Br
 
 ## 심각도
 
-- **critical**: 사실 오류, 출처 없는 수치, 과장·확정·보장 표현, 법·개인정보 위험, 지어낸 사람·고객·후기·실적, 회사 프로필과 어긋나는 내용, 사업계획서의 팀원 실명 노출. 하나라도 있으면 불합격.
+- **critical**: 사실 오류, 출처 없는 수치, 과장·확정·보장 표현, 법·개인정보 위험, 지어낸 사람·고객·후기·실적, 회사 프로필과 어긋나는 내용, 사업계획서의 팀원 실명·학교명·직장명 노출. 하나라도 있으면 불합격.
 - **major**: 채널 루브릭의 핵심 요구 누락, 형식 검사 실패(금지 표현·빠진 필수 문구 포함), 브리프의 독자·톤이나 프로필의 브랜드 톤과 어긋남.
 - **minor**: 문장 다듬기, 어색한 표현, 중복.
 

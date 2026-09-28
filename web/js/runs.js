@@ -27,6 +27,7 @@
     infoTries: 0,
     busy: false,
     error: '',
+    forceRun: null,   // run id whose resume got a 409 with can_force
     dialog: null,
     runs: null,
     runsError: null,
@@ -114,6 +115,7 @@
       }
     }
     if (R.error) nodes.push(el('span', { class: 'rb-error', role: 'alert', text: R.error }));
+    if (R.forceRun && w && R.forceRun === w.runId) nodes.push(forceButton(w.runId));
     var keep = document.activeElement && bar.contains(document.activeElement) ? document.activeElement.getAttribute('data-key') : null;
     bar.dataset.kind = state;
     bar.textContent = '';
@@ -137,15 +139,32 @@
     }, function (ex) {
       R.busy = false;
       if (ex.auth) return;
+      if (ex.status === 409 && ex.data && ex.data.recovered) {
+        // the run was no longer running anywhere: the server marked it interrupted, so it can be resumed now
+        ui.toast(ex.message, 'info');
+        if (R.watching && R.watching.runId === runId) refreshInfo(runId);
+        renderBar();
+        if (R.dialog && R.dialog.open) loadRuns();
+        return;
+      }
       R.error = '멈추지 못했어요: ' + ex.message;
       renderBar();
       if (R.dialog && R.dialog.open) { R.runsError = ex; renderRuns(); }
     });
   }
 
+  /** 409 with can_force: the run still looks alive elsewhere (e.g. a CLI run); the server message says which. */
+  function forceButton(runId) {
+    return el('button', {
+      type: 'button', class: 'btn btn--small btn--danger', 'data-key': 'force-' + runId, disabled: R.busy,
+      text: '그래도 이어서 실행', title: '다른 곳의 실행이 정말 멈췄을 때만 눌러 주세요. 아직 돌고 있으면 같은 작업을 두 번 하게 돼요.',
+      onclick: function () { resumeRun(runId, true); }
+    });
+  }
   function resumeRun(runId, force) {
     R.busy = true;
     R.error = '';
+    R.forceRun = null;
     renderBar();
     var body = { options: ws.jobOptions() };
     if (force) body.force = true;
@@ -159,6 +178,7 @@
       R.busy = false;
       if (ex.auth) return;
       R.error = '이어서 실행하지 못했어요: ' + ex.message;
+      if (!force && ex.status === 409 && ex.data && ex.data.can_force) R.forceRun = runId;
       renderBar();
       if (R.dialog && R.dialog.open) { R.dialogError = R.error; renderRuns(); }
     });
@@ -280,6 +300,7 @@
       el('div', { class: 'runs-body' }, [
         el('p', { class: 'panel-hint', text: '서버를 다시 켜도 기록과 이벤트가 남아 있어요. 끝난 실행은 무대에서 다시 볼 수 있어요. 서버가 꺼져서 중단됐거나 직접 멈춘 실행은 ‘이어서 실행’을 누르면 끝난 채널은 건너뛰고 남은 작업만 해요.' }),
         R.dialogError ? el('p', { class: 'form-error', role: 'alert', text: R.dialogError }) : null,
+        R.dialogError && R.forceRun ? el('p', null, [forceButton(R.forceRun)]) : null,
         body
       ])
     ]);

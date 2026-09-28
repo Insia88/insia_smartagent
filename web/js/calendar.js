@@ -29,6 +29,7 @@
     planError: '',
     planSummary: '',
     planNotices: [],
+    planWeekend: null,   // {channel: true} ticked "주말에도 올리기" boxes (kept while the form is reopened)
     dialog: null,
     dialogSlot: null,
     dialogTrigger: null,
@@ -258,6 +259,17 @@
         el('i', { class: 'lg-swatch', 'aria-hidden': 'true' }), el('span', { text: U.chName(c) }), inp, el('span', { class: 'unit', text: '개' })
       ]);
     });
+    // weekends are off by default (the planner's rule); a channel ticked here may also get Saturday/Sunday posts
+    var weekend = {};
+    var weekendHint = el('p', { class: 'panel-hint weekend-hint', id: 'planWeekendHint', hidden: true, text: '주말 게시를 켰다면 insia run-due 예약을 평일만이 아니라 매일 돌도록 바꿔 주세요 (예: cron의 요일 칸을 *로). 아니면 주말 초안이 게시일이 지난 뒤에 만들어져요.' });
+    function syncWeekendHint() { weekendHint.hidden = !PLAN_CHANNELS.some(function (c) { return weekend[c].checked; }); }
+    var weekendFields = PLAN_CHANNELS.map(function (c) {
+      var box = el('input', { id: 'planWeekend-' + c, type: 'checkbox', value: c, 'aria-describedby': 'planWeekendHint', checked: C.planWeekend && C.planWeekend[c] ? true : null });
+      box.addEventListener('change', function () { C.planWeekend = C.planWeekend || {}; C.planWeekend[c] = box.checked; syncWeekendHint(); });
+      weekend[c] = box;
+      return el('label', { class: 'weekend-field', for: 'planWeekend-' + c, style: '--ch:' + ws.channelColor(c) }, [box, el('span', { text: U.chName(c) })]);
+    });
+    syncWeekendHint();
     var err = el('p', { class: 'form-error', role: 'alert', hidden: !C.planError, text: C.planError });
     var submit = el('button', { type: 'submit', class: 'btn btn--primary', disabled: C.planBusy, text: C.planBusy ? '계획을 세우는 중…' : '계획 세우기' });
     var form = el('form', { class: 'card plan-form', id: 'planForm', novalidate: true, 'aria-labelledby': 'planFormTitle' }, [
@@ -266,7 +278,11 @@
       el('div', { class: 'plan-grid' }, [
         el('label', { class: 'field field--wide', for: 'planTheme' }, [el('span', { text: '이번 주 테마' }), theme]),
         el('div', { class: 'field' }, [el('label', { for: 'planStart', text: '시작일' }), startInput, span]),
-        el('fieldset', { class: 'field counts' }, [el('legend', { text: '채널별 게시 수' })].concat(countFields))
+        el('fieldset', { class: 'field counts' }, [el('legend', { text: '채널별 게시 수' })].concat(countFields)),
+        el('fieldset', { class: 'field weekends' }, [
+          el('legend', { text: '주말(토·일)에도 올리기' }),
+          el('p', { class: 'field-hint', text: '기본은 평일만 계획해요. 체크한 채널은 주말에도 게시일을 잡아요.' })
+        ].concat(weekendFields, [weekendHint]))
       ]),
       err,
       el('div', { class: 'form-foot' }, [
@@ -278,7 +294,10 @@
       e.preventDefault();
       var t = theme.value.trim();
       var s = startInput.value;
-      var body = { theme: t, start: s, end: /^\d{4}-\d{2}-\d{2}$/.test(s) ? D.add(s, 6) : '', counts: {} };
+      var body = {
+        theme: t, start: s, end: /^\d{4}-\d{2}-\d{2}$/.test(s) ? D.add(s, 6) : '', counts: {},
+        weekend_channels: PLAN_CHANNELS.filter(function (c) { return weekend[c].checked; })  // [] = weekdays only
+      };
       var total = 0;
       PLAN_CHANNELS.forEach(function (c) {
         var n = Math.max(0, Math.min(7, parseInt(counts[c].value, 10) || 0));

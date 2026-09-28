@@ -906,3 +906,182 @@ def test_profile_template_goes_to_the_workspace_when_cwd_is_read_only(env, tmp_p
     monkeypatch.setattr(cli.os, "access", lambda path, mode: False)  # like /app inside the Docker image
     code, out, _ = run(capsys, "profile", "edit-template", "--format", "json")
     assert code == 0 and (env / "profile.json").is_file() and not (tmp_path / "profile.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# P3 integration: weekend plans, safe --replace, jobs by item, healthcheck --host
+# ---------------------------------------------------------------------------
+
+
+def test_plan_week_weekend_option_and_planning_errors_exit_2(env, capsys):
+    code, out, err = run(capsys, "plan-week", "--start", "2026-10-05", "--mode", "mock", "--instagram", "7",
+                         "--linkedin", "7", "--weekend", "인스타", "--json")
+    assert code == 0, err
+    week = json.loads(out)
+    days = {(s["channel"], s["date"]) for s in week["slots"]}
+    assert ("instagram", "2026-10-10") in days and ("instagram", "2026-10-11") in days  # Sat, Sun
+    assert not {("linkedin", "2026-10-10"), ("linkedin", "2026-10-11")} & days and week["replaced"] == []
+    code, out, _ = run(capsys, "plan-week", "--start", "2026-10-12", "--mode", "mock", "--linkedin", "7", "--theme", "평일만")
+    assert code == 0 and "주말을 빼고" in out  # default: weekdays only, and the notice says why
+    code, out, _ = run(capsys, "plan-week", "--start", "2026-10-19", "--mode", "mock", "--blog", "7", "--weekend", "all",
+                       "--theme", "주말도", "--json")
+    assert code == 0 and len(json.loads(out)["slots"]) == 7
+
+    code, _, err = run(capsys, "plan-week", "--start", "2026-10-26", "--mode", "mock", "--weekend", "tiktok")
+    assert code == 2 and "--weekend" in err and "알 수 없는 채널" in err
+    code, _, err = run(capsys, "plan-week", "--start", "2026-10-26", "--mode", "mock", "--blog", "0")
+    assert code == 2 and "하나 이상" in err  # a planning input error is a usage error
+    with open_ws(env) as ws:
+        assert ws.list_slots(date_from="2026-10-26", date_to="2026-11-01") == []
+    code, out, _ = run(capsys, "plan-week", "-h")
+    assert code == 0 and "--weekend" in out and "주말" in out
+
+
+def test_plan_week_replace_is_undone_when_planning_fails(env, capsys, monkeypatch):
+    from insia_agents.backends.base import BackendError
+    from insia_agents.backends.mock_backend import MockBackend
+
+    week = ("--start", "2026-10-05", "--mode", "mock")
+    assert run(capsys, "plan-week", *week, "--linkedin", "2")[0] == 0
+    with open_ws(env) as ws:
+        old = {s.id for s in ws.list_slots()}
+
+    def statuses():
+        with open_ws(env) as ws:
+            return {s.id: s.status for s in ws.list_slots()}
+
+    code, _, err = run(capsys, "plan-week", *week, "--linkedin", "1", "--replace", "--weekend", "bogus")
+    assert code == 2 and statuses() == {i: "planned" for i in old}  # stopped before touching anything
+
+    def broken(self, *args, **kwargs):
+        raise BackendError("AI 호출에 실패했어요 (테스트)")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(MockBackend, "plan_calendar", broken)
+        code, _, err = run(capsys, "plan-week", *week, "--linkedin", "1", "--replace")
+    assert code == 1 and "AI 호출에 실패" in err and statuses() == {i: "planned" for i in old}  # put back
+
+    code, out, _ = run(capsys, "plan-week", *week, "--linkedin", "1")
+    assert code == 0 and "기존 계획 2개는 그대로 두었어요" in out and "--replace" in out
+    code, out, _ = run(capsys, "plan-week", *week, "--linkedin", "1", "--replace", "--json")
+    replaced = json.loads(out)["replaced"]
+    assert code == 0 and old <= set(replaced) and all(statuses()[i] == "skipped" for i in replaced)
+
+
+def test_runs_list_filters_by_content_item(env, capsys):
+    _mock_run(capsys, "--channels", "linkedin,instagram")
+    with open_ws(env) as ws:
+        run_id = ws.list_runs()[0]["run_id"]
+    item_id, other_id = pipeline_item_id(run_id, "linkedin"), pipeline_item_id(run_id, "instagram")
+    assert run(capsys, "review", item_id, "--mode", "mock", "--quiet")[0] == 0
+    code, out, _ = run(capsys, "runs", "list", "--item", item_id, "--json")
+    rows = json.loads(out)
+    assert code == 0 and [r["kind"] for r in rows] == ["review"] and rows[0]["parent_item_id"] == item_id
+    code, out, _ = run(capsys, "runs", "list", "--item", item_id)
+    assert code == 0 and rows[0]["run_id"] in out and run_id not in out
+    code, out, _ = run(capsys, "runs", "list", "--item", other_id)
+    assert code == 0 and "돌린 작업" in out and other_id in out
+    code, out, _ = run(capsys, "runs", "list", "-h")
+    assert "--item" in out
+
+
+def test_healthcheck_host_option(capsys, monkeypatch):
+    assert cli._health_url("127.0.0.1", 8765) == "http://127.0.0.1:8765/api/health"
+    assert cli._health_url("::1", 8765) == cli._health_url("[::1]", 8765) == "http://[::1]:8765/api/health"
+    assert cli._health_url("0.0.0.0", 1) == "http://127.0.0.1:1/api/health"
+    assert cli._health_url("::", 1) == "http://[::1]:1/api/health"
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _HealthHandler)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        code, out, _ = run(capsys, "healthcheck", "--host", "localhost", "--port", port)
+        assert code == 0 and f"http://localhost:{port}/api/health" in out
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    import urllib.request
+
+    asked = []
+
+    class Opener:
+        def open(self, request, timeout):
+            asked.append(request.full_url)
+            raise OSError("no IPv6 here")
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *handlers: Opener())
+    code, _, err = run(capsys, "healthcheck", "--host", "::1", "--port", "8765")
+    assert code == 1 and asked == ["http://[::1]:8765/api/health"] and "[::1]" in err
+
+
+def test_error_text_is_the_shared_helper():
+    from insia_agents import errors
+
+    assert cli._error_text is errors.error_text
+
+
+def test_run_due_skips_a_slot_that_changed_after_it_was_listed(env, capsys, monkeypatch):
+    """run-due drafts its due slots one by one (minutes each in live mode): a slot skipped meanwhile (by hand, or
+    set aside by `plan-week --replace`) is not drafted — no paid draft for a day the user took off the plan."""
+    with open_ws(env) as ws:
+        first, second = ws.add_slots([PlannedSlot(date=day, channel="linkedin", topic=f"{day} 예정 글", angle="사례",
+                                                  keywords=["AI"], goal="인지") for day in ("2026-09-28", "2026-09-29")])
+    real_due = Workspace.due_slots
+
+    def due_then_skipped(self, until):
+        due = real_due(self, until)
+        self.update_slot(first.id, status="skipped")  # the user skips it right after run-due listed it
+        return due
+
+    monkeypatch.setattr(Workspace, "due_slots", due_then_skipped)
+    code, out, err = run(capsys, "run-due", "--mode", "mock", "--until", "2026-09-29")
+    assert code == 0, err
+    assert "건너뛰었어요: 그사이 '건너뜀' 상태로 바뀌었어요" in out and "초안 1개를 만들었어요" in out and "건너뜀 1개" in out
+    with open_ws(env) as ws:
+        assert ws.get_slot(first.id).status == "skipped" and not ws.get_slot(first.id).item_id
+        assert ws.get_slot(second.id).status == "drafted"
+        assert [r["kind"] for r in ws.list_runs()] == ["slot"]  # no run was started for the skipped slot
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM delivery is POSIX")
+def test_plan_week_replace_is_undone_when_the_process_gets_sigterm(env, tmp_path):
+    """`kill`, systemd or docker stop the CLI with SIGTERM: like Ctrl+C, the slots --replace set aside go back to
+    'planned' (the default SIGTERM action would end the process with them left 'skipped')."""
+    import os
+    import signal
+    import subprocess
+    import time
+
+    with open_ws(env) as ws:
+        old = ws.add_slots([PlannedSlot(date=day, channel="linkedin", topic=f"{day} 기존 계획", angle="사례",
+                                        keywords=["AI"], goal="인지") for day in ("2026-10-05", "2026-10-06")])
+    marker = tmp_path / "planning.started"
+    script = (
+        "import pathlib, sys, time\n"
+        "from insia_agents.backends.mock_backend import MockBackend\n"
+        "def slow(self, *args, **kwargs):\n"  # a live planning call still in flight
+        f"    pathlib.Path({str(marker)!r}).write_text('in')\n"
+        "    time.sleep(60)\n"
+        "MockBackend.plan_calendar = slow\n"
+        "from insia_agents.cli import main\n"
+        "sys.exit(main(['plan-week', '--start', '2026-10-05', '--mode', 'mock', '--linkedin', '1', '--replace']))\n")
+    child_env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "INSIA_HOME": str(env), "PYTHONUNBUFFERED": "1"}
+    proc = subprocess.Popen([sys.executable, "-c", script], cwd=tmp_path, env=child_env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 30
+        while not marker.exists() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert marker.exists(), proc.communicate(timeout=10)
+        with open_ws(env) as ws:
+            assert {ws.get_slot(s.id).status for s in old} == {"skipped"}  # set aside while planning
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(10)
+    assert proc.returncode == 130, (out, err)
+    assert "계획을 멈췄어요" in err and "Traceback" not in err
+    with open_ws(env) as ws:
+        assert sorted((s.id, s.status) for s in ws.list_slots()) == sorted((s.id, "planned") for s in old)

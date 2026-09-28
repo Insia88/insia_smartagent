@@ -13,7 +13,7 @@ from insia_agents.backends.mock_backend import MockBackend
 from insia_agents.channels import check_format
 from insia_agents.db import NotFoundError, Workspace, WorkspaceError, pipeline_item_id
 from insia_agents.events import EventBus, SimClock
-from insia_agents.models import PlannedSlot, Profile, UsageRecord
+from insia_agents.models import Draft, PlannedSlot, Profile, UsageRecord
 from insia_agents.pipeline import BudgetExceeded, execute_run, new_run_id, prepare_run
 
 
@@ -418,3 +418,43 @@ def test_generate_slot_recovers_a_slot_whose_run_died(settings, ws):
                      (dead, dbmod.this_host()))
     result = actions.generate_slot(ws, slot.id, settings=settings)  # no force needed: its process is gone
     assert result.slot.status == "drafted" and ws.get_run("killed-run")["status"] == "interrupted"
+
+
+class CliRoundDuringReReview(MockBackend):
+    """A CLI run (`insia run-due` in a terminal, another Workspace) stores its next round on the item while the
+    dashboard's 수정 요청 re-reviews its revision."""
+
+    def __init__(self, settings, home, item_id, run_id):
+        super().__init__(settings)
+        self.home, self.item_id, self.run_id, self.done = home, item_id, run_id, False
+
+    def review(self, brief, research, draft, format_checks):
+        out = super().review(brief, research, draft, format_checks)
+        if not self.done:
+            self.done = True
+            with Workspace(self.home) as cli:
+                cli.add_run_version(self.item_id, Draft(channel="linkedin", round=9, title="CLI 라운드", content="CLI 본문"),
+                                    run_id=self.run_id)
+        return out
+
+
+def test_revise_is_not_superseded_when_a_cli_round_keeps_its_revision_current(settings, brief, tmp_path):
+    """A CLI round stored during 수정 요청's re-review is put back under the revision: the job is not 'superseded'."""
+    home = tmp_path / "ws"
+    ws = Workspace(home)
+    try:
+        result, _ = execute_run(brief, settings, workspace=ws)
+        item_id = pipeline_item_id(result.run_id, "linkedin")
+        base = ws.get_item(item_id).versions[-1]
+        assert base.review is not None
+        job = actions.revise_item(ws, item_id, "짧게", settings=settings,
+                                  backend=CliRoundDuringReReview(settings, home, item_id, result.run_id))
+        detail = ws.get_item(item_id)
+        revision, cli_round, current = detail.versions[-3], detail.versions[-2], detail.versions[-1]
+        assert (revision.version, cli_round.draft.title) == (base.version + 1, "CLI 라운드")
+        assert current.draft.content == revision.draft.content and current.review == job.review  # the revision is current
+        assert detail.item.score == job.review.score
+        assert not job.superseded and not job.superseded_by_human_edit
+        assert ws.list_events(job.run_id)[-1]["data"]["superseded"] is False
+    finally:
+        ws.close()

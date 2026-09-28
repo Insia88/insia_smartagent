@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from collections import Counter
 from dataclasses import replace
 
 import pytest
@@ -452,3 +451,144 @@ def test_threaded_run_persists_from_worker_threads(settings, brief, ws):
     stored = ws.get_run("threaded-ws")["research"]
     assert [s["id"] for s in stored["sources"]] == [f"s{i}" for i in range(1, len(stored["sources"]) + 1)]
     assert len(stored["findings"]) == len(result.research.findings)
+
+
+# ---------------------------------------------------------------------------
+# Safety net: a person's edit is never buried by a later agent round
+# ---------------------------------------------------------------------------
+
+HUMAN_TITLE = "사람이 고친 제목"
+HUMAN_CONTENT = "사람이 직접 고친 본문이에요.\n\n두 번째 문단도 사람이 썼어요."
+
+
+class FailFirstReview(MockBackend):
+    """R0 always gets a critical issue, so every channel revises at least once."""
+
+    def review(self, brief, research, draft, format_checks):
+        from insia_agents.models import ReviewIssue
+
+        review = super().review(brief, research, draft, format_checks)
+        if draft.round == 0:
+            issue = ReviewIssue(severity="critical", location="본문", problem="강제 실패", fix="고치기")
+            review = review.model_copy(update={"issues": [*review.issues, issue]})
+        return review
+
+
+class CrashOnRevise(FailFirstReview):
+    def revise(self, *args, **kwargs):
+        raise SimulatedCrash("kill -9")
+
+
+def _assert_edit_is_current(ws, run_id, channel="linkedin"):
+    detail = ws.get_item(pipeline_item_id(run_id, channel))
+    current = detail.versions[-1]
+    assert current.source == "human" and (current.draft.title, current.draft.content) == (HUMAN_TITLE, HUMAN_CONTENT)
+    assert detail.item.title == HUMAN_TITLE and detail.item.version == current.version
+    return detail
+
+
+def test_resume_after_a_human_edit_keeps_the_edit_current(settings, ws):
+    from insia_agents import actions
+    from insia_agents.models import Brief
+
+    brief = Brief(topic="멈춘 사이 고친 글", channels=["linkedin"])
+    with pytest.raises(SimulatedCrash):  # R0 is stored and reviewed (failed), then the process dies while revising
+        run_pipeline(brief, CrashOnRevise(settings), EventBus("run-edit-a", clock=SimClock(0)), settings, workspace=ws)
+    item_id = pipeline_item_id("run-edit-a", "linkedin")
+    assert [v.source for v in ws.get_item(item_id).versions] == ["agent"]
+    edit = actions.edit_item(ws, item_id, HUMAN_TITLE, HUMAN_CONTENT, settings=settings)  # while the run is stopped
+    approved = ws.set_item_status(item_id, "approved", force=True)  # and the person even approved it
+    assert (approved.approved_version, approved.approval_forced) == (edit.version.version, True)
+
+    backend = TimedBackend(settings)
+    result = resume_run("run-edit-a", settings, ws, backend=backend, out_dir=None)
+    assert backend.channel_calls("linkedin")[0] == "revise"  # the run still continued its own loop
+
+    detail = _assert_edit_is_current(ws, "run-edit-a")
+    agent_rounds = [v for v in detail.versions if v.source == "agent"]
+    assert [v.draft.round for v in agent_rounds][:2] == [0, 1]  # R1 is kept in the history
+    assert all(v.version > edit.version.version for v in agent_rounds[1:])
+    assert "사람이 고친" in detail.versions[-1].draft.change_log[0]
+    # the person's decision stays: still approved, now pointing at the current copy of the same text
+    assert detail.item.status == "approved" and detail.item.approved_version == detail.item.version
+    assert detail.item.approval_forced is True
+    # resume still finds its own rounds; the final copy was not put on top
+    assert [v.draft.round for v in ws.list_run_versions("run-edit-a", "linkedin")] == [d.round for d in result.results[0].drafts]
+
+    events = ws.list_events("run-edit-a")
+    completed = events[-1]
+    assert completed["type"] == "run.completed" and completed["data"]["superseded_by_human_edit"] is True
+    assert completed["data"]["superseded"] is True
+    info = completed["data"]["superseded_channels"]["linkedin"]
+    assert info["superseded_by_human_edit"] is True and info["current_version"] == detail.item.version
+    assert any(e["type"] == "log" and e["data"]["level"] == "warn" and "사람이 고친 버전이 있어서" in e["data"]["message"]
+               for e in events)
+    assert ws.get_run("run-edit-a")["progress"]["superseded_channels"]["linkedin"]["superseded_by_human_edit"] is True
+
+
+def test_dashboard_edit_during_a_cli_run_is_not_buried(settings, tmp_path):
+    """A CLI run (its own process, invisible to the server's 409 check) and a dashboard edit on the same workspace."""
+    import threading
+
+    from insia_agents import actions
+    from insia_agents.models import Brief
+
+    home = tmp_path / "shared"
+    cli_ws, server_ws = Workspace(home), Workspace(home)  # two processes' connections to the same insia.db
+    reached, edited = threading.Event(), threading.Event()
+    run_id = "run-cli-b"
+    item_id = pipeline_item_id(run_id, "linkedin")
+
+    def pause_after_first_review(event):
+        if event["type"] == "revision.requested" and event["data"].get("round") == 0 and not reached.is_set():
+            reached.set()
+            assert edited.wait(20), "the dashboard edit never happened"
+
+    outcome: dict = {}
+
+    def cli_run():
+        try:
+            bus = EventBus(run_id, clock=SimClock(0))
+            bus.add_listener(pause_after_first_review)
+            outcome["result"] = run_pipeline(Brief(topic="CLI 실행 중 고친 글", channels=["linkedin"]), FailFirstReview(settings),
+                                             bus, settings, workspace=cli_ws)
+        except BaseException as exc:  # noqa: BLE001
+            outcome["error"] = exc
+            reached.set()
+
+    thread = threading.Thread(target=cli_run, daemon=True)
+    thread.start()
+    try:
+        assert reached.wait(20) and "error" not in outcome
+        before = server_ws.get_item(item_id)
+        assert [v.source for v in before.versions] == ["agent"]  # v1 is in 보관함 while the run goes on
+        actions.edit_item(server_ws, item_id, HUMAN_TITLE, HUMAN_CONTENT, settings=settings)  # PUT /draft
+        edited.set()
+        thread.join(30)
+        assert not thread.is_alive() and "error" not in outcome, outcome.get("error")
+
+        detail = _assert_edit_is_current(server_ws, run_id)
+        assert detail.item.status == "draft"  # the edit has no review yet: nothing else decided for the person
+        rounds = [v.draft.round for v in detail.versions if v.source == "agent"]
+        assert rounds[:2] == [0, 1]
+        completed = cli_ws.list_events(run_id)[-1]
+        assert completed["type"] == "run.completed" and completed["data"]["superseded_by_human_edit"] is True
+        assert completed["data"]["superseded_channels"]["linkedin"]["current_version"] == detail.item.version
+        final = outcome["result"].results[0].final  # the run's own result is unchanged (outputs/final)
+        assert any(v.draft.content == final.content for v in detail.versions if v.source == "agent")
+    finally:
+        edited.set()
+        thread.join(5)
+        cli_ws.close()
+        server_ws.close()
+
+
+def test_run_without_edits_reports_nothing_superseded(settings, ws):
+    from insia_agents.models import Brief
+
+    bus = EventBus("run-plain", clock=SimClock(0))
+    run_pipeline(Brief(topic="평범한 실행", channels=["linkedin"]), FailFirstReview(settings), bus, settings, workspace=ws)
+    completed = bus.events[-1]["data"]
+    assert not {"superseded", "superseded_by_human_edit", "superseded_channels"} & set(completed)
+    detail = ws.get_item(pipeline_item_id("run-plain", "linkedin"))
+    assert all(v.source == "agent" for v in detail.versions) and detail.item.status in ("draft", "needs_changes")
