@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .models import Brief, ChannelId, Draft, FormatCheck, Review, RubricScore
+from .models import Brief, ChannelId, Draft, FormatCheck, Profile, Review, RubricScore
 
 
 @dataclass(frozen=True)
@@ -189,8 +189,13 @@ def _range(value: int, lo: int, hi: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def check_format(draft: Draft, brief: Brief | None = None) -> list[FormatCheck]:
-    """Run the channel's deterministic checks. Same input → same output."""
+def check_format(draft: Draft, brief: Brief | None = None, profile: Profile | None = None) -> list[FormatCheck]:
+    """Run the channel's deterministic checks. Same input → same output.
+
+    With a company ``profile`` three brand checks are added: no banned words
+    (every channel), required phrases present (SNS channels only), and — for
+    the business plan — no real team member names (블라인드 규정).
+    """
     spec = CHANNELS[draft.channel]
     lim = spec.limits
     content = draft.content
@@ -261,6 +266,38 @@ def check_format(draft: Draft, brief: Brief | None = None) -> list[FormatCheck]:
             f"{len(tags)}개", f"{lim['min_hashtags']}~{lim['max_hashtags']}개",
         ))
 
+    if profile is not None:
+        checks.extend(profile_checks(draft, profile))
+
+    return checks
+
+
+def _norm_space(text: str) -> str:
+    return _WS.sub("", text).lower()
+
+
+def profile_checks(draft: Draft, profile: Profile) -> list[FormatCheck]:
+    """Brand checks derived from the company profile (deterministic)."""
+    text = f"{draft.title}\n{draft.content}"
+    flat = _norm_space(text)
+    checks: list[FormatCheck] = []
+
+    banned = [w.strip() for w in profile.banned_words if w.strip()]
+    if banned:
+        hits = [w for w in banned if _norm_space(w) and _norm_space(w) in flat]
+        checks.append(_check("banned_words", "금지 표현 없음", not hits, ", ".join(hits) if hits else "없음", "프로필의 금지 표현을 쓰지 않음"))
+
+    if draft.channel != "bizplan":
+        required = [w.strip() for w in profile.required_phrases if w.strip()]
+        if required:
+            missing = [w for w in required if _norm_space(w) not in flat]
+            checks.append(_check("required_phrases", "필수 문구 포함", not missing, "누락: " + ", ".join(missing) if missing else "모두 포함", "프로필의 필수 문구를 넣음"))
+
+    if draft.channel == "bizplan":
+        names = [m.name.strip() for m in profile.team if m.name.strip() and len(m.name.strip()) >= 2]
+        exposed = [n for n in names if _norm_space(n) in flat]
+        checks.append(_check("blind_names", "블라인드(실명 미노출)", not exposed, f"실명 {len(exposed)}개 노출" if exposed else "노출 없음", "팀원 실명은 ○○로 가림"))
+
     return checks
 
 
@@ -278,7 +315,8 @@ def format_score(checks: list[FormatCheck], max_points: int) -> int:
     return round(max_points * passed / len(checks))
 
 
-def finalize_review(review: Review, draft: Draft, brief: Brief | None = None, pass_score: int = DEFAULT_PASS_SCORE) -> Review:
+def finalize_review(review: Review, draft: Draft, brief: Brief | None = None, pass_score: int = DEFAULT_PASS_SCORE,
+                    profile: Profile | None = None) -> Review:
     """Make a review deterministic: recompute format, clamp scores, total, verdict.
 
     - Rubric items are matched to the channel spec by id; unknown ids are dropped,
@@ -288,7 +326,7 @@ def finalize_review(review: Review, draft: Draft, brief: Brief | None = None, pa
     - ``passed`` = score >= pass_score and no critical issue.
     """
     spec = CHANNELS[draft.channel]
-    checks = check_format(draft, brief)
+    checks = check_format(draft, brief, profile)
     given = {item.id: item for item in review.rubric}
     rubric: list[RubricScore] = []
     for item in spec.rubric:

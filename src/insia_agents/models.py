@@ -84,6 +84,10 @@ class Source(BaseModel):
         description="1=정부·공공기관·공식통계·법령·기업 공시 원문, 2=언론·리서치기관·업계 보고서, 3=블로그·커뮤니티·기타"
     )
     accessed: str = Field(default="", description="확인한 날짜 YYYY-MM-DD")
+    origin: Literal["web", "user"] = Field(
+        default="web",
+        description="web=웹에서 찾은 출처, user=사용자가 올린 자료(회사 소개서·IR 자료 등, url은 user://<문서 id>)",
+    )
 
 
 class Finding(BaseModel):
@@ -190,3 +194,143 @@ class RunResult(BaseModel):
     results: list[ChannelResult]
     started_at: str
     finished_at: str
+
+
+# ---------------------------------------------------------------------------
+# Workspace (production use): company profile, user materials, content items
+# ---------------------------------------------------------------------------
+# These are stored by ``insia_agents.db.Workspace`` (SQLite). ``ContentPlan``
+# and ``PlannedSlot`` are LLM-produced and must stay structured-output
+# compatible; the others are not sent as output schemas.
+
+ContentStatus = Literal["draft", "needs_changes", "approved", "scheduled", "published", "archived"]
+DraftSource = Literal["agent", "human"]
+SlotStatus = Literal["planned", "generating", "drafted", "skipped"]
+
+
+class TeamMember(BaseModel):
+    role: str = Field(description="역할 (예: 대표, CTO, 마케팅 담당)")
+    name: str = Field(default="", description="실명. 사업계획서에는 블라인드 규정 때문에 절대 쓰지 않는다")
+    background: str = Field(default="", description="학위·전공, 경력, 보유 역량 (사용자 제공 사실)")
+    hiring: bool = Field(default=False, description="채용 예정 인력이면 true")
+
+
+class Profile(BaseModel):
+    """회사·브랜드 프로필. 모든 에이전트가 참고하는 사용자 제공 사실과 브랜드 규칙."""
+
+    company_name: str = ""
+    service_name: str = ""
+    one_liner: str = Field(default="", description="한 줄 소개")
+    description: str = Field(default="", description="서비스 설명")
+    industry: str = ""
+    stage: str = Field(default="", description="예: 예비창업, 초기(3년 이내), 도약")
+    target_customers: str = ""
+    problem: str = ""
+    solution: str = ""
+    differentiators: list[str] = Field(default_factory=list)
+    business_model: str = ""
+    pricing: str = Field(default="", description="확정 가격이 아니면 '가정'이라고 적는다")
+    traction: list[str] = Field(default_factory=list, description="사용자 제공 실적·지표 (예: 베타 사용자 120명, 2026-08 기준)")
+    team: list[TeamMember] = Field(default_factory=list)
+    tone: str = Field(default="", description="브랜드 톤앤매너")
+    banned_words: list[str] = Field(default_factory=list, description="쓰면 안 되는 표현")
+    required_phrases: list[str] = Field(default_factory=list, description="반드시 넣을 문구 (예: 광고 표시, 면책 문구)")
+    default_hashtags: list[str] = Field(default_factory=list)
+    cta: str = Field(default="", description="기본 행동 유도 문구 (예: 무료 체험 신청은 프로필 링크에서)")
+    contact: str = Field(default="", description="문의처 (이메일·네이버 톡톡 등)")
+    naver_blog_url: str = ""
+    linkedin_url: str = ""
+    instagram_handle: str = ""
+    brand_colors: list[str] = Field(default_factory=list, description="카드뉴스용 브랜드 색 (#RRGGBB), 첫 번째가 주 색")
+    notes: str = ""
+    updated_at: str = ""
+
+
+class UserDocument(BaseModel):
+    """사용자가 올린 참고 자료. 리서치 팩에 origin='user' 출처로 들어간다."""
+
+    id: str = Field(description='"u1", "u2", ...')
+    title: str
+    kind: Literal["text", "markdown", "pdf", "docx"] = "text"
+    filename: str = ""
+    text: str
+    chars: int = 0
+    created_at: str = ""
+
+
+class ContentItem(BaseModel):
+    """채널 산출물 하나 (예: 이번 주 링크드인 게시물). 버전·검수·승인·게시 상태를 가진다."""
+
+    id: str
+    run_id: str = ""
+    channel: ChannelId
+    title: str
+    status: ContentStatus = "draft"
+    version: int = Field(default=1, description="현재 버전 번호 (1부터)")
+    score: int | None = None
+    passed: bool | None = None
+    scheduled_at: str = Field(default="", description="게시 예정일 YYYY-MM-DD 또는 ISO 시각")
+    published_at: str = ""
+    published_url: str = ""
+    note: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class DraftVersion(BaseModel):
+    id: str
+    item_id: str
+    version: int
+    source: DraftSource
+    draft: Draft
+    review: Review | None = None
+    instructions: str = Field(default="", description="사람이 준 수정 지시 (있을 때)")
+    created_at: str = ""
+
+
+class ContentItemDetail(BaseModel):
+    item: ContentItem
+    versions: list[DraftVersion]
+    brief: Brief | None = None
+
+
+class UsageRecord(BaseModel):
+    run_id: str = ""
+    agent: str = ""
+    task: str = Field(default="", description="plan, research, draft, review, revise, plan_calendar ...")
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    web_search_requests: int = 0
+    cost_usd: float = 0.0
+    created_at: str = ""
+
+
+class PlannedSlot(BaseModel):
+    date: str = Field(description="게시 예정일 YYYY-MM-DD")
+    channel: ChannelId
+    topic: str = Field(description="이 게시물의 주제 한 줄")
+    angle: str = Field(description="관점·형식 (예: 체크리스트, 사례, 데이터 해설)")
+    keywords: list[str] = Field(description="핵심 키워드 1~5개, 첫 번째가 메인")
+    goal: str = Field(description="이 게시물로 얻으려는 것 (인지, 문의, 저장 등)")
+
+
+class ContentPlan(BaseModel):
+    summary: str = Field(description="이번 기간 콘텐츠 전략 2~3문장")
+    slots: list[PlannedSlot]
+
+
+class CalendarSlot(BaseModel):
+    id: str
+    date: str
+    channel: ChannelId
+    topic: str
+    angle: str = ""
+    keywords: list[str] = Field(default_factory=list)
+    goal: str = ""
+    status: SlotStatus = "planned"
+    item_id: str = ""
+    run_id: str = ""
+    created_at: str = ""
