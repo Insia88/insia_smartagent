@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from ..models import (Brief, ChannelId, ContentItem, ContentPlan, Draft, Finding, FormatCheck, Plan, Profile,
                       ResearchPack, ResearchQuestion, Review, Source, UsageRecord, UserDocument)
@@ -44,7 +44,11 @@ class Backend(Protocol):
     knows the run and fills it. An exception raised by the callback that is a
     ``BackendError`` propagates (it stops the step); any other exception is
     reported through ``on_notice`` and ignored, so a broken recorder never
-    fails a run.
+    fails a run. When ``on_usage`` also has a ``check()`` method (the
+    pipeline's ``UsageMeter``), the live backend calls it before every paid
+    request inside one call (``pause_turn`` continuations, the research
+    structuring call), so a run over its cost cap stops there; whatever
+    ``check()`` raises (``BudgetExceeded``) propagates unchanged.
     """
 
     name: str  # "live" | "mock"
@@ -68,11 +72,14 @@ class Backend(Protocol):
         ...
 
     def plan_calendar(self, profile: Profile, theme: str, start: str, end: str, counts: dict[str, int],
-                      history: list[ContentItem]) -> ContentPlan:
+                      history: list[ContentItem], *, days: Mapping[str, Sequence[str]] | None = None) -> ContentPlan:
         """Content calendar for ``start``..``end`` (YYYY-MM-DD, inclusive) with
-        ``counts[channel]`` posts per channel on weekdays, avoiding the topics
-        in ``history``. The result is already normalized (see
-        ``insia_agents.planner.normalize_plan``)."""
+        ``counts[channel]`` posts per channel, avoiding the topics in
+        ``history``. ``days[channel]`` = the dates that channel may use
+        (``plan_week`` passes them: weekend rule applied, days already planned
+        removed); without it every channel uses the weekdays in range. The
+        result is already normalized (see ``insia_agents.planner.normalize_plan``);
+        ``plan_week`` also works with backends that do not take ``days``."""
         ...
 
 

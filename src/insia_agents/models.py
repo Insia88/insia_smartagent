@@ -275,6 +275,11 @@ class ContentItem(BaseModel):
     note: str = ""
     created_at: str = ""
     updated_at: str = ""
+    # The last approval (kept after publishing as an audit record; 0/None/"" = never approved).
+    approved_version: int = Field(default=0, description="승인한 버전 번호 (0 = 승인한 적 없음)")
+    approval_forced: bool = Field(default=False, description="검수를 통과하지 못한 버전을 사람이 '그래도 승인'했으면 true")
+    approved_score: int | None = Field(default=None, description="승인한 버전의 검수 점수 (검수 전이면 None)")
+    approved_at: str = Field(default="", description="승인한 시각 (UTC ISO)")
 
 
 class DraftVersion(BaseModel):

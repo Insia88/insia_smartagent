@@ -49,12 +49,12 @@ from .backends import create_backend
 from .backends.base import Backend, BackendError, RunContext
 from .config import Settings, resolve_mode
 from .events import EventBus, RealClock, SimClock
-from .models import (Brief, ChannelId, ChannelResult, Draft, Plan, Profile, ResearchPack, ResearchQuestion, Review,
-                     RunResult, UsageRecord)
+from .models import (Brief, CalendarSlot, ChannelId, ChannelResult, Draft, Plan, Profile, ResearchPack, ResearchQuestion,
+                     Review, RunResult, UsageRecord)
 from .storage import run_dir, save_run
 
 if TYPE_CHECKING:
-    from .db import Workspace
+    from .db import RunLease, Workspace
 
 try:  # priced by the intelligence layer; records normally arrive priced already
     from .costs import cost_of as _cost_of
@@ -392,13 +392,18 @@ def build_context(workspace: "Workspace | None", settings: Settings, *, docs: st
 
 
 def ensure_run(workspace: "Workspace", run_id: str, brief: Brief, *, kind: str, options: dict[str, Any] | None = None,
-               mode: str = "", model: str = "", profile: Profile | None = None, parent_item_id: str = "") -> None:
-    """Create the run row, or mark an existing one (server-created, resumed) as running again."""
+               mode: str = "", model: str = "", profile: Profile | None = None, parent_item_id: str = "") -> "RunLease":
+    """Create the run row, or mark an existing one (server-created, resumed) as running again.
+
+    Returns this process's lease on the run (``Workspace.acquire_run``): the
+    heartbeat that tells other processes the run is alive. The caller releases
+    it when the run ends (``lease.release()``; releasing twice is fine).
+    """
     existing = workspace.get_run(run_id)
     if existing is None:
         workspace.create_run(run_id, brief, kind=kind, options=options or {}, mode=mode, model=model, profile=profile,
                              parent_item_id=parent_item_id)
-        return
+        return workspace.acquire_run(run_id)
     fields: dict[str, Any] = {"status": "running", "options": {**(existing.get("options") or {}), **(options or {})}}
     if mode:
         fields["mode"] = mode
@@ -407,6 +412,7 @@ def ensure_run(workspace: "Workspace", run_id: str, brief: Brief, *, kind: str, 
     if profile is not None and not existing.get("profile"):
         fields["profile"] = profile
     workspace.update_run(run_id, **fields)
+    return workspace.acquire_run(run_id)
 
 
 def continue_numbering(workspace: "Workspace", bus: EventBus) -> None:
@@ -416,25 +422,46 @@ def continue_numbering(workspace: "Workspace", bus: EventBus) -> None:
         bus.continue_from(int(last["seq"]), float(last.get("t") or 0.0))
 
 
-def event_sink(workspace: "Workspace", run_id: str) -> Callable[[dict[str, Any]], None]:
-    """Bus listener that appends every event to the workspace (logs, never raises)."""
+def event_sink(workspace: "Workspace", run_id: str, lease: "RunLease | None" = None) -> Callable[[dict[str, Any]], None]:
+    """Bus listener that appends every event to the workspace (logs, never raises).
+
+    With ``lease`` (this process's claim on the run), nothing more is stored once another process took the run over.
+    """
+    from .db import RunTakenOverError
+
     failed = [False]
 
     def sink(event: dict[str, Any]) -> None:
         try:
+            if lease is not None and lease.lost:
+                raise RunTakenOverError(f"다른 곳에서 실행 {run_id}를 넘겨받았어요. 이 프로세스는 더 기록하지 않고 멈춰요.")
             workspace.append_event(run_id, event)
-        except Exception:  # noqa: BLE001 - the bus ignores listener errors; make them visible in the log
+        except Exception as exc:  # noqa: BLE001 - the bus ignores listener errors; make them visible in the log
             if not failed[0]:
                 failed[0] = True
-                log.exception("이벤트를 워크스페이스에 저장하지 못했어요 (run %s)", run_id)
+                if isinstance(exc, RunTakenOverError):
+                    log.warning("%s (run %s)", exc, run_id)
+                else:
+                    log.exception("이벤트를 워크스페이스에 저장하지 못했어요 (run %s)", run_id)
 
     return sink
 
 
-def make_checkpoint(runner: Any, meter: UsageMeter) -> Callable[[], None]:
+TAKEN_OVER_MESSAGE = "다른 곳에서 이 실행을 넘겨받아서 여기서는 멈췄어요"
+
+
+def make_checkpoint(runner: Any, meter: UsageMeter, lost: Callable[[], bool] | None = None) -> Callable[[], None]:
+    """Before every backend call: stop when the run was cancelled, taken over by another process (``lost``),
+    or went over its budget."""
+
     def checkpoint() -> None:
         if getattr(runner, "cancelled", False):
             raise RunCancelled()
+        if lost is not None and lost():
+            cancel = getattr(runner, "cancel", None)
+            if callable(cancel):  # stop the other channels too
+                cancel()
+            raise RunCancelled(TAKEN_OVER_MESSAGE)
         meter.check()
 
     return checkpoint
@@ -474,11 +501,18 @@ class _Recorder:
         self.brief = brief
         self.progress: dict[str, Any] = {"channels": {}, "followups": {}, "questions": [], **(progress or {})}
         self.version_ids: dict[tuple[str, int], str] = dict(version_ids or {})
+        self.lease: "RunLease | None" = None  # set once the run is claimed: no more writes after a takeover
         self._lock = threading.RLock()
 
     @property
     def enabled(self) -> bool:
         return self.workspace is not None
+
+    def _guard(self) -> None:
+        if self.lease is not None and self.lease.lost:
+            from .db import RunTakenOverError
+
+            raise RunTakenOverError(f"다른 곳에서 실행 {self.run_id}를 넘겨받았어요. 이 프로세스는 더 기록하지 않고 멈춰요.")
 
     def item_id(self, channel: str) -> str:
         from .db import pipeline_item_id
@@ -492,10 +526,12 @@ class _Recorder:
 
     def _save_progress(self) -> None:
         assert self.workspace is not None
+        self._guard()
         self.workspace.update_run(self.run_id, progress=self.progress)
 
     def plan(self, plan: Plan) -> None:
         if self.workspace is not None:
+            self._guard()
             self.workspace.update_run(self.run_id, plan=plan)
 
     def research(self, store: researcher.ResearchStore) -> None:
@@ -506,6 +542,7 @@ class _Recorder:
                 pack = store.pack.model_copy(deep=True)
                 questions = [q.model_dump(mode="json") for q in store.questions]
             self.progress["questions"] = questions
+            self._guard()
             self.workspace.update_run(self.run_id, research=pack, progress=self.progress)
 
     def draft(self, draft: Draft) -> None:
@@ -513,6 +550,7 @@ class _Recorder:
             return
         item_id = self.item_id(draft.channel)
         with self._lock:
+            self._guard()
             self.workspace.ensure_item(item_id, draft.channel, draft.title, run_id=self.run_id, brief=self.brief)
             version = self.workspace.add_version(item_id, draft, source="agent", run_id=self.run_id)
             self.version_ids[(draft.channel, draft.round)] = version.id
@@ -525,7 +563,8 @@ class _Recorder:
             if version_id is None:  # drafted before recording started (should not happen): store it now
                 self.draft(draft)
                 version_id = self.version_ids[(draft.channel, draft.round)]
-            self.workspace.attach_review(version_id, review)
+            self._guard()
+            self.workspace.attach_review(version_id, review, run_id=self.run_id)
 
     def followup_done(self, channel: str, round: int, store: researcher.ResearchStore) -> None:
         if self.workspace is None:
@@ -540,6 +579,7 @@ class _Recorder:
         if self.workspace is None:
             return
         with self._lock:
+            self._guard()
             self.workspace.upsert_item_from_result(self.run_id, result, self.brief)
             self.progress["channels"][result.channel] = "completed"
             self._save_progress()
@@ -689,6 +729,10 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
     target_dir: Path | None = None
     restore_hooks: Callable[[], None] = lambda: None
     sink: Callable[[dict[str, Any]], None] | None = None
+    lease: "RunLease | None" = None
+
+    def lost() -> bool:  # another process took the run over (Workspace.recover_stale / a forced resume)
+        return lease is not None and not lease.verify()
 
     try:
         if context is None:
@@ -696,7 +740,7 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
         meter = UsageMeter(run_id, workspace=workspace, cap=settings.max_cost_usd,
                            initial=workspace.run_cost(run_id) if workspace is not None else 0.0)
         ctx = AgentContext(bus=bus, backend=backend, settings=settings, brief=brief, simulated=simulated, context=context,
-                           checkpoint=make_checkpoint(runner, meter), wait=make_wait(runner, bus))
+                           checkpoint=make_checkpoint(runner, meter, lost), wait=make_wait(runner, bus))
         recorder = _Recorder(workspace, run_id, brief,
                              progress=resume_state.progress if resume_state else None,
                              version_ids=resume_state.version_ids if resume_state else None)
@@ -709,14 +753,15 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
         recorder.brief = brief
         backend_note = backend.prepare(brief) if hasattr(backend, "prepare") else None  # type: ignore[attr-defined]
         if workspace is not None:
-            ensure_run(workspace, run_id, brief, kind="pipeline", mode=backend.name, model=backend.model,
-                       profile=context.profile, options={
+            lease = ensure_run(workspace, run_id, brief, kind="pipeline", mode=backend.name, model=backend.model,
+                               profile=context.profile, options={
                            "max_rounds": settings.max_rounds, "pass_score": settings.pass_score,
                            "max_cost_usd": settings.max_cost_usd, "doc_ids": [d.id for d in context.documents],
                            "use_profile": context.profile is not None,
                        })
+            recorder.lease = lease
             continue_numbering(workspace, bus)
-            sink = event_sink(workspace, run_id)
+            sink = event_sink(workspace, run_id, lease)
             bus.add_listener(sink)
         if out_dir is not None:
             target_dir = run_dir(out_dir, run_id)
@@ -844,6 +889,8 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
             completed["items"] = recorder.item_ids()
         if meter.spent:
             completed["cost_usd"] = round(meter.spent, 6)
+        if lost():  # taken over at the very end: the new owner finishes and records the run
+            raise RunCancelled(TAKEN_OVER_MESSAGE)
         bus.emit("run.completed", "system", completed)
         if workspace is not None:
             summary = " · ".join(f"{channel_label(ch)} 실패: {msg}" for ch, msg in errors.items())
@@ -860,9 +907,15 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
                 bus.emit("run.failed", "system", data)
             except RuntimeError:
                 pass
-        if workspace is not None:
+        if workspace is not None and lease is not None and lease.lost:
+            log.warning("다른 곳에서 실행 %s를 넘겨받아서, 이 프로세스는 실행 상태를 기록하지 않아요", run_id)
+        elif workspace is not None:
+            from .db import RunTakenOverError
+
             try:
                 workspace.update_run(run_id, status=status, error=message, cost_usd=workspace.run_cost(run_id))
+            except RunTakenOverError as taken:  # the new owner records how the run goes from here
+                log.warning("%s", taken)
             except Exception:  # noqa: BLE001 - never mask the original error
                 log.exception("실행 상태를 저장하지 못했어요 (run %s)", run_id)
         raise
@@ -871,6 +924,8 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
         if sink is not None:
             bus.remove_listener(sink)
         restore_hooks()
+        if lease is not None:
+            lease.release()
 
 
 # ---------------------------------------------------------------------------
@@ -935,10 +990,13 @@ def load_resume_state(workspace: "Workspace", run_id: str) -> ResumeState:
                        version_ids=version_ids)
 
 
-def link_slot_after_run(workspace: "Workspace", run_id: str):
+def link_slot_after_run(workspace: "Workspace", run_id: str, *, owner_token: str | None = None):
     """For a calendar-slot run: link the slot to its item and mark it drafted.
 
-    Returns the updated ``CalendarSlot`` (``None`` when the run has no slot).
+    Only while the slot is still this run's claim (and, with ``owner_token``,
+    the run still this process's): a slot another run or process took
+    meanwhile is left alone (``Workspace.link_slot``). Returns the slot
+    (``None`` when the run has no slot).
     """
     from .db import pipeline_item_id
 
@@ -950,29 +1008,85 @@ def link_slot_after_run(workspace: "Workspace", run_id: str):
     if slot is None:
         return None
     item_id = pipeline_item_id(run_id, slot.channel)
-    detail = workspace.get_item(item_id)
-    if detail is None:
-        return workspace.update_slot(slot_id, status="planned", run_id=run_id)
-    if not detail.item.scheduled_at:
-        workspace.update_item(item_id, scheduled_at=slot.date)
-    return workspace.update_slot(slot_id, status="drafted", item_id=item_id, run_id=run_id)
+    if workspace.get_item(item_id) is None:
+        return workspace.release_slot(slot_id, run_id, status="planned", owner_token=owner_token) or workspace.get_slot(slot_id)
+    return workspace.link_slot(slot_id, run_id, item_id, owner_token=owner_token)
 
 
 _DEFAULT = object()
 
 
+def _stored_cap(value: Any) -> float:
+    try:
+        cap = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return cap if cap == cap and 0 < cap < float("inf") else 0.0
+
+
+def still_running_message(workspace: "Workspace", run_id: str) -> str:
+    """Why a ``running`` run cannot be resumed yet, and what to do (CLI wording)."""
+    from .db import STALE_AFTER_SECONDS, _parse_ts
+
+    owner = workspace.run_owner(run_id) or {}
+    if owner.get("this_host") and owner.get("pid"):
+        where = f"이 컴퓨터의 프로세스 {owner['pid']}"
+    elif owner.get("host"):
+        where = f"다른 컴퓨터·컨테이너({owner['host']})"
+    else:
+        where = "다른 프로그램"
+    beat = _parse_ts(owner.get("heartbeat_at") or "")
+    if beat is not None:
+        minutes = int(max(0.0, (datetime.now(timezone.utc) - beat).total_seconds()) // 60)
+        where += f", 마지막 신호 {minutes}분 전" if minutes else ", 방금 신호가 있었어요"
+    stale = int(STALE_AFTER_SECONDS // 60)
+    return (f"다른 곳에서 아직 실행 중인 작업이에요 ({where}). 끝날 때까지 기다려 주세요. 신호가 {stale}분 넘게 끊기면 "
+            f"이어서 실행할 때 자동으로 정리돼요. 멈춘 게 확실하면 'insia resume {run_id} --force'로 지금 이어서 할 수 있어요.")
+
+
+def _restore_slot(workspace: "Workspace", slot_id: str, before: "CalendarSlot", run_id: str,
+                  owner_token: str | None) -> None:
+    """Put a slot back the way it was before a resume took it (the resume failed or stopped) — unless another
+    process took the run over or another run claimed the slot meanwhile (``Workspace.release_slot``)."""
+    try:
+        if before.item_id and workspace.get_item(before.item_id) is not None:
+            workspace.release_slot(slot_id, run_id, status="drafted", item_id=before.item_id,
+                                   set_run_id=before.run_id or run_id, owner_token=owner_token)
+        elif before.status == "skipped":
+            workspace.release_slot(slot_id, run_id, status="skipped", set_run_id=before.run_id or run_id,
+                                   owner_token=owner_token)
+        else:
+            workspace.release_slot(slot_id, run_id, status="planned", owner_token=owner_token)
+    except Exception:  # noqa: BLE001 - never mask the run's own error
+        log.exception("슬롯 상태를 되돌리지 못했어요 (%s)", slot_id)
+
+
 def resume_run(run_id: str, settings: Settings, workspace: "Workspace", *, backend: Backend | None = None,
                bus: EventBus | None = None, client: object | None = None,
                listener: Callable[[dict[str, Any]], None] | None = None, runner: SimRunner | ThreadRunner | None = None,
-               out_dir: Any = _DEFAULT, context: RunContext | None = None, force: bool = False) -> RunResult:
+               out_dir: Any = _DEFAULT, context: RunContext | None = None, force: bool = False,
+               max_cost_usd: float | None = None) -> RunResult:
     """Continue an interrupted / failed / budget-stopped pipeline run.
 
     Reuses the stored plan and research, skips channels that already
     finished and continues each other channel from its last stored draft or
     review (same run id: its items and event stream continue). The original
-    run's round limit and pass score are kept; the mode too when
-    ``settings.mode`` is ``auto``. ``force=True`` also resumes a run still
-    marked ``running`` (only when you are sure no process is working on it).
+    run's round limit, pass score and budget cap are kept; the mode too when
+    ``settings.mode`` is ``auto``. ``max_cost_usd`` sets a new cap for this
+    run (raise it after a budget stop, or lower it); without it the run keeps
+    the cap it was started with. ``settings.max_cost_usd`` applies only when
+    the run had no cap, or when the run already spent its cap and the
+    settings' cap is higher (resuming a budget-stopped run with a raised cap).
+
+    A run still marked ``running`` is resumed only when its owner process is
+    gone (``Workspace.recover_stale``: dead pid, restarted machine, or no
+    heartbeat for 10 minutes); ``force=True`` takes it over anyway (only when
+    you are sure no process is working on it). A calendar-slot run takes its
+    slot back (``generating``) while it runs, so it cannot be generated twice,
+    and puts it back the way it was when the resume fails — unless another
+    process took the run over meanwhile (then this process stops at its next
+    checkpoint and leaves the run and the slot to the new owner). A run this
+    same process is running right now is refused.
     """
     run = workspace.get_run(run_id)
     if run is None:
@@ -981,8 +1095,12 @@ def resume_run(run_id: str, settings: Settings, workspace: "Workspace", *, backe
         raise NotFoundError(f"실행 {run_id}를 찾을 수 없어요")
     if run["kind"] not in RESUMABLE_KINDS:
         raise PipelineError(f"'{run['kind']}' 작업은 이어서 실행할 수 없어요. 같은 작업을 다시 시작해 주세요.")
+    if workspace.holds_run(run_id):  # this very process is running it (another thread, or a nested call)
+        raise PipelineError("이 실행은 이 프로그램에서 아직 진행 중이에요. 끝날 때까지 기다리거나 먼저 중단한 뒤 이어서 실행해 주세요.")
     if run["status"] == "running" and not force:
-        raise PipelineError("아직 실행 중으로 표시된 작업이에요. 정말 멈춘 작업이라면 프로그램을 다시 시작한 뒤 이어서 실행해 주세요.")
+        if not workspace.recover_stale(run_ids=[run_id], trust_own_pid=True):
+            raise PipelineError(still_running_message(workspace, run_id))
+        run = workspace.get_run(run_id) or run  # its owner was gone: now 'interrupted'
     state = load_resume_state(workspace, run_id)
     brief = Brief.model_validate(run["brief"])
     if run["status"] == "completed" and all(state.channels.get(ch) and state.channels[ch].completed for ch in brief.channels):
@@ -990,6 +1108,15 @@ def resume_run(run_id: str, settings: Settings, workspace: "Workspace", *, backe
 
     options = run.get("options") or {}
     overrides: dict[str, Any] = {"max_rounds": options.get("max_rounds"), "pass_score": options.get("pass_score")}
+    stored_cap = _stored_cap(options.get("max_cost_usd"))
+    if max_cost_usd is not None:
+        overrides["max_cost_usd"] = float(max_cost_usd)
+    elif stored_cap > 0:
+        # the run keeps its own cap; a run the cap already stopped can only go on with a higher one, so a higher
+        # cap from the caller's settings counts as raising it (e.g. the server's per-request option)
+        budget_stopped = workspace.run_cost(run_id) >= stored_cap
+        higher = settings.max_cost_usd > stored_cap
+        overrides["max_cost_usd"] = settings.max_cost_usd if budget_stopped and higher else stored_cap
     if settings.mode == "auto" and run.get("mode") in ("live", "mock"):
         overrides["mode"] = run["mode"]
     settings = settings.with_options(**overrides)
@@ -1012,9 +1139,32 @@ def resume_run(run_id: str, settings: Settings, workspace: "Workspace", *, backe
     target = settings.out_dir if out_dir is _DEFAULT else out_dir
     if not workspace.claim_run(run_id, run["status"]):  # everything is ready: claim the run atomically
         raise PipelineError("이 실행은 이미 다른 곳에서 이어서 진행 중이에요")
-    result = run_pipeline(brief, backend, bus, settings, runner=runner, out_dir=target, mode_note=note,
-                          workspace=workspace, context=context, resume_state=state)
-    link_slot_after_run(workspace, run_id)
+    slot_id = str(options.get("slot_id") or "") if run["kind"] == "slot" else ""
+    slot_before = None
+    if slot_id:
+        try:
+            slot_before = workspace.reclaim_slot(slot_id, run_id)
+        except BaseException:  # another live run is generating the slot: give the run back as it was
+            try:
+                workspace.update_run(run_id, status=run["status"], error=run.get("error") or "")
+            except Exception:  # noqa: BLE001
+                log.exception("실행 상태를 되돌리지 못했어요 (run %s)", run_id)
+            raise
+    # this process owns the run from here (run_pipeline keeps using this lease); its token decides whether the
+    # slot may still be handed back or linked when the run ends (not when another process took the run over)
+    lease = workspace.acquire_run(run_id)
+    try:
+        try:
+            result = run_pipeline(brief, backend, bus, settings, runner=runner, out_dir=target, mode_note=note,
+                                  workspace=workspace, context=context, resume_state=state)
+        except BaseException:
+            if slot_before is not None:
+                _restore_slot(workspace, slot_id, slot_before, run_id, lease.token)
+            raise
+        if slot_before is not None:
+            link_slot_after_run(workspace, run_id, owner_token=lease.token)
+    finally:
+        lease.release()
     return result
 
 

@@ -12,9 +12,18 @@ Each job is a run of its own (``runs.kind`` = review / revise / edit / slot)
 with the normal event stream, so the dashboard animates the same agents and
 the workspace keeps the history. Pass ``bus`` (and ``backend``) from
 ``pipeline.prepare_run`` to know the run id before the job starts (the server
-streams it); without them the job builds its own. Every function checks its
-input first and raises ``WorkspaceError`` / ``NotFoundError`` before any run
-is created.
+streams it); without them the job builds its own. Pass ``runner`` (a
+cancellable ``SimRunner`` / ``ThreadRunner``) to be able to stop the job the
+way a pipeline run is stopped. Every function checks its input first and
+raises ``WorkspaceError`` / ``NotFoundError`` before any run is created.
+
+Human edits during a job: a review/revise job records the version it started
+from (``options.base_version``). If a newer version appears while it runs (a
+person saved an edit), the job's result does not silently replace it: a
+review stays attached to the version it reviewed, and a revision is kept in
+the history while the newer version is put back on top as the current one
+(``Workspace.add_job_version``). ``JobResult.superseded_by_human_edit`` /
+``current_version`` and the ``run.completed`` event report it.
 """
 
 from __future__ import annotations
@@ -29,13 +38,14 @@ from .backends import create_backend
 from .backends.base import Backend, BackendError, RunContext
 from .channels import check_format
 from .config import Settings, resolve_mode
-from .db import (NotFoundError, Workspace, WorkspaceError, normalize_hashtags, pipeline_item_id, profile_is_empty)
+from .db import (NotFoundError, RunTakenOverError, Workspace, WorkspaceError, normalize_hashtags, pipeline_item_id,
+                 profile_is_empty)
 from .events import EventBus, RealClock, SimClock
 from .models import (Brief, CalendarSlot, ContentItem, ContentItemDetail, Draft, DraftVersion, FormatCheck, Plan, Profile,
                      ResearchPack, ResearchQuestion, Review, RunResult)
-from .pipeline import (BudgetExceeded, SimRunner, ThreadRunner, UsageMeter, build_context, continue_numbering, ensure_run,
-                       event_sink, failure_status, install_backend_hooks, link_slot_after_run, make_checkpoint, make_wait,
-                       new_run_id, prepare_run, run_pipeline)
+from .pipeline import (TAKEN_OVER_MESSAGE, BudgetExceeded, RunCancelled, SimRunner, ThreadRunner, UsageMeter, build_context,
+                       continue_numbering, ensure_run, event_sink, failure_status, install_backend_hooks, link_slot_after_run,
+                       make_checkpoint, make_wait, new_run_id, prepare_run, run_pipeline)
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +66,10 @@ class JobResult:
     format_checks: list[FormatCheck] = field(default_factory=list)
     slot: CalendarSlot | None = None
     result: RunResult | None = None
+    base_version: int | None = None  # the version a review/revise job started from
+    current_version: int | None = None  # the item's current version when the job ended
+    superseded: bool = False  # a newer version appeared while the job ran; the job's result did not become current
+    superseded_by_human_edit: bool = False  # ... and that newer version was a person's edit
 
     def to_dict(self) -> dict[str, Any]:
         def dump(value: Any) -> Any:
@@ -69,6 +83,10 @@ class JobResult:
             "review": dump(self.review),
             "format_checks": [c.model_dump(mode="json") for c in self.format_checks],
             "slot": dump(self.slot),
+            "base_version": self.base_version,
+            "current_version": self.current_version,
+            "superseded": self.superseded,
+            "superseded_by_human_edit": self.superseded_by_human_edit,
         }
 
 
@@ -131,7 +149,7 @@ class _Job:
     def __init__(self, workspace: Workspace, settings: Settings, kind: str, brief: Brief, *, item_id: str,
                  backend: Backend | None, bus: EventBus | None, client: object | None,
                  listener: Callable[[dict[str, Any]], None] | None, context: RunContext, options: dict[str, Any],
-                 needs_backend: bool = True) -> None:
+                 needs_backend: bool = True, runner: SimRunner | ThreadRunner | None = None) -> None:
         note: str | None = None
         if bus is None:
             if needs_backend:
@@ -153,12 +171,17 @@ class _Job:
         self.context = context
         self.options = options
         self.run_id = bus.run_id
-        self.runner: SimRunner | ThreadRunner = SimRunner(bus.clock) if isinstance(bus.clock, SimClock) else ThreadRunner(1)
+        if runner is None:
+            runner = SimRunner(bus.clock) if isinstance(bus.clock, SimClock) else ThreadRunner(1)
+        self.runner: SimRunner | ThreadRunner = runner
         self.meter = UsageMeter(self.run_id, workspace=workspace, cap=settings.max_cost_usd,
                                 initial=workspace.run_cost(self.run_id))
+        self.lease: Any = None
         self.ctx = AgentContext(bus=bus, backend=self.backend, settings=settings, brief=brief,  # type: ignore[arg-type]
                                 simulated=bool(getattr(bus.clock, "simulated", False)), context=context,
-                                checkpoint=make_checkpoint(self.runner, self.meter), wait=make_wait(self.runner, bus))
+                                checkpoint=make_checkpoint(self.runner, self.meter,
+                                                           lambda: self.lease is not None and not self.lease.verify()),
+                                wait=make_wait(self.runner, bus))
         self._sink: Callable[[dict[str, Any]], None] | None = None
         self._restore: Callable[[], None] = lambda: None
         self._finished = False
@@ -166,13 +189,14 @@ class _Job:
     def __enter__(self) -> "_Job":
         backend = self.backend
         try:
-            ensure_run(self.workspace, self.run_id, self.brief, kind=self.kind, options=self.options,
-                       mode=backend.name if backend is not None else "", model=backend.model if backend is not None else "",
-                       profile=self.context.profile, parent_item_id=self.item_id)
+            self.lease = ensure_run(self.workspace, self.run_id, self.brief, kind=self.kind, options=self.options,
+                                    mode=backend.name if backend is not None else "",
+                                    model=backend.model if backend is not None else "",
+                                    profile=self.context.profile, parent_item_id=self.item_id)
             continue_numbering(self.workspace, self.bus)
             if self.listener is not None:
                 self.bus.add_listener(self.listener)
-            self._sink = event_sink(self.workspace, self.run_id)
+            self._sink = event_sink(self.workspace, self.run_id, self.lease)
             self.bus.add_listener(self._sink)
             backend_note = None
             if backend is not None:
@@ -206,6 +230,8 @@ class _Job:
                                    "output_dir": None, "kind": self.kind, "item_id": self.item_id, **data}
         if self.meter.spent:
             payload["cost_usd"] = round(self.meter.spent, 6)
+        if self.lease is not None and not self.lease.verify():  # taken over: the new owner records the run
+            raise RunCancelled(TAKEN_OVER_MESSAGE)
         self.bus.emit("run.completed", "system", payload)
         self.workspace.update_run(self.run_id, status="completed", cost_usd=self.workspace.run_cost(self.run_id))
         self._finished = True
@@ -223,8 +249,12 @@ class _Job:
                     except RuntimeError:
                         pass
                 try:
+                    if self.lease is not None and self.lease.lost:
+                        raise RunTakenOverError(f"다른 곳에서 실행 {self.run_id}를 넘겨받았어요. 이 프로세스는 더 기록하지 않고 멈춰요.")
                     self.workspace.update_run(self.run_id, status=status, error=message,
                                               cost_usd=self.workspace.run_cost(self.run_id))
+                except RunTakenOverError as taken:  # the new owner records how the run goes from here
+                    log.warning("%s", taken)
                 except Exception:  # noqa: BLE001 - never mask the job's own error
                     log.exception("작업 상태를 저장하지 못했어요 (run %s)", self.run_id)
             elif not self._finished:
@@ -233,6 +263,8 @@ class _Job:
             if self._sink is not None:
                 self.bus.remove_listener(self._sink)
             self._restore()
+            if self.lease is not None:
+                self.lease.release()
         return False
 
     def done(self, *agents: str) -> None:
@@ -245,6 +277,22 @@ def _verdict(review: Review) -> str:
     return "통과" if review.passed else "미통과"
 
 
+def _superseded(workspace: Workspace, item_id: str, base_version: int, own_version: int) -> tuple[DraftVersion | None, bool]:
+    """When a job ends: ``(current, by_human)``.
+
+    ``current`` is the item's current version when it is not the job's own
+    result (``own_version``: the revision, or for a review the version it
+    reviewed), i.e. something newer was saved while the job ran, else None.
+    ``by_human`` is whether a person saved a version after the job started
+    (any ``human`` version after ``base_version`` other than the job's own).
+    """
+    detail = workspace.get_item(item_id)
+    if detail is None or not detail.versions or detail.versions[-1].version == own_version:
+        return None, False
+    by_human = any(v.source == "human" for v in detail.versions if v.version > base_version and v.version != own_version)
+    return detail.versions[-1], by_human
+
+
 # ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------
@@ -252,8 +300,14 @@ def _verdict(review: Review) -> str:
 
 def review_item(workspace: Workspace, item_id: str, *, settings: Settings | None = None, backend: Backend | None = None,
                 bus: EventBus | None = None, client: object | None = None,
-                listener: Callable[[dict[str, Any]], None] | None = None, context: RunContext | None = None) -> JobResult:
-    """재검수: review the item's current (latest) version and attach the result to it."""
+                listener: Callable[[dict[str, Any]], None] | None = None, context: RunContext | None = None,
+                runner: SimRunner | ThreadRunner | None = None) -> JobResult:
+    """재검수: review the item's current (latest) version and attach the result to it.
+
+    The review always stays on the version it reviewed. When a newer version
+    was saved meanwhile, that one stays current (and unreviewed) and the
+    result says ``superseded``.
+    """
     settings = settings or Settings.from_env()
     detail = _require_item(workspace, item_id)
     latest = _latest(detail, "검수할")
@@ -262,29 +316,42 @@ def review_item(workspace: Workspace, item_id: str, *, settings: Settings | None
     context = _context(workspace, settings, context)
     channel = detail.item.channel
     label = channel_label(channel)
+    options = {"item_id": item_id, "version": latest.version, "base_version": latest.version}
     with _Job(workspace, settings, "review", brief, item_id=item_id, backend=backend, bus=bus, client=client,
-              listener=listener, context=context, options={"item_id": item_id, "version": latest.version}) as job:
+              listener=listener, context=context, options=options, runner=runner) as job:
         ctx = job.ctx
         ctx.status("orchestrator", "waiting", f"{label} v{latest.version} 재검수 결과를 기다려요")
         review = job.runner.run(reviewer.review(ctx, research, latest.draft))
-        workspace.attach_review(latest.id, review)
+        workspace.attach_review(latest.id, review, run_id=job.run_id)
         ctx.handoff(reviewer.AGENT, orchestrator.AGENT, "result",
                     f"{label} v{latest.version} 재검수 {review.score}점 · {_verdict(review)}", channel)
+        newer, by_human = _superseded(workspace, item_id, latest.version, latest.version)
+        if newer is not None:
+            who = "사람이 고친" if by_human else "새"
+            ctx.log(f"검수하는 동안 {who} 버전 v{newer.version}이 저장됐어요. 이 점수는 v{latest.version}의 점수이고, "
+                    f"현재 버전 v{newer.version}은 아직 검수 전이에요.", "warn", reviewer.AGENT)
         job.done("reviewer", "orchestrator")
         item = _require_item(workspace, item_id).item
-        job.finish(scores={channel: review.score}, passed={channel: review.passed}, version=latest.version, status=item.status)
+        job.finish(scores={channel: review.score}, passed={channel: review.passed}, version=latest.version, status=item.status,
+                   base_version=latest.version, current_version=item.version, superseded=newer is not None,
+                   superseded_by_human_edit=by_human)
     return JobResult(run_id=job.run_id, kind="review", item=item, version=workspace.get_version(latest.id), review=review,
-                     format_checks=list(review.format_checks))
+                     format_checks=list(review.format_checks), base_version=latest.version, current_version=item.version,
+                     superseded=newer is not None, superseded_by_human_edit=by_human)
 
 
 def revise_item(workspace: Workspace, item_id: str, instructions: str = "", *, settings: Settings | None = None,
                 backend: Backend | None = None, bus: EventBus | None = None, client: object | None = None,
-                listener: Callable[[dict[str, Any]], None] | None = None, context: RunContext | None = None) -> JobResult:
+                listener: Callable[[dict[str, Any]], None] | None = None, context: RunContext | None = None,
+                runner: SimRunner | ThreadRunner | None = None) -> JobResult:
     """수정 요청: revise the latest version with its review (+ human ``instructions``) → new version → re-review.
 
     A latest version without a review is reviewed first. When the review
     asks for more research, the researcher runs a follow-up and the pack is
-    stored on this job's run (later jobs on the item reuse it).
+    stored on this job's run (later jobs on the item reuse it). When a newer
+    version was saved while the job ran (a person's edit), the revision is
+    kept in the history but that newer version stays current
+    (``superseded_by_human_edit``; see ``Workspace.add_job_version``).
     """
     settings = settings or Settings.from_env()
     instructions = (instructions or "").strip()
@@ -300,14 +367,14 @@ def revise_item(workspace: Workspace, item_id: str, instructions: str = "", *, s
     label = channel_label(channel)
     options = {"item_id": item_id, "base_version": latest.version, "instructions": instructions}
     with _Job(workspace, settings, "revise", brief, item_id=item_id, backend=backend, bus=bus, client=client,
-              listener=listener, context=context, options=options) as job:
+              listener=listener, context=context, options=options, runner=runner) as job:
         ctx, runner = job.ctx, job.runner
         store = _store(plan, research, brief)
         review = latest.review
         if review is None:
             ctx.log(f"{label} v{latest.version}에 검수 결과가 없어 먼저 검수해요", "info", reviewer.AGENT)
             review = runner.run(reviewer.review(ctx, store.snapshot(), latest.draft))
-            workspace.attach_review(latest.id, review)
+            workspace.attach_review(latest.id, review, run_id=job.run_id)
         runner.run(reviewer.request_revision(ctx, review, instructions))
         if review.needs_research:
             try:
@@ -317,7 +384,13 @@ def revise_item(workspace: Workspace, item_id: str, instructions: str = "", *, s
                 ctx.log(f"{label} 추가 조사 실패: {exc} — 지금 있는 근거로 수정을 이어가요", "warn", researcher.AGENT)
                 ctx.status(researcher.AGENT, "idle", "추가 조사 요청이 오면 다시 찾아볼게요")
         new_draft = runner.run(orchestrator.revise(ctx, plan, store.snapshot(), latest.draft, review, instructions=instructions))
-        version = workspace.add_version(item_id, new_draft, source="agent", instructions=instructions, run_id=job.run_id)
+        version, restored = workspace.add_job_version(item_id, new_draft, base_version=latest.version, source="agent",
+                                                      instructions=instructions, run_id=job.run_id)
+        if restored is not None:
+            who = "사람이 고친 버전" if restored.source == "human" else "새 버전"
+            ctx.log(f"수정하는 동안 {who}이 저장돼서, 수정 결과는 v{version.version}으로 기록만 하고 그 내용을 현재 버전 "
+                    f"v{restored.version}으로 유지했어요. 수정 결과를 쓰려면 보관함 기록에서 v{version.version}을 확인해 주세요.",
+                    "warn", orchestrator.AGENT)
         new_review: Review | None = None
         try:
             new_review = runner.run(reviewer.review(ctx, store.snapshot(), new_draft))
@@ -325,16 +398,26 @@ def revise_item(workspace: Workspace, item_id: str, instructions: str = "", *, s
             ctx.log(f"수정본 v{version.version}은 저장했지만 재검수를 마치지 못했어요: {exc}. 보관함에서 재검수를 눌러 주세요.",
                     "warn", reviewer.AGENT)
         if new_review is not None:
-            workspace.attach_review(version.id, new_review)
+            workspace.attach_review(version.id, new_review, run_id=job.run_id)
             ctx.handoff(reviewer.AGENT, orchestrator.AGENT, "result",
                         f"{label} v{version.version} 검수 {new_review.score}점 · {_verdict(new_review)}", channel)
+        # judged at the end: a person may also have saved a version while the revision was being re-reviewed
+        newer, by_human = _superseded(workspace, item_id, latest.version, version.version)
+        superseded = newer is not None
+        if superseded and restored is None:
+            who = "사람이 고친" if by_human else "새"
+            ctx.log(f"재검수하는 동안 {who} 버전 v{newer.version}이 저장됐어요. 수정 결과 v{version.version}은 기록에 남고, "
+                    f"현재 버전은 v{newer.version}이에요.", "warn", orchestrator.AGENT)
         job.done("orchestrator", "reviewer")
         item = _require_item(workspace, item_id).item
         job.finish(scores={channel: new_review.score} if new_review else {},
                    passed={channel: new_review.passed} if new_review else {},
-                   version=version.version, status=item.status)
+                   version=version.version, status=item.status, base_version=latest.version, current_version=item.version,
+                   superseded=superseded, superseded_by_human_edit=by_human)
     return JobResult(run_id=job.run_id, kind="revise", item=item, version=workspace.get_version(version.id),
-                     review=new_review, format_checks=list(new_review.format_checks) if new_review else [])
+                     review=new_review, format_checks=list(new_review.format_checks) if new_review else [],
+                     base_version=latest.version, current_version=item.version, superseded=superseded,
+                     superseded_by_human_edit=by_human)
 
 
 def edit_item(workspace: Workspace, item_id: str, title: str, content: str, hashtags: list[str] | str | None = None, *,
@@ -405,20 +488,21 @@ def slot_brief(slot: CalendarSlot, profile: Profile | None = None) -> Brief:
 def generate_slot(workspace: Workspace, slot_id: str, *, settings: Settings | None = None, backend: Backend | None = None,
                   bus: EventBus | None = None, client: object | None = None,
                   listener: Callable[[dict[str, Any]], None] | None = None, context: RunContext | None = None,
-                  force: bool = False) -> JobResult:
+                  force: bool = False, runner: SimRunner | ThreadRunner | None = None) -> JobResult:
     """캘린더 슬롯 초안: run the pipeline for the slot's channel and link the item to the slot.
 
     The slot is ``generating`` while it runs and ``drafted`` afterwards (the
     item gets the slot date as ``scheduled_at``); on failure it goes back to
     ``planned`` so it can be retried (or resumed with ``resume_run``), and a
     failed ``force=True`` regeneration keeps the draft the slot already had.
+    A slot another live run is generating is refused even with ``force``; a
+    slot left ``generating`` by a process that is gone is recovered and
+    generated again (``Workspace.claim_slot``).
     """
     settings = settings or Settings.from_env()
     slot = workspace.get_slot(slot_id)
     if slot is None:
         raise NotFoundError(f"캘린더 슬롯 {slot_id}를 찾을 수 없어요")
-    if slot.status == "generating" and not force:
-        raise WorkspaceError("이 슬롯은 이미 초안을 만드는 중이에요")
     if slot.status == "drafted" and slot.item_id and not force:
         raise WorkspaceError(f"이미 초안이 있어요 (보관함 {slot.item_id}). 다시 만들려면 force로 요청해 주세요.")
     context = _context(workspace, settings, context)
@@ -432,22 +516,33 @@ def generate_slot(workspace: Workspace, slot_id: str, *, settings: Settings | No
     if listener is not None:
         bus.add_listener(listener)
     run_id = bus.run_id
+    # a slot that already had a draft keeps it when this (re)generation fails
+    had_draft = bool(slot.item_id) and slot.status in ("drafted", "generating") and workspace.get_item(slot.item_id) is not None
     workspace.claim_slot(slot.id, run_id, force=force)  # atomic: a double click cannot start two runs
+    lease = None
     try:
-        ensure_run(workspace, run_id, brief, kind="slot", options={"slot_id": slot.id}, mode=backend.name,
-                   model=backend.model, profile=context.profile)
-        result = run_pipeline(brief, backend, bus, settings, out_dir=settings.out_dir, mode_note=note, workspace=workspace,
-                              context=context)
+        lease = ensure_run(workspace, run_id, brief, kind="slot", options={"slot_id": slot.id}, mode=backend.name,
+                           model=backend.model, profile=context.profile)
+        result = run_pipeline(brief, backend, bus, settings, runner=runner, out_dir=settings.out_dir, mode_note=note,
+                              workspace=workspace, context=context)
     except BaseException:
-        try:  # a failed regeneration keeps the draft the slot already had; otherwise the slot can be retried
-            if slot.status == "drafted" and slot.item_id:
-                workspace.update_slot(slot.id, status="drafted", run_id=slot.run_id)
+        # a failed regeneration keeps the draft the slot already had; otherwise the slot can be retried. Only while
+        # the slot is still this run's: when another process took the run over (recovered it, or resumed it with
+        # force) or another run claimed the slot meanwhile, the slot is theirs now and stays as they left it.
+        token = lease.token if lease is not None else None
+        try:
+            if had_draft:
+                workspace.release_slot(slot.id, run_id, status="drafted", item_id=slot.item_id,
+                                       set_run_id=slot.run_id or run_id, owner_token=token)
             else:
-                workspace.update_slot(slot.id, status="planned", run_id=run_id)
+                workspace.release_slot(slot.id, run_id, status="planned", owner_token=token)
         except Exception:  # noqa: BLE001
             log.exception("슬롯 상태를 되돌리지 못했어요 (%s)", slot.id)
         raise
-    linked = link_slot_after_run(workspace, run_id)
+    finally:
+        if lease is not None:
+            lease.release()
+    linked = link_slot_after_run(workspace, run_id, owner_token=lease.token)
     detail = _require_item(workspace, pipeline_item_id(run_id, slot.channel))
     latest = detail.versions[-1] if detail.versions else None
     return JobResult(run_id=run_id, kind="slot", item=detail.item, version=latest, review=latest.review if latest else None,

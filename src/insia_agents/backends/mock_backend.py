@@ -27,8 +27,9 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from ..channels import CHANNELS, FORMAT_ITEM_ID, chars_no_space, chars_with_space, first_lines
 from ..config import Settings
@@ -54,9 +55,8 @@ from ..models import (
     RubricScore,
     Source,
 )
-from ..planner import (DEFAULT_GOALS, cap_counts, history_keys, normalize_counts, normalize_plan, repeats_history, slot_days,
-                       spread, topic_key)
-from ..prompt_loader import DocumentExcerpt, budget_documents, profile_is_empty, user_sources
+from ..planner import DEFAULT_GOALS, calendar_days, history_keys, normalize_plan, repeats_history, spread, topic_key
+from ..prompt_loader import DocumentExcerpt, blind_safe_text, budget_documents, profile_is_empty, user_sources
 from .base import BackendError, EmitFn, NoticeFn, RunContext, UsageFn
 
 TEMPLATE_MODEL = "mock-template"
@@ -695,6 +695,12 @@ def _items(values: list[str], count: int, limit: int) -> list[str]:
     return [_clip(v, limit) for v in values if v.strip()][:count]
 
 
+def _required(values: list[str]) -> list[str]:
+    """Every required phrase, whole (whitespace collapsed): the format check
+    wants each one word for word, so none may be dropped or shortened."""
+    return [re.sub(r"\s+", " ", v).strip() for v in values if v.strip()]
+
+
 def _banned_pattern(word: str) -> re.Pattern[str] | None:
     chars = [c for c in word if not c.isspace()]
     return re.compile(r"\s*".join(re.escape(c) for c in chars), re.IGNORECASE) if chars else None
@@ -740,7 +746,11 @@ def _profile_context(profile: Profile | None, research: ResearchPack) -> dict[st
                 role = _clip(m.role, 20) or "팀원"
                 label = "채용 예정" if m.hiring else role
                 if m.background.strip():
-                    ability = f"{_clip(m.background, 80)} (자사 자료)"
+                    # Blind rule: the template copies text verbatim, so only words known to be generic
+                    # (field, role, degree, years) stay; any other word — a school or employer the
+                    # name rules may not know ("카카오", "토스") — becomes ○○.
+                    safe = blind_safe_text(m.background, keep=[p.company_name, p.service_name])
+                    ability = f"{_clip(safe, 80)} (자사 자료)"
                 else:
                     ability = "[요구 역량: ○○]" if m.hiring else "[경력: ○○ 분야 ○년]"
                 rows.append(f"| {label} | ○○○ | {role} | {ability} |")
@@ -751,7 +761,7 @@ def _profile_context(profile: Profile | None, research: ResearchPack) -> dict[st
         closing = [_clip(p.cta, 100)] if p.cta.strip() else []
         if p.contact.strip():
             closing.append(f"문의: {_clip(p.contact, 60)}")
-        closing += _items(p.required_phrases, 3, 100)
+        closing += _required(p.required_phrases)
         if closing:
             extra["closing_extra"] = "\n\n" + "\n".join(closing)
         if p.brand_colors:
@@ -778,7 +788,7 @@ def template_draft(brief: Brief, research: ResearchPack, channel: ChannelId, rou
     ctx = _Ctx(brief_context(brief, profile), **_profile_context(profile, research))
     has_profile = profile is not None and not profile_is_empty(profile)
     default_tags = list(profile.default_hashtags) if has_profile and profile is not None else []
-    required = _items(profile.required_phrases, 3, 100) if has_profile and profile is not None else []
+    required = _required(profile.required_phrases) if has_profile and profile is not None else []
     cta = _clip(profile.cta, 100) if has_profile and profile is not None and profile.cta.strip() else ""
     used = [f.id for f in research.findings]
     fixed = round >= 1
@@ -1055,13 +1065,13 @@ def _calendar_topics(profile: Profile | None, theme: str) -> list[tuple[str, str
 
 
 def template_calendar(profile: Profile | None, theme: str, start: str, end: str, counts: dict[str, int],
-                      history: list[ContentItem]) -> ContentPlan:
-    """Deterministic plan: each channel's posts spread over the weekdays in
-    range (channels offset so they rarely share a day), topics drawn in turn
-    from a bank built from the theme and profile, skipping any topic that
-    repeats ``history`` or an earlier slot."""
-    days = slot_days(start, end)
-    capped, _ = cap_counts(normalize_counts(counts), len(days))
+                      history: list[ContentItem], days: Mapping[str, Sequence[str]] | None = None) -> ContentPlan:
+    """Deterministic plan: each channel's posts spread over its posting days
+    (``days`` per channel, default the weekdays in range; channels offset so
+    they rarely share a day), topics drawn in turn from a bank built from the
+    theme and profile, skipping any topic that repeats ``history`` or an
+    earlier slot."""
+    capped, by_channel = calendar_days(start, end, counts, days)
     p = profile if profile is not None and not profile_is_empty(profile) else Profile()
     bank = _calendar_topics(p, theme)
     seen = history_keys(history)
@@ -1069,7 +1079,7 @@ def template_calendar(profile: Profile | None, theme: str, start: str, end: str,
     order = {c: i for i, c in enumerate(ALL_CHANNELS)}
     wanted: list[tuple[str, ChannelId]] = []
     for channel, count in capped.items():
-        wanted += [(day, channel) for day in spread(count, days, offset=order[channel])]
+        wanted += [(day, channel) for day in spread(count, by_channel[channel], offset=order[channel])]
     wanted.sort(key=lambda pair: (pair[0], order[pair[1]]))
 
     slots: list[PlannedSlot] = []
@@ -1091,9 +1101,11 @@ def template_calendar(profile: Profile | None, theme: str, start: str, end: str,
                                  goal=DEFAULT_GOALS.get(channel, "")))
     total = len(slots)
     mix = ", ".join(f"{CHANNELS[c].label} {n}편" for c, n in capped.items())
-    summary = (f"[데모] {start}~{end} 평일에 {mix}, 모두 {total}편을 배치했어요. 지난 게시물과 겹치는 주제는 뺐어요. "
+    weekend = any(date.fromisoformat(slot.date).weekday() >= 5 for slot in slots)
+    when = f"{start}~{end}" + ("(주말 포함)" if weekend else " 평일")
+    summary = (f"[데모] {when}에 {mix}, 모두 {total}편을 배치했어요. 지난 게시물과 겹치는 주제는 뺐어요. "
                "live 모드에서는 총괄 에이전트가 프로필과 주제를 읽고 계획해요.")
-    return normalize_plan(ContentPlan(summary=summary, slots=slots), start, end, capped)
+    return normalize_plan(ContentPlan(summary=summary, slots=slots), start, end, capped, days=by_channel)
 
 
 # ---------------------------------------------------------------------------
@@ -1329,8 +1341,8 @@ class MockBackend:
         return produced
 
     def plan_calendar(self, profile: Profile, theme: str, start: str, end: str, counts: dict[str, int],
-                      history: list[ContentItem]) -> ContentPlan:
-        plan = template_calendar(profile, theme, start, end, counts, history)
+                      history: list[ContentItem], *, days: Mapping[str, Sequence[str]] | None = None) -> ContentPlan:
+        plan = template_calendar(profile, theme, start, end, counts, history, days=days)
         self._usage("orchestrator", "plan_calendar", [profile, theme, start, end, counts, history], plan)
         return plan
 

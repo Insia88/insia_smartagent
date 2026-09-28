@@ -24,10 +24,18 @@ without a code change, later sources winning:
    least ``INPUT`` and ``OUTPUT``; missing cache prices are derived from the
    input price (read 0.1×, 5-minute write 1.25×).
 
-A model without a price costs 0 (web searches included) and is logged once
-(a warning, never an error): the run keeps going, but the budget cap cannot
-see its spend, so set a price for it. ``cache_write`` is the 5-minute-TTL rate (the only TTL this
-package uses). Mock-mode records (model ``mock``) are always free.
+Tokens of a model without a price cost 0 and the model is logged once (a
+warning, never an error; the live backend also shows a notice): the run keeps
+going, but the budget cap cannot see that spend, so set a price for it. Web
+searches are still counted (their fee does not depend on the model).
+``cache_write`` is the 5-minute-TTL rate (the only TTL this package uses).
+Mock-mode records (model ``mock``) are always free.
+
+Server-side refusal fallback: a response can be produced by several attempts
+(the requested model declines, a fallback model answers). ``usage.iterations``
+is then the per-attempt source of truth and top-level ``usage`` covers only
+the attempt that produced the message, so ``usage_from_response`` bills every
+iteration at its own model's rates (a declined attempt included).
 """
 
 from __future__ import annotations
@@ -50,6 +58,9 @@ PRICE_FIELDS: tuple[str, ...] = ("input", "output", "cache_read", "cache_write")
 # USD per million tokens (MTok).
 PRICES: dict[str, dict[str, float]] = {
     "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
+    # Default server-side fallback target (cyber-category refusals of Opus 5 /
+    # Fable 5.1 go to Opus 4.8); Opus 5 is priced the same as Opus 4.8.
+    "claude-opus-4-8": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
     "claude-opus-5-5": {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0},
     "claude-sonnet-5": {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.5},
     "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25},
@@ -205,28 +216,39 @@ def is_mock_model(model: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _warn_unpriced(model: str) -> None:
+    if model not in _warned:
+        _warned.add(model)
+        log.warning("모델 %r의 가격을 몰라 이 모델의 토큰 비용을 0으로 기록해요. prices.json이나 %s%s_INPUT/_OUTPUT으로 가격을 넣어 주세요.",
+                    model, ENV_PREFIX, env_key(model or "MODEL"))
+
+
+def _token_cost(price: Mapping[str, float], input_tokens: int, output_tokens: int, cache_read: int,
+                cache_write: int) -> float:
+    return (input_tokens * price.get("input", 0.0)
+            + output_tokens * price.get("output", 0.0)
+            + cache_read * price.get("cache_read", 0.0)
+            + cache_write * price.get("cache_write", 0.0)) / 1_000_000
+
+
 def cost_of(record: UsageRecord, *, prices: Mapping[str, Mapping[str, float]] | None = None,
             web_search_per_1k: float | None = None, env: Mapping[str, str] | None = None,
             home: str | Path | None = None) -> float:
-    """USD cost of one usage record (6 decimals). Unknown model → 0 (+ one warning)."""
+    """USD cost of one usage record (6 decimals). Unknown model → its tokens
+    cost 0 (+ one warning); web searches are still counted."""
     if is_mock_model(record.model):
         return 0.0
     if prices is None or web_search_per_1k is None:
         table, web = load_prices(env, home)
         prices = table if prices is None else prices
         web_search_per_1k = web if web_search_per_1k is None else web_search_per_1k
+    searches = record.web_search_requests * web_search_per_1k / 1000
     price = _lookup(prices, record.model)
     if price is None:
-        if record.model not in _warned:
-            _warned.add(record.model)
-            log.warning("모델 %r의 가격을 몰라 비용을 0으로 기록해요. prices.json이나 %s%s_INPUT/_OUTPUT으로 가격을 넣어 주세요.",
-                        record.model, ENV_PREFIX, env_key(record.model or "MODEL"))
-        return 0.0
-    tokens = (record.input_tokens * price.get("input", 0.0)
-              + record.output_tokens * price.get("output", 0.0)
-              + record.cache_read_tokens * price.get("cache_read", 0.0)
-              + record.cache_write_tokens * price.get("cache_write", 0.0)) / 1_000_000
-    searches = record.web_search_requests * web_search_per_1k / 1000
+        _warn_unpriced(record.model)
+        return round(searches, 6)
+    tokens = _token_cost(price, record.input_tokens, record.output_tokens, record.cache_read_tokens,
+                         record.cache_write_tokens)
     return round(tokens + searches, 6)
 
 
@@ -257,32 +279,104 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def _tokens_of(obj: Any) -> tuple[int, int, int, int]:
+    """``(input, output, cache_read, cache_write)`` of a usage object or an iteration entry."""
+    return tuple(_count(obj, name) for name in TOKEN_FIELDS)  # type: ignore[return-value]
+
+
+def _model_name(value: Any) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+def served_model(response: Any, model: str) -> str:
+    """The model that produced the returned message (``response.model``), else ``model``."""
+    return _model_name(_field(response, "model")) or model
+
+
+def usage_parts(response: Any, model: str) -> list[tuple[str, tuple[int, int, int, int]]]:
+    """The billed attempts of one response: ``[(model, (input, output, cache_read, cache_write))]``.
+
+    ``usage.iterations`` (server-side refusal fallback, server-tool loops,
+    compaction) lists every sampling attempt with its own model and tokens and
+    is the billing source of truth: top-level ``usage`` covers only the attempt
+    that produced the message (a declined attempt bills at its model's rates,
+    the fallback attempt at the fallback model's). An entry without a model is
+    billed at the requested ``model``. Without iterations there is one part:
+    top-level ``usage`` at the served model.
+    """
+    usage = _field(response, "usage")
+    iterations = _field(usage, "iterations")
+    parts: list[tuple[str, tuple[int, int, int, int]]] = []
+    if isinstance(iterations, (list, tuple)):
+        for entry in iterations:
+            tokens = _tokens_of(entry)
+            if any(tokens):
+                parts.append((_model_name(_field(entry, "model")) or model, tokens))
+    return parts or [(served_model(response, model), _tokens_of(usage))]
+
+
+def response_models(response: Any, model: str) -> list[str]:
+    """Every model billed for this response (served model first), deduplicated."""
+    names = [served_model(response, model)] + [name for name, _ in usage_parts(response, model)]
+    return list(dict.fromkeys(n for n in names if n))
+
+
 def usage_from_response(response: Any, *, agent: str, task: str, model: str, run_id: str = "",
                         prices: Mapping[str, Mapping[str, float]] | None = None,
                         web_search_per_1k: float | None = None) -> UsageRecord:
     """Build a priced ``UsageRecord`` from an SDK ``Message`` (or a dict/fake).
 
-    Missing fields count as 0. The model that actually served the response
-    (``response.model`` — differs from ``model`` after a server-side refusal
-    fallback, and top-level ``usage`` covers that serving attempt) is priced;
-    ``model`` is the fallback when the response names none. Only reads
-    ``model`` and ``usage`` — never ``content`` (a refusal is recorded too).
+    Missing fields count as 0. ``record.model`` is the model that served the
+    response (``response.model`` — differs from ``model`` after a server-side
+    refusal fallback; ``model`` when the response names none). Tokens and cost
+    cover every attempt in ``usage.iterations`` (see ``usage_parts``), each at
+    its own model's price, plus the web-search fee once; a part whose model has
+    no price adds 0 and is logged (``response_models`` lists the models so the
+    caller can warn). Only reads ``model`` and ``usage`` — never ``content``
+    (a refusal is recorded too).
     """
     usage = _field(response, "usage")
-    served = _field(response, "model")
+    served = served_model(response, model)
+    top = _tokens_of(usage)
+    parts = usage_parts(response, model)
+    summed = tuple(sum(tokens[i] for _, tokens in parts) for i in range(4))
+    # The iteration breakdown includes the top-level attempt; never bill less than top-level reports.
+    tokens = tuple(max(a, b) for a, b in zip(summed, top))
     record = UsageRecord(
         run_id=run_id,
         agent=agent,
         task=task,
-        model=served if isinstance(served, str) and served.strip() else model,
-        input_tokens=_count(usage, "input_tokens"),
-        output_tokens=_count(usage, "output_tokens"),
-        cache_read_tokens=_count(usage, "cache_read_input_tokens"),
-        cache_write_tokens=_count(usage, "cache_creation_input_tokens"),
+        model=served,
+        input_tokens=tokens[0],
+        output_tokens=tokens[1],
+        cache_read_tokens=tokens[2],
+        cache_write_tokens=tokens[3],
         web_search_requests=_count(_field(usage, "server_tool_use"), "web_search_requests"),
         created_at=now_iso(),
     )
-    return record.model_copy(update={"cost_usd": cost_of(record, prices=prices, web_search_per_1k=web_search_per_1k)})
+    if is_mock_model(served):
+        return record
+    if prices is None or web_search_per_1k is None:
+        table, web = load_prices()
+        prices = table if prices is None else prices
+        web_search_per_1k = web if web_search_per_1k is None else web_search_per_1k
+
+    def priced(parts_: list[tuple[str, tuple[int, int, int, int]]]) -> float:
+        total = 0.0
+        for name, counts in parts_:
+            price = {f: 0.0 for f in PRICE_FIELDS} if is_mock_model(name) else _lookup(prices, name)
+            if price is None:
+                _warn_unpriced(name)
+                continue
+            total += _token_cost(price, *counts)
+        return total
+
+    token_cost = max(priced(parts), priced([(served, top)]))
+    searches = record.web_search_requests * web_search_per_1k / 1000
+    return record.model_copy(update={"cost_usd": round(token_cost + searches, 6)})
 
 
 def estimate_tokens(text: str) -> int:

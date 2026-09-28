@@ -721,3 +721,213 @@ def test_packaged_prompts_load_and_teach_the_context_rules():
     assert "자사 프로필" in agent_prompt("reviewer") and "어긋나는 내용은 critical" in agent_prompt("reviewer")
     planner = agent_prompt("planner")
     assert "available_days" in planner and "history" in planner and "ContentPlan" in planner
+
+
+# ---------------------------------------------------------------------------
+# Budget cap inside one backend call (pause_turn continuations, structure call)
+# ---------------------------------------------------------------------------
+
+from insia_agents.pipeline import BudgetExceeded, UsageMeter  # noqa: E402
+
+_SEARCH_USE = SimpleNamespace(type="server_tool_use", id="srv_b", name="web_search", input={"query": "소상공인 통계"})
+
+
+def _paid_turn(stop_reason: str = "pause_turn", content=None) -> SimpleNamespace:
+    # 180k input + 2k output on Opus 5 + 10 searches ≈ $1.05 per request
+    return usage_message(content if content is not None else [_SEARCH_USE], stop_reason=stop_reason,
+                         input_tokens=180_000, output_tokens=2_000, searches=10)
+
+
+def test_budget_cap_stops_research_before_the_next_paid_continuation(settings, prompts_dir, brief, plan, pack):
+    client = FakeClient([_paid_turn() for _ in range(5)] + [_paid_turn("end_turn", [text("메모")]),
+                                                              usage_message([json_text(pack)])])
+    backend = AnthropicBackend(replace(settings, max_continuations=5), client=client)
+    meter = UsageMeter("r1", cap=0.5)
+    backend.on_usage = meter
+    with pytest.raises(BudgetExceeded, match="예산 상한"):
+        backend.research(brief, plan.questions, lambda t, d: None)
+    assert len(client.calls) == 1  # the first turn crossed the cap; no second paid request
+    assert meter.calls == 1 and meter.spent == pytest.approx(1.05, abs=0.01)
+
+
+def test_budget_cap_also_guards_the_research_structuring_call(settings, prompts_dir, brief, plan, pack):
+    client = FakeClient([_paid_turn("end_turn", [text("메모")]), usage_message([json_text(pack)])])
+    backend = AnthropicBackend(settings, client=client)
+    backend.on_usage = UsageMeter("r1", cap=0.5)
+    with pytest.raises(BudgetExceeded):
+        backend.research(brief, plan.questions, lambda t, d: None)
+    assert len(client.calls) == 1  # the search call finished over the cap; the structure call never started
+
+
+def test_a_response_that_already_arrived_is_kept_even_over_the_cap(settings, prompts_dir, brief, plan):
+    client = FakeClient([usage_message([json_text(plan)], input_tokens=500_000)])  # $2.5 for one plan call
+    backend = AnthropicBackend(settings, client=client)
+    meter = UsageMeter("r1", cap=0.5)
+    backend.on_usage = meter
+    assert backend.plan(brief) == plan  # paid for: returned, not thrown away
+    assert meter.exceeded()
+    with pytest.raises(BudgetExceeded):  # but the next call does not start
+        backend.plan(brief)
+    assert len(client.calls) == 1
+
+
+def test_under_the_cap_every_continuation_runs(settings, prompts_dir, brief, plan, pack):
+    client = FakeClient([_paid_turn(), _paid_turn("end_turn", [text("메모")]), usage_message([json_text(pack)])])
+    backend = AnthropicBackend(settings, client=client)
+    backend.on_usage = UsageMeter("r1", cap=50.0)
+    backend.research(brief, plan.questions, lambda t, d: None)
+    assert len(client.calls) == 3
+
+
+def test_a_pipeline_run_stops_right_after_the_cap_is_crossed(settings, prompts_dir, tmp_path):
+    """The review's repro: cap $0.50, plan ≈ $0.01, then search turns ≈ $1.05 each."""
+    from insia_agents.db import Workspace
+    from insia_agents.events import EventBus, RealClock
+    from insia_agents.models import Brief
+    from insia_agents.pipeline import run_pipeline
+
+    small_plan = Plan(summary="요약", key_messages=["a", "b", "c"],
+                      questions=[ResearchQuestion(id="q1", question="질문", why="왜", channels=["linkedin"])],
+                      outlines=[ChannelOutline(channel="linkedin", sections=["도입"])])
+    client = FakeClient([usage_message([json_text(small_plan)], input_tokens=1000, output_tokens=200)]
+                        + [_paid_turn() for _ in range(5)] + [_paid_turn("end_turn", [text("메모")])]
+                        + [usage_message([json_text(ResearchPack(findings=[], sources=[], gaps=["없음"]))])])
+    live = replace(settings, mode="live", max_cost_usd=0.5, max_continuations=5, home=tmp_path / "ws")
+    workspace = Workspace(tmp_path / "ws")
+    try:
+        with pytest.raises(BudgetExceeded):
+            run_pipeline(Brief(topic="테스트", channels=["linkedin"]), AnthropicBackend(live, client=client),
+                         EventBus("run-cap", clock=RealClock()), live, workspace=workspace)
+        assert len(client.calls) == 2  # plan + the one search turn that crossed the cap (was 8)
+        assert workspace.run_cost("run-cap") == pytest.approx(1.06, abs=0.01)  # was $7.08
+    finally:
+        workspace.close()
+
+
+# ---------------------------------------------------------------------------
+# Refusal fallback billing through the backend (and the real SDK stream)
+# ---------------------------------------------------------------------------
+
+
+def test_an_unpriced_fallback_model_is_announced_and_the_declined_attempt_billed(settings, prompts_dir, brief, plan):
+    served = usage_message([json_text(plan)], model="claude-future-9", input_tokens=20_000, output_tokens=5_000)
+    served.usage.iterations = [
+        SimpleNamespace(type="message", model="claude-opus-5", input_tokens=20_000, output_tokens=3_000,
+                        cache_read_input_tokens=0, cache_creation_input_tokens=0),
+        SimpleNamespace(type="fallback_message", model="claude-future-9", input_tokens=20_000, output_tokens=5_000,
+                        cache_read_input_tokens=0, cache_creation_input_tokens=0)]
+    backend = AnthropicBackend(settings, client=FakeClient([served]))
+    records, notices = [], []
+    backend.on_usage = records.append
+    backend.on_notice = lambda agent, level, msg: notices.append(msg)
+    backend.plan(brief)
+    assert records[0].cost_usd == pytest.approx((20_000 * 5 + 3_000 * 25) / 1e6)  # never silently $0
+    priced = [n for n in notices if "가격 정보가 없어" in n]
+    assert len(priced) == 1 and "claude-future-9" in priced[0] and "INSIA_PRICE_CLAUDE_FUTURE_9_INPUT" in priced[0]
+    assert "예산 상한" in priced[0]
+
+
+def _fallback_sse(plan_json: str) -> bytes:
+    import json as _json
+
+    def sse(events):
+        return "".join(f"event: {n}\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n" for n, d in events).encode()
+
+    start = {"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5", "content": [],
+             "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 20000, "output_tokens": 1}}
+    iterations = [
+        {"type": "message", "model": "claude-opus-5", "input_tokens": 20000, "output_tokens": 3000,
+         "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+        {"type": "fallback_message", "model": "claude-opus-4-8", "input_tokens": 20000, "output_tokens": 5000,
+         "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+    ]
+    return sse([
+        ("message_start", {"type": "message_start", "message": start}),
+        ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": plan_json[:10]}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("content_block_start", {"type": "content_block_start", "index": 1, "content_block": {
+            "type": "fallback", "from": {"model": "claude-opus-5"}, "to": {"model": "claude-opus-4-8"},
+            "trigger": {"type": "refusal", "category": "cyber"}}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 1}),
+        ("content_block_start", {"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": plan_json[10:]}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 2}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                           "usage": {"input_tokens": 20000, "output_tokens": 5000, "iterations": iterations}}),
+        ("message_stop", {"type": "message_stop"}),
+    ])
+
+
+def test_fallback_served_response_is_billed_in_full_through_the_real_sdk(settings, prompts_dir, brief, plan, monkeypatch):
+    for name in [n for n in __import__("os").environ if n.startswith("INSIA_PRICE_")]:
+        monkeypatch.delenv(name)
+    bodies = [_fallback_sse(plan.model_dump_json())]
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, headers={"content-type": "text/event-stream", "request-id": "req_mock"},
+                               content=bodies.pop(0))
+
+    client = anthropic.Anthropic(api_key="sk-test-not-real", max_retries=0,
+                                 http_client=anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(handler)))
+    backend = AnthropicBackend(replace(settings, home=settings.out_dir / "no-prices"), client=client)
+    records, notices = [], []
+    backend.on_usage = records.append
+    backend.on_notice = lambda agent, level, msg: notices.append(msg)
+    assert backend.plan(brief).summary == plan.summary
+    record = records[0]
+    assert record.model == "claude-opus-4-8" and (record.input_tokens, record.output_tokens) == (40_000, 8_000)
+    assert record.cost_usd == pytest.approx(0.4)  # was $0.0 (unpriced fallback model, declined attempt dropped)
+    assert not any("가격 정보가 없어" in n for n in notices)
+    assert any("대신 응답" in n for n in notices)
+
+
+# ---------------------------------------------------------------------------
+# Calendar: per-channel days and history rows
+# ---------------------------------------------------------------------------
+
+
+def test_plan_calendar_sends_per_channel_days_and_keeps_slots_on_them(settings, prompts_dir, profile):
+    import json as _json
+
+    (prompts_dir / "agents" / "planner.md").write_text("# planner", encoding="utf-8")
+    raw = ContentPlan(summary="s", slots=[
+        PlannedSlot(date="2026-10-10", channel="instagram", topic="토요일 인스타", angle="a", keywords=["k"], goal="g"),
+        PlannedSlot(date="2026-10-10", channel="linkedin", topic="토요일 링크드인", angle="a", keywords=["k"], goal="g"),
+        PlannedSlot(date="2026-10-06", channel="linkedin", topic="이미 찬 날", angle="a", keywords=["k"], goal="g"),
+    ])
+    client = FakeClient([message([json_text(raw)])])
+    days = {"instagram": ["2026-10-05", "2026-10-10", "2026-10-11"], "linkedin": ["2026-10-07", "2026-10-09"]}
+    plan = AnthropicBackend(settings, client=client).plan_calendar(
+        profile, "주제", "2026-10-05", "2026-10-11", {"instagram": 1, "linkedin": 2}, [], days=days)
+    body = client.calls[0]["messages"][0]["content"][-1]["text"]
+    payload = _json.loads(body.split("```json\n", 1)[1].rsplit("```", 1)[0])
+    assert payload["channel_days"] == days
+    assert [d["date"] for d in payload["available_days"]] == ["2026-10-05", "2026-10-07", "2026-10-09", "2026-10-10", "2026-10-11"]
+    assert "channel_days" in body.split("입력(JSON)")[0]  # the instruction names the per-channel days
+    assert [(s.date, s.channel) for s in plan.slots] == [
+        ("2026-10-07", "linkedin"), ("2026-10-09", "linkedin"), ("2026-10-10", "instagram")]
+    empty = AnthropicBackend(settings, client=FakeClient([])).plan_calendar(
+        profile, "주제", "2026-10-05", "2026-10-11", {"linkedin": 1}, [], days={"linkedin": []})
+    assert empty.slots == []  # no free day: no API call at all
+
+
+def test_history_rows_put_upcoming_plans_first_and_keep_room_for_published():
+    from insia_agents.backends.anthropic_backend import HISTORY_IN_PROMPT, _history_rows
+
+    published = [ContentItem(id=f"p{i}", channel="linkedin", title=f"게시 {i}", status="published",
+                             published_at=f"2026-0{1 + i % 8}-{10 + i % 18}T00:00:00Z") for i in range(61)]
+    approved = [ContentItem(id=f"a{i}", channel="instagram", title=f"승인 {i}", status="approved",
+                            updated_at="2026-09-20T00:00:00Z") for i in range(10)]
+    planned = [ContentItem(id="sl_1", channel="naver_blog", title="재고 관리 엑셀 체크리스트 10가지", status="scheduled",
+                           scheduled_at="2026-10-06")]
+    rows = _history_rows(published + approved + planned)
+    assert len(rows) == HISTORY_IN_PROMPT
+    titles = [r["title"] for r in rows]
+    assert "재고 관리 엑셀 체크리스트 10가지" in titles and sum(t.startswith("승인") for t in titles) == 10
+    assert sum(t.startswith("게시") for t in titles) == HISTORY_IN_PROMPT - 11
+    assert [r["date"] for r in rows] == sorted(r["date"] for r in rows)
+    many_upcoming = [ContentItem(id=f"s{i}", channel="linkedin", title=f"예약 {i}", status="scheduled",
+                                 scheduled_at="2026-10-01") for i in range(100)]
+    rows = _history_rows(published + many_upcoming)
+    assert sum(r["status"] == "published" for r in rows) == HISTORY_IN_PROMPT // 3

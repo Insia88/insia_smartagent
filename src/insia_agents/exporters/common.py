@@ -1,8 +1,11 @@
 """Shared pieces for the exporters.
 
 - ``ExportFile`` (the result every exporter returns) and the exporter errors.
-- File naming: ``<YYYY-MM-DD>_<channel>_<slug>.<ext>``.
+- File naming: ``<YYYY-MM-DD>_<channel>_<slug>_v<N>.<ext>``.
 - Picking the version to export and the date used in file names.
+- Text cleanup for XML/HTML outputs (``clean_draft``): characters XML 1.0
+  forbids (NUL, ESC, the vertical tab PowerPoint uses as a line break, the
+  form feed PDF copies carry …) are removed or turned into line breaks.
 - A small markdown block parser tuned to the channel formats in the build
   spec: 개조식 markers (□ ○ - ※ →), pipe tables with a separator row,
   ``< 표 제목 >`` captions and ``[이미지: …]`` slots. It is intentionally not a
@@ -16,11 +19,11 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Iterator, Literal
+from typing import Collection, Iterator, Literal
 from urllib.parse import quote
 
 from ..config import KST, today_kst
-from ..models import ContentItemDetail, DraftVersion
+from ..models import ContentItemDetail, Draft, DraftVersion
 
 CONTENT_TYPES: dict[str, str] = {
     "md": "text/markdown; charset=utf-8",
@@ -68,16 +71,35 @@ class ExportFile:
         return (f'{disposition}; filename="{ascii_filename(self.filename)}"; '
                 f"filename*=UTF-8''{quote(self.filename, safe='')}")
 
-    def save(self, directory: str | Path) -> Path:
-        """Write the file into ``directory`` (created if needed) and return its path."""
+    def save(self, directory: str | Path, *, overwrite: bool = False) -> Path:
+        """Write the file into ``directory`` (created if needed) and return its path.
+
+        An existing file is never replaced silently: a byte-identical file is
+        reused as is, anything else (another version, a file the founder
+        edited in place) is kept and the new file is saved as
+        ``<name> (2).<ext>``, ``<name> (3).<ext>`` …. ``overwrite=True``
+        replaces the file instead.
+        """
         name = Path(self.filename).name
         if not name or name in {".", ".."}:
             raise ExportError(f"저장할 수 없는 파일 이름이에요: {self.filename!r}")
         target_dir = Path(directory)
         target_dir.mkdir(parents=True, exist_ok=True)
         path = target_dir / name
-        path.write_bytes(self.data)
-        return path
+        if overwrite:
+            path.write_bytes(self.data)
+            return path
+        stem, suffix = path.stem, path.suffix
+        for counter in range(2, 1002):
+            try:
+                with open(path, "xb") as handle:  # exclusive create: never clobbers a file
+                    handle.write(self.data)
+                return path
+            except FileExistsError:
+                if path.is_file() and path.stat().st_size == len(self.data) and path.read_bytes() == self.data:
+                    return path
+            path = target_dir / f"{stem} ({counter}){suffix}"
+        raise ExportError(f"같은 이름의 파일이 너무 많아 저장하지 못했어요: {target_dir / name}")
 
 
 # ---------------------------------------------------------------------------
@@ -103,8 +125,11 @@ def slugify(text: str, max_len: int = 40, fallback: str = "초안") -> str:
     return text or fallback
 
 
-def export_filename(day: str, channel: str, title: str, ext: str) -> str:
-    return f"{day}_{channel}_{slugify(title)}.{ext}"
+def export_filename(day: str, channel: str, title: str, ext: str, version: int | None = None) -> str:
+    """``<day>_<channel>_<slug>[_v<N>].<ext>``. Item exports always pass the
+    version so exporting v1 never lands on the file of v2."""
+    suffix = f"_v{version}" if version is not None else ""
+    return f"{day}_{channel}_{slugify(title)}{suffix}.{ext}"
 
 
 def ascii_filename(filename: str) -> str:
@@ -113,7 +138,8 @@ def ascii_filename(filename: str) -> str:
     if not dot:
         stem, ext = filename, ""
     folded = unicodedata.normalize("NFKD", stem).encode("ascii", "ignore").decode("ascii")
-    folded = _DASHES.sub("-", re.sub(r"[^A-Za-z0-9._-]", "-", folded)).strip("-._")
+    folded = _DASHES.sub("-", re.sub(r"[^A-Za-z0-9._-]", "-", folded))
+    folded = re.sub(r"[-_]*_[-_]*", "_", folded).strip("-._")  # "…_linkedin_-_v2" → "…_linkedin_v2"
     ext = re.sub(r"[^A-Za-z0-9]", "", ext)
     folded = folded or "insia-export"
     return f"{folded}.{ext}" if ext else folded
@@ -178,6 +204,49 @@ def item_date(detail: ContentItemDetail, version: DraftVersion | None = None) ->
         if day:
             return day
     return today_kst()
+
+
+# ---------------------------------------------------------------------------
+# Text cleanup (XML / HTML outputs)
+# ---------------------------------------------------------------------------
+
+# Characters XML 1.0 forbids (lxml/python-docx raise ValueError on them).
+# \x0b (PowerPoint's soft line break) and \x0c (page break in text copied
+# from PDF/Word) are handled first: they become line breaks.
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff￾￿]")
+_SOFT_BREAK = re.compile("[\x0b\x0c]")
+
+
+def xml_safe(text: str, *, soft_break: str = "\n") -> str:
+    """``text`` without characters XML 1.0 forbids; ``\\x0b``/``\\x0c`` become ``soft_break``."""
+    if not text:
+        return text or ""
+    if not _XML_ILLEGAL.search(text):
+        return text
+    return _XML_ILLEGAL.sub("", _SOFT_BREAK.sub(soft_break, text))
+
+
+def clean_markdown(text: str) -> str:
+    """Channel markdown without XML-illegal characters. Soft breaks become
+    real line breaks, except inside a table row where they become ``<br>``
+    (a line break inside the cell) so the row is not split in two."""
+    if not text or not _XML_ILLEGAL.search(text):
+        return text or ""
+    lines = []
+    for line in text.split("\n"):
+        in_table = line.lstrip().startswith("|")
+        lines.append(xml_safe(line, soft_break="<br>" if in_table else "\n"))
+    return "\n".join(lines)
+
+
+def clean_draft(draft: Draft) -> Draft:
+    """A copy of ``draft`` that is safe to put into XML/HTML (see ``xml_safe``)."""
+    title = xml_safe(draft.title or "", soft_break=" ")
+    content = clean_markdown(draft.content or "")
+    hashtags = [xml_safe(tag, soft_break="") for tag in draft.hashtags]
+    if title == draft.title and content == draft.content and hashtags == list(draft.hashtags):
+        return draft
+    return draft.model_copy(update={"title": title, "content": content, "hashtags": hashtags})
 
 
 # ---------------------------------------------------------------------------
@@ -359,14 +428,132 @@ class Segment:
 
 
 _BOLD = re.compile(r"\*\*(.+?)\*\*")
+# Bracketed text that is NOT a fill-in placeholder:
+# - citations [s12], [s2, s5], [s2·s5], [s3~s5];
+# - document labels [별첨 1], [표 2];
+# - markdown checkboxes [ ], [x];
+# - ad disclosures the founder must keep, only in their literal form: the
+#   bracket holds nothing but disclosure words ([광고], [협찬], [유료 광고 포함],
+#   [광고·협찬], [AD], [Sponsored]). "[광고 예산]", "[스폰서 이름]" or
+#   "[광고 문구: …]" are fill-ins and stay placeholders; a longer disclosure
+#   sentence is protected through ``Profile.required_phrases`` (``keep=``);
+# - blog labels that are just the word ([TIP], [팁], [공지], [이벤트]).
+_DISCLOSURE_WORD = r"(?:유료\s*광고|광고|협찬|제휴|스폰서(?:십)?|체험단|(?i:ads?|sponsored|paid|partnership|affiliate))"
+_DISCLOSURE_TAIL = rf"(?:{_DISCLOSURE_WORD}|포함|제공)"
+_NOT_PLACEHOLDER = (
+    r"(?!\s*s\d+(?:\s*[,·/~\-]\s*s?\d+)*\s*\])"
+    r"(?!\s*(?:별첨|붙임|첨부|참고|표|그림)\s*\d)"
+    r"(?!\s*[xX✓✔]?\s*\])"
+    rf"(?!\s*{_DISCLOSURE_WORD}(?:\s*(?:[·・/,&+]|및|또는)?\s*{_DISCLOSURE_TAIL})*\s*\])"
+    r"(?!\s*(?:팁|공지|이벤트|(?i:tip|pr|notice))\s*\d*\s*\])"
+)
 # URLs, or bracketed fill-in placeholders such as [대표자 성명] / [확인 필요: …] / [○].
-# Citations like [s12], document labels like [별첨 1] and markdown links
-# [text](url) are not placeholders.
+# Markdown links [text](url) are not placeholders. A URL never runs into a square
+# bracket (outside an IPv6 host), so "…kosis.kr[확인 필요: 기준연도]" keeps its
+# placeholder, nor into CJK punctuation or full-width forms (，。「」). Korean
+# particles glued to it are handled in ``_url_length`` ("…go.kr에서" and
+# "…go.kr/에서" are not part of the link).
 _INLINE = re.compile(
-    r"(?P<url>https?://[^\s<>\"'「」]+)"
-    r"|(?P<ph>\[(?!s\d+\])(?!\s*(?:별첨|붙임|첨부|참고|표|그림)\s*\d)[^\[\]\n]{1,80}\](?!\())"
+    r"(?P<url>https?://(?:\[[0-9A-Fa-f:.]+\])?[^\s<>\"'\[\]　-〿＀-￯]*)"
+    rf"|(?P<ph>\[{_NOT_PLACEHOLDER}[^\[\]\n]{{1,80}}\](?!\())"
 )
 _URL_TRAIL = ".,;:!?)」』]>"
+_HANGUL = re.compile(r"[ᄀ-ᇿ㄰-㆏ꥠ-꥿가-힯]")
+_URL_SEGMENT_START = frozenset("/=?&#-_+~(")
+# A Hangul run that is nothing but a particle or copula ending. Right after a
+# slash at the end of a URL ("…go.kr/에서", "…/path/을") it is sentence text:
+# browsers copy root URLs with a trailing slash.
+_PARTICLES = frozenset((
+    "이", "가", "은", "는", "을", "를", "의", "에", "도", "로", "와", "과", "만", "나", "랑", "께", "요",
+    "에서", "에게", "에는", "에도", "에만", "에선", "으로", "이나", "이랑", "하고", "처럼", "까지", "부터", "보다",
+    "마다", "이며", "이고", "이다", "이죠", "이요", "이야", "에요", "예요", "라는", "라고", "인데",
+    "에서는", "에서도", "에서의", "에서만", "에서요", "으로는", "으로도", "으로의", "으로요", "이라는", "이라고",
+    "이에요", "입니다", "인데요", "이지만",
+))
+# Endings that practically never end a Korean noun, so they can be split off a
+# Hangul path segment at the end of a URL ("…/wiki/소상공인에서"). One-syllable
+# particles that often end nouns (이, 가, 의, 도, 과 …) are left alone.
+_PARTICLE_SUFFIXES = (
+    "에서는", "에서도", "에서의", "에서만", "으로는", "으로도", "으로의", "이라는", "이라고", "이에요", "입니다",
+    "에서", "으로", "에게", "에는", "까지", "부터", "처럼", "를",
+)
+
+
+def _has_final_consonant(syllable: str) -> bool:
+    code = ord(syllable) - 0xAC00
+    return 0 <= code <= 11171 and code % 28 != 0
+
+
+def _particle_suffix_length(run: str) -> int:
+    """Length of a particle glued to the end of a Hangul path segment, or 0."""
+    for suffix in _PARTICLE_SUFFIXES:
+        if len(run) > len(suffix) and run.endswith(suffix):
+            return len(suffix)
+    if len(run) > 1:
+        # 을/은 follow a final consonant (소상공인을), 는 a vowel (블로그는)
+        if run[-1] in "을은" and _has_final_consonant(run[-2]):
+            return 1
+        if run[-1] == "는" and not _has_final_consonant(run[-2]):
+            return 1
+    return 0
+
+
+def _url_length(url: str) -> int:
+    """Length of the real URL at the start of ``url``.
+
+    Korean attaches particles straight to a URL. The URL ends before Hangul
+    glued to the host or to other URL characters ("…go.kr에서", "…/path를"),
+    before a bare particle after a trailing slash ("…go.kr/에서") and before a
+    particle glued to a Hangul segment at the very end ("…/wiki/소상공인에서").
+    Hangul that starts a path or query segment ("…/wiki/소상공인",
+    "?query=소상공인") and internationalized host labels ("http://한국.kr",
+    "…/도메인.한국") are kept.
+    """
+    scheme_end = url.find("://") + 3
+    host_end = next((i for i in range(scheme_end, len(url)) if url[i] in "/?#"), len(url))
+    index = scheme_end
+    while index < len(url):
+        if not _HANGUL.match(url[index]):
+            index += 1
+            continue
+        end = index
+        while end < len(url) and _HANGUL.match(url[end]):
+            end += 1
+        run, previous = url[index:end], url[index - 1]
+        if index < host_end:
+            if previous in "/." and url[end:end + 1] == ".":
+                index = end  # a Hangul domain label: "한국" in http://한국.kr
+                continue
+            if previous == "." and run.startswith("한국") and (run == "한국" or run[2:] in _PARTICLES):
+                index += 2  # the .한국 top-level domain, maybe followed by a particle
+                if index < end:
+                    return index
+                continue
+            return index  # "…go.kr에서"
+        if previous not in _URL_SEGMENT_START:
+            return index  # glued to the URL: "…/path를"
+        if not url[end:].rstrip(_URL_TRAIL):  # the run ends the URL
+            if previous == "/" and run in _PARTICLES:
+                return index  # "…go.kr/에서": keep the slash, drop the particle
+            cut = _particle_suffix_length(run)
+            if cut:
+                return end - cut  # "…/wiki/소상공인에서"
+        index = end
+    return len(url)
+
+
+def _trim_url(url: str) -> str:
+    """The URL without trailing punctuation or particles (see ``_url_length``)."""
+    url = url[:_url_length(url)]
+    trimmed = url.rstrip(_URL_TRAIL)
+    # keep a closing bracket that belongs to the URL: …/Foo_(bar), http://[::1]
+    while trimmed != url:
+        closing = url[len(trimmed)]
+        opening = {")": "(", "]": "["}.get(closing)
+        if opening is None or trimmed.count(opening) <= trimmed.count(closing):
+            break
+        trimmed += closing
+    return trimmed
 
 
 def inline_segments(text: str) -> Iterator[Segment]:
@@ -382,24 +569,28 @@ def inline_segments(text: str) -> Iterator[Segment]:
 
 
 def _plain_segments(text: str, bold: bool) -> Iterator[Segment]:
-    pos = 0
-    for match in _INLINE.finditer(text):
-        start, end = match.span()
+    pos = 0  # start of the text not yielded yet
+    scan = 0  # where the next search starts
+    while True:
+        match = _INLINE.search(text, scan)
+        if match is None:
+            break
+        start = match.start()
         if match.group("url"):
-            url = match.group("url")
-            trimmed = url.rstrip(_URL_TRAIL)
-            # keep a closing parenthesis that belongs to the URL, e.g. …/Foo_(bar)
-            while trimmed != url and url[len(trimmed)] == ")" and trimmed.count("(") > trimmed.count(")"):
-                trimmed += ")"
-            end = start + len(trimmed)
+            url = _trim_url(match.group("url"))
+            if len(url) <= url.find("://") + 3:  # nothing left but the scheme
+                scan = match.end()
+                continue
+            end = start + len(url)
             if start > pos:
                 yield Segment(text[pos:start], bold)
-            yield Segment(trimmed, bold, "url")
+            yield Segment(url, bold, "url")
         else:
+            end = match.end()
             if start > pos:
                 yield Segment(text[pos:start], bold)
             yield Segment(match.group("ph"), bold, "placeholder")
-        pos = end
+        pos = scan = end
     if pos < len(text):
         yield Segment(text[pos:], bold)
 
@@ -409,12 +600,19 @@ def strip_inline(text: str) -> str:
     return _BOLD.sub(r"\1", text)
 
 
-def find_placeholders(text: str) -> list[str]:
-    """Distinct fill-in placeholders in order of appearance (image slots excluded)."""
+def is_kept_phrase(placeholder: str, keep: Collection[str] = ()) -> bool:
+    """True when ``placeholder`` is (part of) a phrase that must stay in the
+    text, e.g. a ``Profile.required_phrases`` entry such as "[광고]"."""
+    return any(placeholder in phrase for phrase in keep if phrase)
+
+
+def find_placeholders(text: str, keep: Collection[str] = ()) -> list[str]:
+    """Distinct fill-in placeholders in order of appearance (image slots and
+    phrases in ``keep`` — e.g. the profile's required phrases — excluded)."""
     seen: list[str] = []
     for match in _INLINE.finditer(text or ""):
         ph = match.group("ph")
-        if ph and not _IMAGE.match(ph) and ph not in seen:
+        if ph and not _IMAGE.match(ph) and ph not in seen and not is_kept_phrase(ph, keep):
             seen.append(ph)
     return seen
 

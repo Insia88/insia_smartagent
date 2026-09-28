@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
+import re
+
 from ..models import Draft
 from ..storage import render_markdown
-from .common import ExportError, content_section, ensure_hashtag_line, parse_blocks, strip_inline
+from .common import ExportError, clean_draft, content_section, ensure_hashtag_line, parse_blocks, strip_inline
+
+# <br> is a line break in the docx and Naver HTML exports; the paste text must match.
+_BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+
+def _line(text: str) -> str:
+    """Plain text of a markdown line: ``<br>`` → line break, bold markers removed."""
+    return strip_inline(_BR.sub("\n", text))
+
+
+def _cell(text: str) -> str:
+    """Plain text of a table cell (kept on one line so the row stays one row)."""
+    return strip_inline(_BR.sub(" / ", text)).strip()
 
 
 def markdown_text(draft: Draft) -> str:
@@ -18,6 +33,7 @@ def instagram_caption(draft: Draft) -> str:
     caption = content_section(content, "캡션")
     if not caption and "## 캐러셀" not in content:
         caption = content.strip()  # caption-only content (no carousel section)
+    caption = _BR.sub("\n", caption)
     if not caption.strip():
         raise ExportError("인스타그램 캡션(## 캡션)이 비어 있어요. 초안에 캡션을 채운 뒤 다시 내보내 주세요.")
     return ensure_hashtag_line(caption, draft.hashtags)
@@ -31,9 +47,14 @@ def paste_text(draft: Draft) -> str:
     - naver_blog / bizplan: a plain-text version without markdown symbols
       (tables become tab-separated rows, which Hangul/Word can turn back into
       tables with "문자열을 표로" / "텍스트를 표로 변환").
+
+    ``<br>`` becomes a line break (`` / `` inside table cells) and invisible
+    control characters pasted from PowerPoint/PDF are cleaned, as in the
+    docx and HTML exports.
     """
+    draft = clean_draft(draft)
     if draft.channel == "linkedin":
-        body = (draft.content or "").strip()
+        body = _BR.sub("\n", draft.content or "").strip()
         if not body:
             raise ExportError("링크드인 본문이 비어 있어요. 초안을 채운 뒤 다시 내보내 주세요.")
         return ensure_hashtag_line(body, draft.hashtags) + "\n"
@@ -55,22 +76,22 @@ def plain_text(draft: Draft) -> str:
         if out and out[-1] != "" and not (block.kind == "item" and prev == "item"):
             out.append("")
         if block.kind == "heading":
-            out.append(strip_inline(block.text))
+            out.append(_line(block.text))
         elif block.kind == "para":
-            out.extend(strip_inline(line) for line in block.lines)
+            out.extend(_line(line) for line in block.lines)
         elif block.kind == "item":
             marker = "•" if block.marker in {"*"} else block.marker
-            text = strip_inline(block.text).replace("\n", "\n" + "  " * (block.level + 1))
+            text = _line(block.text).replace("\n", "\n" + "  " * (block.level + 1))
             out.append(f"{'  ' * block.level}{marker} {text}")
         elif block.kind == "table":
-            out.append("\t".join(strip_inline(c) for c in block.header))
-            out.extend("\t".join(strip_inline(c) for c in row) for row in block.rows)
+            out.append("\t".join(_cell(c) for c in block.header))
+            out.extend("\t".join(_cell(c) for c in row) for row in block.rows)
         elif block.kind == "image":
             out.append(f"[이미지: {block.text}]")
         elif block.kind == "caption":
-            out.append(f"< {strip_inline(block.text)} >")
+            out.append(f"< {_cell(block.text)} >")
         elif block.kind == "quote":
-            out.append(strip_inline(block.text))
+            out.append(_line(block.text))
         prev = block.kind
 
     text = "\n".join(out).strip()

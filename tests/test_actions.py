@@ -278,3 +278,143 @@ def test_resuming_a_slot_run_links_the_slot(settings, ws):
     resume_run(bus.run_id, settings, ws, backend=MockBackend(settings))
     after = ws.get_slot(slot.id)
     assert after.status == "drafted" and after.item_id == pipeline_item_id(bus.run_id, "linkedin")
+
+
+# ---------------------------------------------------------------------------
+# Human edits during a job (review finding 4, data side), cancellable job runners, stuck slots
+# ---------------------------------------------------------------------------
+
+HUMAN_CONTENT = "사람이 직접 고친 본문이에요. " * 20
+
+
+class EditsWhileWorking(MockBackend):
+    """Saves a human edit (like a PUT /draft from the dashboard) while the job's backend call is in flight."""
+
+    def __init__(self, settings, workspace, item_id, during="revise"):
+        super().__init__(settings)
+        self.job_settings = settings
+        self.workspace = workspace
+        self.item_id = item_id
+        self.during = during
+
+    def _edit(self):
+        actions.edit_item(self.workspace, self.item_id, "사람이 고친 제목", HUMAN_CONTENT, ["#사람"], settings=self.job_settings)
+
+    def revise(self, brief, plan, research, draft, review, *args, **kwargs):
+        out = super().revise(brief, plan, research, draft, review)
+        if self.during == "revise":
+            self._edit()
+        return out
+
+    def review(self, brief, research, draft, format_checks):
+        out = super().review(brief, research, draft, format_checks)
+        if self.during == "review" and not getattr(self, "_edited", False):
+            self._edited = True
+            self._edit()
+        return out
+
+
+def test_revise_does_not_replace_a_human_edit_saved_meanwhile(settings, ws, run_items):
+    item_id = run_items["linkedin"]
+    base = ws.get_item(item_id).versions[-1]
+    result = actions.revise_item(ws, item_id, "짧게", settings=settings,
+                                 backend=EditsWhileWorking(settings, ws, item_id, during="revise"))
+    detail = ws.get_item(item_id)
+    human, agent, current = detail.versions[-3], detail.versions[-2], detail.versions[-1]
+    assert (human.source, human.version) == ("human", base.version + 1)
+    assert (agent.source, agent.version, agent.instructions) == ("agent", base.version + 2, "짧게")
+    assert agent.review is not None  # the revision was reviewed and kept in the history
+    assert current.version == base.version + 3 and current.source == "human"
+    assert (current.draft.title, current.draft.content) == ("사람이 고친 제목", HUMAN_CONTENT.rstrip())
+    assert detail.item.version == current.version and detail.item.title == "사람이 고친 제목"
+    assert result.superseded and result.superseded_by_human_edit
+    assert (result.version.version, result.base_version, result.current_version) == (agent.version, base.version, current.version)
+    data = result.to_dict()
+    assert data["superseded_by_human_edit"] is True and data["current_version"] == current.version
+    events = ws.list_events(result.run_id)
+    assert events[-1]["type"] == "run.completed" and events[-1]["data"]["superseded_by_human_edit"] is True
+    assert ws.get_run(result.run_id)["options"]["base_version"] == base.version
+    assert any(e["type"] == "log" and "현재 버전" in e["data"]["message"] for e in events)
+
+
+def test_revise_reports_a_human_edit_saved_during_its_re_review(settings, ws, run_items):
+    item_id = run_items["linkedin"]
+    base = ws.get_item(item_id).versions[-1]
+    assert base.review is not None  # so the only review call of the job is the re-review of its revision
+    result = actions.revise_item(ws, item_id, "짧게", settings=settings,
+                                 backend=EditsWhileWorking(settings, ws, item_id, during="review"))
+    detail = ws.get_item(item_id)
+    agent, human = detail.versions[-2], detail.versions[-1]
+    assert (agent.version, agent.source, human.version, human.source) == (base.version + 1, "agent", base.version + 2, "human")
+    assert agent.review is not None and agent.review == result.review and human.review is None
+    assert detail.item.version == human.version and detail.item.title == "사람이 고친 제목"  # the edit stays current
+    assert result.superseded and result.superseded_by_human_edit
+    assert (result.version.version, result.base_version, result.current_version) == (agent.version, base.version, human.version)
+    events = ws.list_events(result.run_id)
+    completed = events[-1]
+    assert completed["type"] == "run.completed" and completed["data"]["superseded_by_human_edit"] is True
+    assert completed["data"]["superseded"] is True and completed["data"]["current_version"] == human.version
+    assert any(e["type"] == "log" and "재검수하는 동안 사람이 고친 버전" in e["data"]["message"] for e in events)
+
+
+def test_revise_without_a_concurrent_edit_is_unchanged(settings, ws, run_items):
+    item_id = run_items["instagram"]
+    result = actions.revise_item(ws, item_id, settings=settings)
+    assert not result.superseded and not result.superseded_by_human_edit
+    assert ws.get_item(item_id).versions[-1].id == result.version.id
+    assert result.current_version == result.version.version
+
+
+def test_review_stays_on_the_version_it_reviewed(settings, ws, run_items):
+    item_id = run_items["naver_blog"]
+    base = ws.get_item(item_id).versions[-1]
+    result = actions.review_item(ws, item_id, settings=settings,
+                                 backend=EditsWhileWorking(settings, ws, item_id, during="review"))
+    detail = ws.get_item(item_id)
+    reviewed = next(v for v in detail.versions if v.version == base.version)
+    assert reviewed.review == result.review and result.version.version == base.version
+    assert detail.versions[-1].source == "human" and detail.versions[-1].review is None  # the edit is current, unreviewed
+    assert detail.item.version == base.version + 1 and detail.item.score is None
+    assert result.superseded_by_human_edit and result.current_version == base.version + 1
+    assert ws.list_events(result.run_id)[-1]["data"]["superseded"] is True
+
+
+def test_jobs_accept_a_cancellable_runner(settings, ws, run_items):
+    from insia_agents.pipeline import RunCancelled, SimRunner
+
+    class StoppedRunner(SimRunner):
+        cancelled = True  # e.g. the server's cancel endpoint was pressed before the first backend call
+
+    item_id = run_items["bizplan"]
+    versions = len(ws.get_item(item_id).versions)
+    for job in (lambda bus, backend: actions.review_item(ws, item_id, settings=settings, backend=backend, bus=bus,
+                                                         runner=StoppedRunner(bus.clock)),
+                lambda bus, backend: actions.revise_item(ws, item_id, settings=settings, backend=backend, bus=bus,
+                                                         runner=StoppedRunner(bus.clock))):
+        backend, bus, _ = prepare_run(settings, run_id=new_run_id())
+        with pytest.raises(RunCancelled):
+            job(bus, backend)
+        assert ws.get_run(bus.run_id)["status"] == "cancelled"
+    assert len(ws.get_item(item_id).versions) == versions
+    slot = ws.add_slots([PlannedSlot(date="2026-10-04", channel="linkedin", topic="주제", angle="", keywords=[], goal="")])[0]
+    backend, bus, _ = prepare_run(settings, run_id=new_run_id())
+    with pytest.raises(RunCancelled):
+        actions.generate_slot(ws, slot.id, settings=settings, backend=backend, bus=bus, runner=StoppedRunner(bus.clock))
+    assert ws.get_run(bus.run_id)["status"] == "cancelled" and ws.get_slot(slot.id).status == "planned"
+
+
+def test_generate_slot_recovers_a_slot_whose_run_died(settings, ws):
+    import subprocess
+    import sys
+
+    from insia_agents import db as dbmod
+
+    slot = ws.add_slots([PlannedSlot(date="2026-10-05", channel="linkedin", topic="주제", angle="", keywords=[], goal="")])[0]
+    ws.create_run("killed-run", actions.slot_brief(slot), kind="slot", options={"slot_id": slot.id})
+    ws.claim_slot(slot.id, "killed-run")
+    dead = int(subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True, text=True).stdout)
+    with ws._tx() as conn:
+        conn.execute("UPDATE runs SET owner_pid = ?, owner_host = ?, owner_token = 'x' WHERE id = 'killed-run'",
+                     (dead, dbmod.this_host()))
+    result = actions.generate_slot(ws, slot.id, settings=settings)  # no force needed: its process is gone
+    assert result.slot.status == "drafted" and ws.get_run("killed-run")["status"] == "interrupted"

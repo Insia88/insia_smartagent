@@ -11,10 +11,12 @@ from __future__ import annotations
 import html
 import json
 import re
+from typing import Collection
 
 from ..channels import CHANNELS, check_format, chars_no_space, chars_with_space
 from ..models import Brief, Draft, FormatCheck, Profile, Review
-from .common import Block, find_placeholders, inline_segments, is_hashtag_line, parse_blocks
+from .common import (Block, clean_draft, find_placeholders, inline_segments, is_hashtag_line, is_kept_phrase,
+                     parse_blocks, xml_safe)
 
 NAVER_GREEN = "#03C75A"
 FRAGMENT_START = "<!-- INSIA:FRAGMENT:START -->"
@@ -27,13 +29,13 @@ _TD = "border:1px solid #D0D5DD;padding:6px 10px;vertical-align:top;"
 _TD_HEAD = _TD + "background-color:#F2F4F7;"
 
 
-def _inline(text: str) -> str:
+def _inline(text: str, keep: Collection[str] = ()) -> str:
     parts: list[str] = []
     for seg in inline_segments(text):
         escaped = html.escape(seg.text, quote=True)
         if seg.kind == "url":
             piece = f'<a href="{escaped}" target="_blank" rel="noopener">{escaped}</a>'
-        elif seg.kind == "placeholder":
+        elif seg.kind == "placeholder" and not is_kept_phrase(seg.text, keep):
             piece = f'<span style="background-color:#FFF3B0;">{escaped}</span>'
         else:
             piece = escaped
@@ -45,11 +47,12 @@ def _is_source_para(block: Block) -> bool:
     return bool(block.lines) and all(line.startswith("출처") for line in block.lines)
 
 
-def _table(block: Block) -> str:
+def _table(block: Block, keep: Collection[str] = ()) -> str:
     rows = ['<table style="border-collapse:collapse;width:100%;">']
-    rows.append("<tr>" + "".join(f'<td style="{_TD_HEAD}"><b>{_inline(c)}</b></td>' for c in block.header) + "</tr>")
+    rows.append("<tr>" + "".join(f'<td style="{_TD_HEAD}"><b>{_inline(c, keep)}</b></td>' for c in block.header)
+                + "</tr>")
     for row in block.rows:
-        rows.append("<tr>" + "".join(f'<td style="{_TD}">{_inline(c)}</td>' for c in row) + "</tr>")
+        rows.append("<tr>" + "".join(f'<td style="{_TD}">{_inline(c, keep)}</td>' for c in row) + "</tr>")
     rows.append("</table>")
     return "".join(rows)
 
@@ -64,19 +67,29 @@ def _image_box(description: str) -> str:
     )
 
 
-def _item(block: Block) -> str:
+def _item(block: Block, keep: Collection[str] = ()) -> str:
     if block.marker in {"-", "*", "•", "·"}:
         marker = "•" if block.level == 0 else "-"
     else:
         marker = html.escape(block.marker)
     indent = "&nbsp;&nbsp;&nbsp;" * block.level
-    text = "<br>".join(_inline(line) for line in block.text.split("\n"))
+    text = "<br>".join(_inline(line, keep) for line in block.text.split("\n"))
     return f"{_P}{indent}{marker} {text}</p>"
 
 
-def naver_fragment(draft: Draft) -> str:
+def _required_phrases(profile: Profile | None) -> tuple[str, ...]:
+    return tuple(p.strip() for p in (profile.required_phrases if profile else []) if p and p.strip())
+
+
+def naver_fragment(draft: Draft, profile: Profile | None = None) -> str:
     """Body HTML to paste into SmartEditor (title and tags go in their own fields,
-    but tags are also listed at the end — SmartEditor turns ``#태그`` into tags)."""
+    but tags are also listed at the end — SmartEditor turns ``#태그`` into tags).
+
+    Fill-in placeholders get a yellow background, except phrases the profile
+    marks as required (an ad disclosure such as "[광고]" is kept as plain text).
+    """
+    draft = clean_draft(draft)
+    keep = _required_phrases(profile)
     blocks = parse_blocks(draft.content or "")
     if blocks and blocks[0].kind == "heading" and blocks[0].level == 1 \
             and blocks[0].text.strip() == draft.title.strip():
@@ -95,24 +108,24 @@ def naver_fragment(draft: Draft) -> str:
                 out.append(_SPACER)
         if block.kind == "heading":
             size = "1.4em" if block.level == 1 else "1.25em" if block.level == 2 else "1.1em"
-            out.append(f'<p style="font-size:{size};line-height:1.6;"><b>{_inline(block.text)}</b></p>')
+            out.append(f'<p style="font-size:{size};line-height:1.6;"><b>{_inline(block.text, keep)}</b></p>')
         elif block.kind == "para":
-            body = "<br>".join(_inline(line) for line in block.lines)
+            body = "<br>".join(_inline(line, keep) for line in block.lines)
             if _is_source_para(block):
                 out.append(f'<p style="font-size:0.85em;line-height:1.7;color:#8A8F98;">{body}</p>')
             else:
                 out.append(f"{_P}{body}</p>")
             last_para_lines = block.lines
         elif block.kind == "item":
-            out.append(_item(block))
+            out.append(_item(block, keep))
         elif block.kind == "table":
-            out.append(_table(block))
+            out.append(_table(block, keep))
         elif block.kind == "image":
             out.append(_image_box(block.text))
         elif block.kind == "caption":
-            out.append(f'<p style="text-align:center;"><b>{_inline(block.text)}</b></p>')
+            out.append(f'<p style="text-align:center;"><b>{_inline(block.text, keep)}</b></p>')
         elif block.kind == "quote":
-            out.append(f'<p style="line-height:1.8;color:#555555;">│ {_inline(block.text)}</p>')
+            out.append(f'<p style="line-height:1.8;color:#555555;">│ {_inline(block.text, keep)}</p>')
         prev = block.kind
 
     tags = [t.strip() for t in draft.hashtags if t.strip()]
@@ -227,10 +240,12 @@ def naver_preview_page(draft: Draft, *, brief: Brief | None = None, profile: Pro
                        review: Review | None = None, meta: str = "") -> str:
     """Standalone page: title/body/tag copy buttons, format checks, fill-in
     warnings and the paste-ready fragment between ``FRAGMENT_START/END``."""
-    fragment = naver_fragment(draft)
+    draft = clean_draft(draft)  # no XML-illegal control characters in the page or the paste
+    meta = xml_safe(meta, soft_break=" ")
+    fragment = naver_fragment(draft, profile)
     tags = [t.strip() for t in draft.hashtags if t.strip()]
     checks = check_format(draft, brief, profile)
-    placeholders = find_placeholders(draft.content or "")
+    placeholders = find_placeholders(draft.content or "", keep=_required_phrases(profile))
     title = draft.title.strip()
     spec = CHANNELS["naver_blog"]
 
@@ -259,7 +274,11 @@ def naver_preview_page(draft: Draft, *, brief: Brief | None = None, profile: Pro
         f'<ul class="stats">{_check_items(checks)}</ul></section>'
     ) if checks else ""
 
-    data_json = json.dumps({"title": title, "tags": " ".join(tags)}, ensure_ascii=False).replace("</", "<\\/")
+    # Inside <script type="application/json"> any "<" can start "<!--" / "<script"
+    # parsing states that swallow the following script, so <, > and & are all
+    # written as JSON unicode escapes (JSON.parse turns them back).
+    data_json = (json.dumps({"title": title, "tags": " ".join(tags)}, ensure_ascii=False)
+                 .replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e"))
     tag_button = '<button type="button" id="copy-tags">태그 복사</button>' if tags else ""
     tag_line = f'<p class="tags">{html.escape(" ".join(tags))}</p>' if tags else ""
     meta_html = f'<p id="meta" style="margin:8px 0 0;font-size:13px;color:#5B616B;">{html.escape(meta)}</p>' if meta else ""

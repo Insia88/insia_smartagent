@@ -35,17 +35,25 @@ Security model (unchanged from the local-only version, plus an access token):
   (when sent; it must name exactly the requested host:port) and POST/PUT a
   ``Content-Type: application/json`` body, which forces a CORS preflight this
   server never approves, so other web pages cannot change anything.
-- A non-loopback bind refuses to start without an access token
-  (``INSIA_ACCESS_TOKEN`` / ``--token``). With a token every ``/api`` route
-  except ``/api/login`` and ``/api/logout`` needs ``Authorization: Bearer
-  <token>`` or the ``insia_token`` cookie (HttpOnly, SameSite=Strict; Secure
-  behind an HTTPS proxy with ``--trust-proxy``). Comparisons are constant-time
-  and failed attempts are rate limited per client IP. Static dashboard files
-  stay public (the dashboard shows a login form when ``/api/health`` is 401).
+- A non-loopback bind, ``--public-host`` or ``--trust-proxy`` refuses to
+  start without an access token (``INSIA_ACCESS_TOKEN`` / ``--token``): the
+  last two mean a reverse proxy makes even 127.0.0.1 reachable. With a token
+  every ``/api`` route except ``/api/login`` and ``/api/logout`` needs
+  ``Authorization: Bearer <token>`` or the ``insia_token`` cookie (HttpOnly,
+  SameSite=Strict; Secure behind an HTTPS proxy with ``--trust-proxy``).
+  Other ``Authorization`` schemes (a proxy's Basic auth) are ignored.
+  Comparisons are constant-time and rate limited per client IP: an attempt is
+  reserved before the comparison (``LoginLimiter.attempt``), so parallel
+  guesses cannot exceed the limit. Static dashboard files stay public (the
+  dashboard shows a login form when ``/api/health`` is 401).
+- Malformed or abandoned requests never produce a 500 or a traceback: a
+  stalled body is a 408, over-long static paths a 404, a client that hangs
+  up a debug log line.
 """
 
 from __future__ import annotations
 
+import errno
 import functools
 import hashlib
 import hmac
@@ -56,11 +64,14 @@ import math
 import mimetypes
 import os
 import re
+import socket
+import sys
 import threading
 import time
 import traceback
 import urllib.parse
 from collections import OrderedDict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
@@ -98,6 +109,10 @@ MAX_RECORDS = 50  # finished runs kept in memory (for their full RunResult / Job
 DEFAULT_MAX_LIVE = 2
 DEFAULT_MAX_MOCK = 4
 MAX_COST_OPTION = 10_000.0
+MAX_JSON_INT = 2 ** 53 - 1  # the largest integer a browser (JavaScript) can send exactly
+MAX_LOGGED_PATH = 200  # characters of a request path written to the log
+# The client went away (or stopped reading) while we answered: nothing to report.
+DISCONNECT_ERRORS: tuple[type[BaseException], ...] = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
 # -- auth ---------------------------------------------------------------------
 COOKIE_NAME = "insia_token"
@@ -123,8 +138,20 @@ PROFILE_REQUIRED: tuple[tuple[str, str], ...] = (
 )
 
 SETTINGS_OPTION_KEYS = ("mode", "speed", "max_rounds", "pass_score", "max_cost_usd", "use_profile")
+ITEM_JOB_KINDS = ("review", "revise")  # jobs that work on an existing item (one at a time; no human edit meanwhile)
+JOB_LABELS = {"review": "재검수", "revise": "수정"}  # what an item job is doing, for 409 messages
 
 NO_KEY_MESSAGE = "API 키가 없어 live 모드를 쓸 수 없어요. ANTHROPIC_API_KEY를 설정한 뒤 서버를 다시 시작해 주세요."
+# Errors ``BaseHTTPRequestHandler`` sends before our routing runs (see ``InsiaHandler.send_error``).
+STDLIB_ERRORS = {
+    400: "요청 형식이 올바르지 않아요.",
+    404: "없는 주소예요.",
+    408: "요청이 제시간에 도착하지 않았어요. 다시 시도해 주세요.",
+    414: "주소(URL)가 너무 길어요.",
+    431: "요청 헤더가 너무 커요.",
+    501: "지원하지 않는 요청 방식이에요.",
+    505: "지원하지 않는 HTTP 버전이에요.",
+}
 LOGIN_REQUIRED = "로그인이 필요해요. 서버를 켤 때 정한 접근 토큰을 입력해 주세요."
 
 MIME_OVERRIDES = {
@@ -157,6 +184,17 @@ NO_WEB_PAGE = """<!doctype html><html lang="ko"><meta charset="utf-8"><title>INS
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _count(counter: dict[str, int], key: str, delta: int) -> None:
+    """Add ``delta`` to ``counter[key]``, dropping the key at zero (no-op for an empty key)."""
+    if not key:
+        return
+    value = counter.get(key, 0) + delta
+    if value > 0:
+        counter[key] = value
+    else:
+        counter.pop(key, None)
 
 
 class RequestError(Exception):
@@ -241,8 +279,37 @@ def parse_docs(value: Any) -> str | list[str]:
     return ids
 
 
+class JsonNumberError(ValueError):
+    """A JSON number the API does not accept (NaN/Infinity, a float that overflows, a huge integer)."""
+
+
 def _reject_json_constant(name: str) -> Any:
-    raise ValueError(f"JSON constant {name} is not allowed")
+    raise JsonNumberError(f"JSON constant {name} is not allowed")
+
+
+def _parse_json_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):  # 1e999 / -1e999 overflow to ±inf
+        raise JsonNumberError(f"JSON number {text[:40]} is out of range")
+    return value
+
+
+def _parse_json_int(text: str) -> int:
+    digits = text.lstrip("-")
+    # Length first, so a 5,000-digit literal never reaches int() (and Python's digit limit).
+    if len(digits) > len(str(MAX_JSON_INT)) or abs(int(text)) > MAX_JSON_INT:
+        raise JsonNumberError(f"JSON integer {text[:40]}… is too large")
+    return int(text)
+
+
+def parse_json_body(raw: bytes) -> Any:
+    """Decode a request body: UTF-8 JSON without NaN/Infinity, overflowing floats or integers beyond 2**53-1.
+
+    Raises ``JsonNumberError`` for such numbers and ``ValueError`` /
+    ``RecursionError`` for anything else that is not valid JSON.
+    """
+    return json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant, parse_float=_parse_json_float,
+                      parse_int=_parse_json_int)
 
 
 def split_host(value: str, default_port: int = 80) -> tuple[str, int] | None:
@@ -367,6 +434,10 @@ def _dump(value: Any) -> Any:
     return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
 
 
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else f"{text[:limit]}…(+{len(text) - limit}자)"
+
+
 # ---------------------------------------------------------------------------
 # Cancellation
 # ---------------------------------------------------------------------------
@@ -452,6 +523,8 @@ class RunRecord:
     brief: Brief | None = None
     options: dict[str, Any] = field(default_factory=dict)
     item_id: str = ""
+    # review/revise: the run that produced the item (while that run is active it still writes the item)
+    item_run_id: str = ""
     slot_id: str = ""
     cancel_event: threading.Event = field(default_factory=threading.Event)
     runner: Any = None
@@ -505,6 +578,8 @@ class RunManager:
         self._active: dict[str, RunRecord] = {}
         self._recent: OrderedDict[str, RunRecord] = OrderedDict()
         self._planning = {"live": 0, "mock": 0}
+        self._editing: dict[str, int] = {}  # item id → human edits being saved right now
+        self._editing_runs: dict[str, int] = {}  # the same edits by the run that produced the item
         self._lock = threading.Lock()
         self.interrupted_on_start = self.workspace.mark_interrupted() if recover else 0
         if self.interrupted_on_start:
@@ -618,16 +693,88 @@ class RunManager:
             raise RequestError(429, f"동시에 실행할 수 있는 작업 수({label} {limit}개)를 넘었어요. "
                                     "진행 중인 작업이 끝난 뒤 다시 시도해 주세요.", headers={"Retry-After": "10"})
 
+    def _item_job(self, item_id: str) -> RunRecord | None:
+        """The active review/revise job on ``item_id`` (call with ``_lock`` held)."""
+        if not item_id:
+            return None
+        for other in self._active.values():
+            if other.item_id == item_id and other.kind in ITEM_JOB_KINDS:
+                return other
+        return None
+
+    def item_job(self, item_id: str) -> RunRecord | None:
+        """The review/revise job running on ``item_id`` in this process, if any."""
+        with self._lock:
+            return self._item_job(item_id)
+
+    def _run_writer(self, run_id: str) -> RunRecord | None:
+        """The active run ``run_id`` (a pipeline or slot run, new or resumed), which still writes
+        the items it produces (``it_<run_id>_<channel>``) — call with ``_lock`` held."""
+        return self._active.get(run_id) if run_id else None
+
     def _check_conflicts(self, record: RunRecord) -> None:
         if record.run_id in self._active:
             raise RequestError(409, "이 실행은 이미 진행 중이에요. 실시간 화면에서 진행 상황을 볼 수 있어요.")
+        other = self._item_job(record.item_id)
+        if other is not None:
+            raise RequestError(409, f"이 콘텐츠는 이미 작업 중이에요 (실행 {other.run_id}). 끝난 뒤 다시 시도해 주세요.",
+                               extra={"run_id": other.run_id})
+        if record.item_id and record.kind in ITEM_JOB_KINDS and self._editing.get(record.item_id):
+            raise RequestError(409, "이 콘텐츠를 직접 수정한 내용을 저장하는 중이에요. 잠시 후 다시 시도해 주세요.")
+        # The item's own run still adds versions: a job started now would work from a stale version.
+        writer = self._run_writer(record.item_run_id)
+        if writer is not None:
+            raise RequestError(409, f"이 콘텐츠를 만드는 실행({writer.run_id})이 아직 진행 중이에요. 실행이 끝난 뒤 다시 "
+                                    "시도해 주세요.", extra={"run_id": writer.run_id, "item_id": record.item_id})
+        # A resumed run writes the items it made before: not while a job or a human edit works on one.
         for other in self._active.values():
-            if record.item_id and other.item_id == record.item_id and other.kind in ("review", "revise"):
-                raise RequestError(409, f"이 콘텐츠는 이미 작업 중이에요 (실행 {other.run_id}). 끝난 뒤 다시 시도해 주세요.",
-                                   extra={"run_id": other.run_id})
+            if other.item_run_id and other.item_run_id == record.run_id:
+                raise RequestError(409, f"이 실행의 콘텐츠를 에이전트가 {JOB_LABELS.get(other.kind, '작업')}하는 중이에요 "
+                                        f"(실행 {other.run_id}). 끝난 뒤 이어서 실행해 주세요.",
+                                   extra={"run_id": other.run_id, "item_id": other.item_id})
+        if self._editing_runs.get(record.run_id):
+            raise RequestError(409, "이 실행의 콘텐츠를 직접 수정한 내용을 저장하는 중이에요. 잠시 후 다시 시도해 주세요.")
+        for other in self._active.values():
             if record.slot_id and other.slot_id == record.slot_id:
                 raise RequestError(409, f"이 슬롯은 이미 초안을 만드는 중이에요 (실행 {other.run_id}).",
                                    extra={"run_id": other.run_id})
+
+    @contextmanager
+    def human_edit(self, item_id: str, run_id: str | None = None) -> Iterator[None]:
+        """Hold while saving a human edit of ``item_id`` (``run_id``: the run that produced it;
+        looked up when not given).
+
+        Refuses (409) while an agent in this process still writes the item:
+        a review/revise job on it (the job started from the previous version),
+        or the item's own pipeline/slot run, new or resumed (its next round or
+        final copy would become the current version on top of the edit).
+        While the edit is being saved, a new job on the item or a resume of
+        its run is refused the same way (``_check_conflicts``), so check and
+        save are one step. Several human edits may still be saved one after
+        another.
+        """
+        if run_id is None:
+            detail = self.workspace.get_item(item_id)
+            run_id = detail.item.run_id if detail is not None else ""
+        with self._lock:
+            job = self._item_job(item_id)
+            if job is not None:
+                raise RequestError(409, f"에이전트가 이 콘텐츠를 {JOB_LABELS[job.kind]}하는 중이에요 (실행 {job.run_id}). "
+                                        "작업이 끝나면 새 버전을 확인한 뒤 다시 저장해 주세요.",
+                                   extra={"run_id": job.run_id, "job": job.kind, "item_id": item_id})
+            writer = self._run_writer(run_id)
+            if writer is not None:
+                raise RequestError(409, f"에이전트가 아직 이 콘텐츠를 쓰고 검수하는 중이에요 (실행 {writer.run_id}). "
+                                        "실행이 끝나면 최신 버전을 확인한 뒤 다시 저장해 주세요.",
+                                   extra={"run_id": writer.run_id, "job": writer.kind, "item_id": item_id})
+            _count(self._editing, item_id, +1)
+            _count(self._editing_runs, run_id, +1)
+        try:
+            yield
+        finally:
+            with self._lock:
+                _count(self._editing, item_id, -1)
+                _count(self._editing_runs, run_id, -1)
 
     # -- launching ---------------------------------------------------------------------
     def _prepare(self, options: dict[str, Any], *, run_id: str | None = None, run_mode: str | None = None,
@@ -823,7 +970,8 @@ class RunManager:
         brief = (detail.brief or Brief(topic=detail.item.title or "콘텐츠", channels=[channel])).model_copy(
             update={"channels": [channel]})
         record = RunRecord(run_id=bus.run_id, kind="review", bus=bus, mode=backend.name, model=backend.model,
-                           brief=brief, options=options, item_id=item_id, cancel_event=cancel_event)
+                           brief=brief, options=options, item_id=item_id, item_run_id=detail.item.run_id,
+                           cancel_event=cancel_event)
 
         def target() -> actions.JobResult:
             return actions.review_item(self.workspace, item_id, settings=settings, backend=backend, bus=bus)
@@ -844,7 +992,7 @@ class RunManager:
             update={"channels": [channel]})
         record = RunRecord(run_id=bus.run_id, kind="revise", bus=bus, mode=backend.name, model=backend.model,
                            brief=brief, options={**options, "instructions": instructions}, item_id=item_id,
-                           cancel_event=cancel_event)
+                           item_run_id=detail.item.run_id, cancel_event=cancel_event)
 
         def target() -> actions.JobResult:
             return actions.revise_item(self.workspace, item_id, instructions, settings=settings, backend=backend, bus=bus)
@@ -1022,7 +1170,16 @@ def _env_int(name: str, default: int) -> int:
 
 
 class LoginLimiter:
-    """Failed login / token attempts per client key (IP) in a sliding window."""
+    """Failed login / token attempts per client key (IP) in a sliding window.
+
+    ``attempt(key)`` is the atomic entry point: it checks the limit and, when
+    the key may try, records the attempt as a failure in the same critical
+    section *before* the caller compares anything. Parallel guesses therefore
+    cannot pass a check that was made before the others failed: at most
+    ``max_failures`` comparisons happen per window. A correct credential then
+    calls ``reset`` (login) or ``release`` (a per-request token check).
+    ``retry_after`` / ``fail`` stay for read-only checks and older callers.
+    """
 
     def __init__(self, max_failures: int = LOGIN_MAX_FAILURES, window: float = LOGIN_WINDOW,
                  clock: Callable[[], float] = time.monotonic, max_keys: int = 10_000) -> None:
@@ -1044,34 +1201,98 @@ class LoginLimiter:
             return None
         return entries
 
+    def _wait(self, entries: deque[float] | None, now: float) -> float:
+        if entries is None or len(entries) < self.max_failures:
+            return 0.0
+        return max(1.0, self.window - (now - entries[-self.max_failures]))
+
+    def _record(self, key: str, entries: deque[float] | None, now: float) -> None:
+        if entries is None:
+            entries = self._failures[key] = deque(maxlen=self.max_failures * 2)
+        entries.append(now)
+        self._failures.move_to_end(key)
+        while len(self._failures) > self.max_keys:
+            self._failures.popitem(last=False)
+
     def retry_after(self, key: str) -> float:
-        """Seconds until ``key`` may try again (0 = allowed now)."""
+        """Seconds until ``key`` may try again (0 = allowed now). Read-only: use ``attempt`` before comparing."""
+        with self._lock:
+            now = self.clock()
+            return self._wait(self._recent(key, now), now)
+
+    def attempt(self, key: str) -> float:
+        """Reserve one attempt for ``key``: ``0`` = compare now (already counted as a failure), else seconds to wait.
+
+        Nothing is recorded when the key is over the limit, so a refused
+        request never extends the lockout.
+        """
         with self._lock:
             now = self.clock()
             entries = self._recent(key, now)
-            if entries is None or len(entries) < self.max_failures:
-                return 0.0
-            return max(1.0, self.window - (now - entries[-self.max_failures]))
+            wait = self._wait(entries, now)
+            if wait:
+                return wait
+            self._record(key, entries, now)
+            return 0.0
+
+    def release(self, key: str) -> None:
+        """Undo one ``attempt`` whose credential was correct (earlier failures stay counted)."""
+        with self._lock:
+            entries = self._failures.get(key)
+            if entries:
+                entries.pop()  # any one of the in-flight entries: they are all "now"
+                if not entries:
+                    del self._failures[key]
 
     def fail(self, key: str) -> None:
+        """Record a failure without reserving first (older callers; ``attempt`` already counts one)."""
         with self._lock:
             now = self.clock()
-            entries = self._recent(key, now)
-            if entries is None:
-                entries = self._failures[key] = deque(maxlen=self.max_failures * 2)
-            entries.append(now)
-            self._failures.move_to_end(key)
-            while len(self._failures) > self.max_keys:
-                self._failures.popitem(last=False)
+            self._record(key, self._recent(key, now), now)
 
     def reset(self, key: str) -> None:
+        """A successful login clears the key's failures."""
         with self._lock:
             self._failures.pop(key, None)
+
+
+LIMITER_IPV6_PREFIX = 64  # one subscriber (a home line, a VPS) usually gets a whole /64
+
+
+def client_key(address: str) -> str:
+    """The ``LoginLimiter`` key for a client address.
+
+    An IPv4 address is its own key. An IPv6 client is keyed by its /64
+    network: keyed by the full address, a client with an ordinary /64 could
+    rotate source addresses and get a fresh set of guesses for each one. An
+    IPv4-mapped address (``::ffff:a.b.c.d``, how a dual-stack ``::`` socket
+    reports IPv4 clients) counts as the IPv4 address. Anything that is not an
+    IP address is used as it is.
+    """
+    text = str(address or "").strip().strip("[]")
+    try:
+        ip = ipaddress.ip_address(text.split("%", 1)[0])  # drop an IPv6 zone id (fe80::1%eth0)
+    except ValueError:
+        return text
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.IPv6Network((ip, LIMITER_IPV6_PREFIX), strict=False))
+    return str(ip)
 
 
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
+
+
+def address_family_for(host: str) -> socket.AddressFamily:
+    """``AF_INET6`` for an IPv6 literal (``::1``, ``::``, ``[::1]``), else ``AF_INET`` (names resolve as IPv4)."""
+    name = str(host or "").strip().strip("[]")
+    try:
+        return socket.AF_INET6 if ipaddress.ip_address(name).version == 6 else socket.AF_INET
+    except ValueError:
+        return socket.AF_INET
 
 
 class InsiaServer(ThreadingHTTPServer):
@@ -1081,10 +1302,13 @@ class InsiaServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], manager: RunManager, web_root: Path | None, heartbeat: float = 15.0,
                  quiet: bool = True, *, token: str | None = None, public_hosts: Sequence[str] = (),
                  trust_proxy: bool = False) -> None:
-        self.bind_host = str(address[0]).strip("[]").lower()
+        host = str(address[0]).strip().strip("[]")
+        self.bind_host = host.lower()
+        # IPv6 literals need an AF_INET6 socket (``::`` also accepts IPv4 clients, see server_bind).
+        self.address_family = address_family_for(host)
         # Set before binding: a failed bind (port in use) calls server_close(), which needs it.
         self.manager = manager
-        super().__init__(address, InsiaHandler)
+        super().__init__((host, address[1]), InsiaHandler)
         self.web_root = web_root.resolve() if web_root is not None and web_root.is_dir() else None
         self.heartbeat = heartbeat
         self.quiet = quiet
@@ -1148,6 +1372,23 @@ class InsiaServer(ThreadingHTTPServer):
             return True
         return False
 
+    def server_bind(self) -> None:
+        if self.address_family == socket.AF_INET6 and self.bind_host == "::":
+            try:  # dual stack: "::" also takes IPv4 clients, like 0.0.0.0 does for IPv4
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, OSError):  # pragma: no cover - platform without the option
+                pass
+        super().server_bind()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """Errors that escaped a handler: a vanished client is routine (debug), anything else is logged once."""
+        exc = sys.exc_info()[1]
+        peer = client_address[0] if isinstance(client_address, tuple) and client_address else "?"
+        if isinstance(exc, DISCONNECT_ERRORS + (TimeoutError,)):
+            log.debug("클라이언트 연결이 끊겼어요 (%s): %s", peer, type(exc).__name__)
+            return
+        log.error("요청을 처리하다 오류가 났어요 (%s):\n%s", peer, traceback.format_exc())
+
     def server_close(self) -> None:
         super().server_close()
         try:
@@ -1208,7 +1449,30 @@ class InsiaHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         if not self.server.quiet:
-            super().log_message(format, *args)
+            # the request line holds the path, which a client can make 64 KB long
+            super().log_message(format, *(_clip(a, MAX_LOGGED_PATH * 2) if isinstance(a, str) else a for a in args))
+
+    def _logged_path(self) -> str:
+        return _clip(str(getattr(self, "path", "") or "").split("?", 1)[0], MAX_LOGGED_PATH)
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        """Errors the stdlib answers itself (414 URL too long, 400 bad request line, 431, 501 …):
+        the same Korean JSON shape as every other error, and no traceback when the client is gone."""
+        try:
+            self.log_error("code %d, message %s", code, _clip(str(message or ""), MAX_LOGGED_PATH))
+            self.close_connection = True
+            body = json.dumps({"error": STDLIB_ERRORS.get(int(code), "요청을 처리하지 못했어요."), "status": int(code)},
+                              ensure_ascii=False).encode("utf-8")
+            self.send_response(code, message)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            if self.command != "HEAD" and int(code) >= 200 and int(code) not in (204, 304):
+                self.wfile.write(body)
+        except DISCONNECT_ERRORS + (TimeoutError,) as exc:
+            self._disconnected(self.command or "?", exc)
 
     # -- response helpers ------------------------------------------------------
     def _send_json(self, status: int, payload: Any, extra: dict[str, str] | None = None) -> None:
@@ -1264,6 +1528,10 @@ class InsiaHandler(BaseHTTPRequestHandler):
         proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
         return proto == "https"
 
+    def _limiter_key(self) -> str:
+        """Login limiter key of this client (its IPv4 address or IPv6 /64, see ``client_key``)."""
+        return client_key(self._client_ip())
+
     def _client_ip(self) -> str:
         peer = str(self.client_address[0]) if self.client_address else ""
         if self.server.trust_proxy:
@@ -1317,28 +1585,44 @@ class InsiaHandler(BaseHTTPRequestHandler):
             parts.append("Secure")
         return "; ".join(parts)
 
+    @staticmethod
+    def _too_many(wait: float) -> RequestError:
+        seconds = math.ceil(wait)
+        return RequestError(429, f"로그인 시도가 너무 많아요. {seconds}초 뒤에 다시 시도해 주세요.",
+                            headers={"Retry-After": str(seconds)})
+
+    def _check_credential(self, key: str, value: str, check: Callable[[str], bool]) -> bool:
+        """Compare one credential under the limiter: the attempt is reserved first, so a burst of
+        parallel guesses gets at most ``max_failures`` comparisons (the rest answer 429)."""
+        limiter = self.server.limiter
+        wait = limiter.attempt(key)
+        if wait:
+            raise self._too_many(wait)
+        if value and check(value):
+            limiter.release(key)
+            return True
+        return False  # the reserved attempt stays counted as a failure
+
     def _require_auth(self) -> None:
         srv = self.server
         if srv.token is None:
             return
-        key = self._client_ip()
+        key = self._limiter_key()
         wait = srv.limiter.retry_after(key)
         if wait:
-            raise RequestError(429, f"로그인 시도가 너무 많아요. {math.ceil(wait)}초 뒤에 다시 시도해 주세요.",
-                               headers={"Retry-After": str(math.ceil(wait))})
+            raise self._too_many(wait)
         unauthorized = {"WWW-Authenticate": 'Bearer realm="insia"'}
-        auth = self.headers.get("Authorization")
-        if auth:
-            scheme, _, value = auth.strip().partition(" ")
-            if scheme.lower() == "bearer" and value.strip() and srv.check_bearer(value.strip()):
+        scheme, _, value = (self.headers.get("Authorization") or "").strip().partition(" ")
+        # Only a Bearer header is a token attempt. Other schemes (e.g. Basic credentials that an nginx
+        # auth_basic / Caddy basicauth proxy forwards) are not ours: fall through to the cookie.
+        if scheme.lower() == "bearer":
+            if self._check_credential(key, value.strip(), srv.check_bearer):
                 return
-            srv.limiter.fail(key)
             raise RequestError(401, "접근 토큰이 맞지 않아요.", extra={"login": True}, headers=unauthorized)
         cookie = self._cookie(COOKIE_NAME)
         if cookie:
-            if srv.check_cookie(cookie):
+            if self._check_credential(key, cookie, srv.check_cookie):
                 return
-            srv.limiter.fail(key)
             headers = {**unauthorized, "Set-Cookie": self._cookie_header("", 0)}
             raise RequestError(401, "로그인이 만료됐어요. 접근 토큰을 다시 입력해 주세요.", extra={"login": True}, headers=headers)
         raise RequestError(401, LOGIN_REQUIRED, extra={"login": True}, headers=unauthorized)
@@ -1361,10 +1645,21 @@ class InsiaHandler(BaseHTTPRequestHandler):
             if required:
                 raise RequestError(400, empty_message)
             return {}
-        raw = self.rfile.read(length)
         try:
-            # NaN/Infinity are not JSON; deep nesting raises RecursionError.
-            body = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+            raw = self.rfile.read(length)
+        except TimeoutError:  # the client sent the headers, then stopped (InsiaHandler.timeout seconds)
+            self.close_connection = True
+            log.debug("%s %s: 요청 본문을 기다리다 시간이 지났어요", self.command, self._logged_path())
+            raise RequestError(408, "요청 본문이 제시간에 도착하지 않았어요. 다시 시도해 주세요.") from None
+        if len(raw) < length:
+            self.close_connection = True
+            raise RequestError(400, "요청 본문이 Content-Length보다 짧아요. 다시 보내 주세요.")
+        try:
+            # NaN/Infinity/1e999/huge integers are refused; deep nesting raises RecursionError.
+            body = parse_json_body(raw)
+        except JsonNumberError:
+            raise RequestError(400, "JSON에 쓸 수 없는 숫자가 있어요 (NaN, Infinity, 1e999처럼 무한대가 되는 수, "
+                                    f"절댓값이 {MAX_JSON_INT:,}보다 큰 정수)") from None
         except (ValueError, RecursionError):  # includes UnicodeDecodeError and JSONDecodeError
             raise RequestError(400, "JSON 형식이 올바르지 않아요") from None
         if not isinstance(body, dict):
@@ -1389,9 +1684,12 @@ class InsiaHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         # No CORS headers: a cross-site preflight always fails.
-        self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Allow", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
-        self.end_headers()
+        try:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Allow", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
+            self.end_headers()
+        except DISCONNECT_ERRORS:
+            self.close_connection = True
 
     def _dispatch(self, method: str) -> None:
         try:
@@ -1423,19 +1721,28 @@ class InsiaHandler(BaseHTTPRequestHandler):
                 self._check_origin(require_json=method != "DELETE")
             getattr(self, f"_h_{route.handler}")(*params, query=query)
         except RequestError as exc:
-            self._error(exc.status, exc.message, exc.extra, exc.headers)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
+            self._answer_error(exc)
+        except DISCONNECT_ERRORS + (TimeoutError,) as exc:
+            # Gone, or stopped reading our answer (a stalled request body is a 408 from _read_json).
+            self._disconnected(method, exc)
         except Exception as exc:  # noqa: BLE001 - map library errors, answer 500 instead of dropping the connection
             mapped = self._map_error(exc)
             if mapped is None:
-                log.error("%s %s failed:\n%s", method, self.path.split("?", 1)[0], traceback.format_exc())
+                log.error("%s %s failed:\n%s", method, self._logged_path(), traceback.format_exc())
                 self.close_connection = True
                 mapped = RequestError(500, "서버에서 요청을 처리하지 못했어요. 잠시 후 다시 시도해 주세요.")
-            try:
-                self._error(mapped.status, mapped.message, mapped.extra, mapped.headers)
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                pass
+            self._answer_error(mapped)
+
+    def _answer_error(self, exc: RequestError) -> None:
+        """Send an error response; a client that already went away is not an error of ours."""
+        try:
+            self._error(exc.status, exc.message, exc.extra, exc.headers)
+        except DISCONNECT_ERRORS + (TimeoutError,) as err:
+            self._disconnected(self.command or "?", err)
+
+    def _disconnected(self, method: str, exc: BaseException) -> None:
+        self.close_connection = True
+        log.debug("%s %s: 클라이언트 연결이 끊겼어요 (%s)", method, self._logged_path(), type(exc).__name__)
 
     @staticmethod
     def _map_error(exc: Exception) -> RequestError | None:
@@ -1468,21 +1775,23 @@ class InsiaHandler(BaseHTTPRequestHandler):
             self._read_json(MAX_LOGIN_BODY)
             self._send_json(200, {"ok": True, "token_required": False})
             return
-        key = self._client_ip()
+        key = self._limiter_key()
         wait = srv.limiter.retry_after(key)
-        if wait:
-            raise RequestError(429, f"로그인 시도가 너무 많아요. {math.ceil(wait)}초 뒤에 다시 시도해 주세요.",
-                               headers={"Retry-After": str(math.ceil(wait))})
+        if wait:  # already locked out: do not even read the body
+            raise self._too_many(wait)
         body = self._read_json(MAX_LOGIN_BODY, required=True, empty_message="토큰을 입력해 주세요")
         token = body.get("token")
         if not isinstance(token, str) or not token.strip():
             raise RequestError(400, "토큰을 입력해 주세요")
+        # The check above ran before the body arrived, so parallel logins could all have passed it:
+        # reserve this attempt atomically now, right before the comparison (429 without comparing).
+        wait = srv.limiter.attempt(key)
+        if wait:
+            raise self._too_many(wait)
         if not srv.check_bearer(token.strip()):
-            srv.limiter.fail(key)
-            wait = srv.limiter.retry_after(key)
+            wait = srv.limiter.retry_after(key)  # the reserved attempt stays counted as a failure
             if wait:
-                raise RequestError(429, f"로그인 시도가 너무 많아요. {math.ceil(wait)}초 뒤에 다시 시도해 주세요.",
-                                   headers={"Retry-After": str(math.ceil(wait))})
+                raise self._too_many(wait)
             raise RequestError(401, "토큰이 맞지 않아요.", extra={"login": True})
         srv.limiter.reset(key)
         assert srv.session_value is not None
@@ -1700,7 +2009,8 @@ class InsiaHandler(BaseHTTPRequestHandler):
     def _h_edit_item(self, item_id: str, *, query: dict[str, list[str]]) -> None:
         body = self._read_json(MAX_DRAFT_BODY, required=True, empty_message="수정한 제목과 본문을 보내 주세요")
         manager = self.server.manager
-        if manager.workspace.get_item(item_id) is None:
+        detail = manager.workspace.get_item(item_id)
+        if detail is None:
             raise RequestError(404, f"콘텐츠 {item_id}를 찾을 수 없어요")
         title = body.get("title")
         content = body.get("content")
@@ -1710,7 +2020,9 @@ class InsiaHandler(BaseHTTPRequestHandler):
         if hashtags is not None and not (isinstance(hashtags, str) or (
                 isinstance(hashtags, list) and all(isinstance(t, str) for t in hashtags) and len(hashtags) <= 100)):
             raise RequestError(400, "해시태그(hashtags)는 문자열 목록이어야 해요")
-        result = actions.edit_item(manager.workspace, item_id, title, content, hashtags, settings=manager.settings)
+        # 409 while an agent still writes this item (a review/revise job on it, or its own pipeline/slot run)
+        with manager.human_edit(item_id, detail.item.run_id):
+            result = actions.edit_item(manager.workspace, item_id, title, content, hashtags, settings=manager.settings)
         self._send_json(200, result.to_dict())
 
     def _job_options(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -1888,12 +2200,23 @@ class InsiaHandler(BaseHTTPRequestHandler):
         target = resolve_static(root, url_path)
         if target is None:
             raise RequestError(403, "접근할 수 없는 경로예요")
-        if not target.is_file():
+        try:
+            is_file = target.is_file()
+        except OSError:  # e.g. a path segment longer than the file system allows (ENAMETOOLONG)
+            is_file = False
+        if not is_file:
             raise RequestError(404, "파일을 찾을 수 없어요")
         self._send_file(target)
 
     def _send_file(self, target: Path) -> None:
-        size = target.stat().st_size
+        try:  # open before any header goes out, so a file that vanished since the check is still a clean 404
+            handle = target.open("rb")
+        except OSError:
+            raise RequestError(404, "파일을 찾을 수 없어요") from None
+        with handle:
+            self._send_open_file(target, handle, os.fstat(handle.fileno()).st_size)
+
+    def _send_open_file(self, target: Path, handle: Any, size: int) -> None:
         ctype = MIME_OVERRIDES.get(target.suffix.lower()) or mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         start, end = 0, size - 1
         status = 200
@@ -1920,15 +2243,14 @@ class InsiaHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command == "HEAD" or length == 0:
             return
-        with target.open("rb") as handle:
-            handle.seek(start)
-            remaining = length
-            while remaining > 0:
-                chunk = handle.read(min(64 * 1024, remaining))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                remaining -= len(chunk)
+        handle.seek(start)
+        remaining = length
+        while remaining > 0:
+            chunk = handle.read(min(64 * 1024, remaining))
+            if not chunk:
+                break
+            self.wfile.write(chunk)
+            remaining -= len(chunk)
 
 
 def resolve_static(root: Path, url_path: str) -> Path | None:
@@ -1951,7 +2273,11 @@ def resolve_static(root: Path, url_path: str) -> Path | None:
         return None
     if resolved != root and not resolved.is_relative_to(root):
         return None
-    if resolved.is_dir():
+    try:
+        is_dir = resolved.is_dir()
+    except OSError:  # e.g. ENAMETOOLONG: not a directory we can serve; the caller's file check answers 404
+        is_dir = False
+    if is_dir:
         # index.html itself may be a symlink, so resolve and check containment again.
         try:
             resolved = (resolved / "index.html").resolve()
@@ -1980,6 +2306,24 @@ def parse_range(header: str, size: int) -> tuple[int, int] | None:
     return start, end
 
 
+TRUE_WORDS = ("1", "true", "yes", "on")
+TOKEN_FOR_PROXY_MESSAGE = ("리버스 프록시(--trust-proxy / INSIA_TRUST_PROXY) 뒤에서 열면 127.0.0.1로 열어도 바깥에서 "
+                           "접속할 수 있어서 접근 토큰이 꼭 필요해요. INSIA_ACCESS_TOKEN 환경 변수나 --token으로 "
+                           f"{MIN_TOKEN_CHARS}자 이상의 토큰을 정해 주세요.")
+
+
+def env_flag(name: str) -> bool:
+    """True when env ``name`` is ``1``/``true``/``yes``/``on`` (case-insensitive)."""
+    return (os.environ.get(name) or "").strip().lower() in TRUE_WORDS
+
+
+def _ipv6_unavailable(exc: BaseException) -> bool:
+    """This machine cannot open an IPv6 socket or has no such address (vs. a port that is taken)."""
+    if isinstance(exc, socket.gaierror):
+        return True
+    return isinstance(exc, OSError) and exc.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL, errno.EPROTONOSUPPORT)
+
+
 def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, web_dir: str | Path | None = None,
                 heartbeat: float = 15.0, quiet: bool = True, *, token: str | None = None,
                 public_hosts: Sequence[str] | str = (), trust_proxy: bool = False, workspace: Workspace | None = None,
@@ -1989,16 +2333,20 @@ def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, w
     ``token`` defaults to env ``INSIA_ACCESS_TOKEN``; empty ``public_hosts`` to
     env ``INSIA_PUBLIC_HOSTS`` (comma-separated) and ``trust_proxy=False`` to env
     ``INSIA_TRUST_PROXY`` (``1``/``true``), so a container can be configured
-    with environment variables alone. Raises ``ServerConfigError`` (a
-    ``ValueError`` with a Korean message) when a non-loopback ``host`` or any
-    ``public_hosts`` entry has no token, the token is too weak, a ``public_hosts`` entry is invalid or the
-    workspace cannot be opened; ``OSError`` when the port cannot be bound.
+    with environment variables alone. ``host`` may be an IPv6 literal (``::1``,
+    ``::`` = every IPv4 and IPv6 address). Raises ``ServerConfigError`` (a
+    ``ValueError`` with a Korean message) when a non-loopback ``host``, any
+    ``public_hosts`` entry or ``trust_proxy`` has no token (a reverse proxy
+    makes even a loopback bind reachable from outside), the token is too weak,
+    a ``public_hosts`` entry is invalid, this machine cannot open an IPv6
+    ``host`` or the workspace cannot be opened; ``OSError`` when the port
+    cannot be bound.
     """
     token = check_token(token if token is not None and str(token).strip() else os.environ.get("INSIA_ACCESS_TOKEN"))
     if not public_hosts:
         public_hosts = [h for h in (os.environ.get("INSIA_PUBLIC_HOSTS") or "").split(",") if h.strip()]
     if not trust_proxy:
-        trust_proxy = (os.environ.get("INSIA_TRUST_PROXY") or "").strip().lower() in ("1", "true", "yes", "on")
+        trust_proxy = env_flag("INSIA_TRUST_PROXY")
     hosts = normalize_public_hosts(public_hosts)
     if not is_loopback_bind(host) and token is None:
         raise ServerConfigError(
@@ -2008,6 +2356,8 @@ def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, w
         raise ServerConfigError(
             "도메인(--public-host / INSIA_PUBLIC_HOSTS)으로 열면 리버스 프록시를 거쳐 바깥에서 접속할 수 있어서 접근 토큰이 "
             f"꼭 필요해요. INSIA_ACCESS_TOKEN 환경 변수나 --token으로 {MIN_TOKEN_CHARS}자 이상의 토큰을 정해 주세요.")
+    if trust_proxy and token is None:  # trusting proxy headers says a proxy is in front: same exposure
+        raise ServerConfigError(TOKEN_FOR_PROXY_MESSAGE)
     web_root = Path(web_dir) if web_dir is not None else settings.web_dir
     try:
         manager = RunManager(settings, workspace=workspace, max_live=max_live, max_mock=max_mock)
@@ -2016,8 +2366,12 @@ def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, w
     try:
         return InsiaServer((host, port), manager, web_root, heartbeat=heartbeat, quiet=quiet, token=token,
                            public_hosts=hosts, trust_proxy=trust_proxy)
-    except BaseException:
+    except BaseException as exc:
         manager.shutdown(timeout=0)
+        if address_family_for(host) == socket.AF_INET6 and _ipv6_unavailable(exc):
+            raise ServerConfigError(
+                f"이 컴퓨터에서는 IPv6 주소({host})로 서버를 열 수 없어요 ({getattr(exc, 'strerror', None) or exc}). "
+                "--host 127.0.0.1(이 컴퓨터에서만) 또는 --host 0.0.0.0(다른 기기에서도, 접근 토큰 필요)을 써 주세요.") from None
         raise
 
 

@@ -18,7 +18,7 @@ from insia_agents import server as server_module
 from insia_agents.db import Workspace, pipeline_item_id
 from insia_agents.exporters import capabilities
 from insia_agents.models import Brief
-from insia_agents.server import COOKIE_NAME, LoginLimiter, ServerConfigError, make_server
+from insia_agents.server import COOKIE_NAME, LoginLimiter, ServerConfigError, client_key, make_server
 
 TOKEN = "unit-test-token-0123456789"
 TERMINAL = ("run.completed", "run.failed")
@@ -518,6 +518,104 @@ def test_second_job_on_the_same_item_is_refused_while_one_runs(srv):
     assert wait_run(srv, first["run_id"])["status"] == "cancelled"
 
 
+@pytest.mark.parametrize("job, body", [("revise", {"instructions": "더 짧게"}), ("review", {})])
+def test_human_edit_is_refused_while_a_review_or_revise_job_runs(srv, job, body):
+    """A job started from the previous version would bury the edit (finding 4): 409, then save afterwards."""
+    run_id, _ = finished_run(srv, ("linkedin",))
+    item_id = pipeline_item_id(run_id, "linkedin")
+    versions = len(ok(srv, "GET", f"/api/items/{item_id}")["versions"])
+    started = ok(srv, "POST", f"/api/items/{item_id}/{job}", {**body, "options": {"speed": 1}}, status=201)
+    edit = {"title": "사람이 고친 제목", "content": "사람이 직접 고친 본문이에요. " * 5}
+    resp, data = request(srv, "PUT", f"/api/items/{item_id}/draft", edit)
+    assert resp.status == 409, data
+    assert data["run_id"] == started["run_id"] and data["job"] == job and data["item_id"] == item_id
+    assert "에이전트가 이 콘텐츠를" in data["error"] and "다시 저장해 주세요" in data["error"]
+    assert len(ok(srv, "GET", f"/api/items/{item_id}")["versions"]) == versions  # nothing was saved
+    ok(srv, "POST", started["cancel_url"], {}, status=202)
+    wait_run(srv, started["run_id"])
+    saved = ok(srv, "PUT", f"/api/items/{item_id}/draft", edit)  # the job is over: the edit goes through
+    assert saved["version"]["source"] == "human" and saved["item"]["title"] == "사람이 고친 제목"
+    assert srv.manager._editing == {}
+
+
+def test_a_job_cannot_start_while_a_human_edit_is_being_saved(srv):
+    run_id, _ = finished_run(srv, ("linkedin",))
+    item_id = pipeline_item_id(run_id, "linkedin")
+    with srv.manager.human_edit(item_id):
+        for job in ("review", "revise"):
+            resp, data = request(srv, "POST", f"/api/items/{item_id}/{job}", {"options": {"speed": 0}})
+            assert resp.status == 409 and "직접 수정한 내용을 저장하는 중" in data["error"], data
+        with srv.manager.human_edit(item_id):  # two edits one after another are still fine
+            assert srv.manager._editing[item_id] == 2
+    assert srv.manager._editing == {}
+    created = ok(srv, "POST", f"/api/items/{item_id}/review", {"options": {"speed": 0}}, status=201)
+    assert wait_run(srv, created["run_id"])["status"] == "completed"
+
+
+@pytest.fixture
+def held_review(monkeypatch):
+    """Holds the first review a run stores until released: by then the run has saved v1 of its item
+    and is still active (deterministic, no dependence on the mock clock)."""
+    reached, release = threading.Event(), threading.Event()
+    original = Workspace.attach_review
+
+    def attach_review(self, *args, **kwargs):
+        if not reached.is_set():
+            reached.set()
+            release.wait(15)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Workspace, "attach_review", attach_review)
+    yield reached, release
+    release.set()
+
+
+def test_items_of_a_run_that_is_still_writing_them_cannot_be_edited_or_given_a_job(srv, held_review):
+    """Finding 4 through the item's own run: its next round or final copy would become the current
+    version on top of a human edit saved meanwhile, so the edit (and review/revise jobs) wait for it."""
+    reached, release = held_review
+    run_id = start_run(srv, ("linkedin",))["run_id"]
+    assert reached.wait(10)
+    item_id = pipeline_item_id(run_id, "linkedin")
+    before = ok(srv, "GET", f"/api/items/{item_id}")["versions"]
+    assert len(before) == 1 and ok(srv, "GET", f"/api/runs/{run_id}")["active"] is True
+    edit = {"title": "사람이 고친 제목", "content": "사람이 직접 고친 본문이에요. " * 5}
+    resp, data = request(srv, "PUT", f"/api/items/{item_id}/draft", edit)
+    assert resp.status == 409, data
+    assert data["run_id"] == run_id and data["job"] == "pipeline" and data["item_id"] == item_id
+    assert "에이전트가 아직 이 콘텐츠를" in data["error"] and "다시 저장해 주세요" in data["error"]
+    for job, body in (("review", {}), ("revise", {"instructions": "더 짧게"})):
+        resp, data = request(srv, "POST", f"/api/items/{item_id}/{job}", {**body, "options": {"speed": 0}})
+        assert resp.status == 409 and data["run_id"] == run_id and "아직 진행 중" in data["error"], (job, data)
+    assert ok(srv, "GET", f"/api/items/{item_id}")["versions"] == before  # nothing was saved
+    release.set()
+    assert wait_run(srv, run_id)["status"] == "completed"
+    saved = ok(srv, "PUT", f"/api/items/{item_id}/draft", edit)  # the run is over: the edit goes through
+    detail = ok(srv, "GET", f"/api/items/{item_id}")
+    assert saved["version"]["source"] == "human" and detail["versions"][-1]["source"] == "human"
+    assert detail["item"]["version"] == saved["version"]["version"] and detail["item"]["title"] == "사람이 고친 제목"
+    assert srv.manager._editing == {} and srv.manager._editing_runs == {}
+
+
+def test_a_run_cannot_resume_while_one_of_its_items_is_edited_or_has_a_job(srv):
+    run_id, _ = finished_run(srv, ("linkedin",))
+    item_id = pipeline_item_id(run_id, "linkedin")
+    srv.manager.workspace.update_run(run_id, status="interrupted")  # resumable again
+    with srv.manager.human_edit(item_id):  # the run is looked up from the item
+        assert srv.manager._editing_runs == {run_id: 1}
+        resp, data = request(srv, "POST", f"/api/runs/{run_id}/resume", {"options": {"speed": 0}})
+        assert resp.status == 409 and "직접 수정한 내용을 저장하는 중" in data["error"], data
+    assert srv.manager._editing_runs == {}
+    job = ok(srv, "POST", f"/api/items/{item_id}/review", {"options": {"speed": 1}}, status=201)
+    resp, data = request(srv, "POST", f"/api/runs/{run_id}/resume", {"options": {"speed": 0}})
+    assert resp.status == 409 and data["run_id"] == job["run_id"] and data["item_id"] == item_id, data
+    assert "재검수하는 중" in data["error"]
+    ok(srv, "POST", job["cancel_url"], {}, status=202)
+    wait_run(srv, job["run_id"])
+    ok(srv, "POST", f"/api/runs/{run_id}/resume", {"options": {"speed": 0}}, status=202)
+    assert wait_run(srv, run_id)["status"] == "completed"
+
+
 # ---------------------------------------------------------------------------
 # exports
 # ---------------------------------------------------------------------------
@@ -778,8 +876,160 @@ def test_login_limiter_window():
     assert limiter.retry_after("1.2.3.4") == 0
 
 
+def test_client_key_groups_ipv6_by_64_and_unmaps_ipv4():
+    assert client_key("203.0.113.9") == "203.0.113.9"
+    assert client_key("::ffff:203.0.113.9") == "203.0.113.9"  # how a dual-stack "::" socket shows IPv4 clients
+    assert client_key("2001:db8:1:2::1") == client_key("2001:db8:1:2:ffff:1:2:3") == "2001:db8:1:2::/64"
+    assert client_key("[2001:db8:1:3::1]") == "2001:db8:1:3::/64" != client_key("2001:db8:1:2::1")
+    assert client_key("fe80::1%eth0") == "fe80::/64"
+    assert client_key("") == "" and client_key("not-an-ip") == "not-an-ip"
+
+
+def test_login_limit_covers_an_ipv6_clients_whole_64(servers, settings):
+    """Keyed by the full address, one IPv6 subscriber could rotate through its /64 for fresh guesses."""
+    srv = servers(settings, token=TOKEN, trust_proxy=True)
+
+    def login(client, token="wrong-token-000000"):
+        return request(srv, "POST", "/api/login", {"token": token}, headers={"X-Forwarded-For": client})[0].status
+
+    statuses = [login(f"2001:db8:1:2::{i:x}") for i in range(1, 11)]  # a new source address for every guess
+    assert statuses.count(401) == 9 and statuses[-1] == 429
+    assert login("2001:db8:1:2:ffff:ffff:ffff:ffff", TOKEN) == 429  # same /64: still locked out
+    assert login("2001:db8:1:3::1", TOKEN) == 200  # another /64 is another client
+    for _ in range(10):
+        login("::ffff:198.51.100.7")
+    assert login("198.51.100.7", TOKEN) == 429  # an IPv4-mapped address is the IPv4 client
+
+
 def test_login_without_a_token_configured(srv):
     assert ok(srv, "POST", "/api/login", {"token": "anything"}) == {"ok": True, "token_required": False}
+
+
+def test_trust_proxy_needs_a_token(settings, monkeypatch):
+    """--trust-proxy means a reverse proxy is in front, so 127.0.0.1 is reachable from outside (finding 14)."""
+    with pytest.raises(ServerConfigError, match="리버스 프록시") as info:
+        make_server(settings, host="127.0.0.1", port=0, trust_proxy=True)
+    assert "접근 토큰" in str(info.value) and "INSIA_ACCESS_TOKEN" in str(info.value)
+    monkeypatch.setenv("INSIA_TRUST_PROXY", "yes")
+    with pytest.raises(ServerConfigError, match="trust-proxy"):
+        make_server(settings, host="127.0.0.1", port=0)
+    srv = make_server(settings, host="127.0.0.1", port=0, token=TOKEN)
+    try:
+        assert srv.trust_proxy is True and srv.token_required
+    finally:
+        srv.server_close()
+
+
+def _raw_login_burst(srv, guesses):
+    """Send every login's headers first (all handlers pass the pre-body check), then all bodies at once."""
+    import socket as socket_module
+
+    port = srv.server_address[1]
+    socks = []
+    bodies = []
+    for guess in guesses:
+        body = json.dumps({"token": guess}).encode()
+        s = socket_module.create_connection(("127.0.0.1", port), timeout=20)
+        s.sendall((f"POST /api/login HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n"
+                   f"Content-Length: {len(body)}\r\n\r\n").encode())
+        socks.append(s)
+        bodies.append(body)
+    time.sleep(0.5)  # every handler now waits for its body, after the lockout pre-check
+    for s, body in zip(socks, bodies):
+        s.sendall(body)
+    answers = []
+    for s in socks:
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        head = data.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        answers.append((int(head.split(" ", 2)[1]), "set-cookie:" in head.lower()))
+    return answers
+
+
+def test_parallel_logins_compare_at_most_the_limit(servers, settings):
+    """Finding 2: guesses held back until they are all in flight still get only LOGIN_MAX_FAILURES comparisons."""
+    srv = servers(settings, token=TOKEN)
+    compared = []
+    real_check = srv.check_bearer
+
+    def counting_check(value):
+        compared.append(value)
+        return real_check(value)
+
+    srv.check_bearer = counting_check
+    guesses = [f"wrong-guess-{i:06d}" for i in range(29)] + [TOKEN]  # the right token arrives last
+    answers = _raw_login_burst(srv, guesses)
+    assert 0 < len(compared) <= server_module.LOGIN_MAX_FAILURES  # before the fix: all 30 were compared
+    statuses = [status for status, _ in answers]
+    assert set(statuses) <= {200, 401, 429} and statuses.count(401) < server_module.LOGIN_MAX_FAILURES
+    assert statuses.count(429) >= len(guesses) - server_module.LOGIN_MAX_FAILURES
+    if TOKEN in compared:  # it happened to get one of the slots
+        assert answers[-1] == (200, True)
+    else:  # the slots went to wrong guesses: the right token was refused without being compared
+        assert answers[-1] == (429, False)
+    assert sum(1 for _, cookie in answers if cookie) == statuses.count(200) <= 1
+
+
+def test_login_limiter_attempt_is_atomic_under_a_thread_burst():
+    limiter = LoginLimiter(max_failures=5, window=60)
+    barrier = threading.Barrier(40, timeout=10)
+    granted = []
+
+    def guess():
+        barrier.wait()
+        if limiter.attempt("203.0.113.9") == 0:
+            granted.append(1)
+
+    threads = [threading.Thread(target=guess) for _ in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert len(granted) == 5  # exactly the limit, however the threads interleave
+    assert limiter.retry_after("203.0.113.9") > 0
+    assert limiter.attempt("203.0.113.9") > 0  # refused attempts do not extend the lockout...
+    assert len(limiter._failures["203.0.113.9"]) == 5
+    limiter.release("203.0.113.9")  # ...and a correct credential gives its reserved slot back
+    assert limiter.retry_after("203.0.113.9") == 0 and limiter.attempt("203.0.113.9") == 0
+    limiter.reset("203.0.113.9")
+    limiter.release("203.0.113.9")  # nothing to release: no error
+    assert limiter.retry_after("203.0.113.9") == 0
+
+
+def test_bearer_guesses_are_capped_and_valid_tokens_do_not_use_up_the_limit(servers, settings):
+    srv = servers(settings, token=TOKEN)
+    bearer = {"Authorization": f"Bearer {TOKEN}"}
+    for _ in range(server_module.LOGIN_MAX_FAILURES - 1):
+        resp, _ = request(srv, "GET", "/api/health", headers={"Authorization": "Bearer wrong-guess-0000"})
+        assert resp.status == 401
+    for _ in range(30):  # each valid request reserves an attempt and gives it back
+        ok(srv, "GET", "/api/health", headers=bearer)
+    resp, _ = request(srv, "GET", "/api/health", headers={"Authorization": "Bearer"})  # an empty token is a failure too
+    assert resp.status == 401
+    resp, _ = request(srv, "GET", "/api/health", headers=bearer)
+    assert resp.status == 429 and int(resp.getheader("Retry-After")) > 0
+
+
+def test_basic_authorization_header_falls_back_to_the_cookie(servers, settings):
+    """Finding 3: an nginx/Caddy basic-auth header in front must neither block the cookie nor count as a failure."""
+    srv = servers(settings, token=TOKEN)
+    resp, _ = request(srv, "POST", "/api/login", {"token": TOKEN})
+    cookie = resp.getheader("Set-Cookie").split(";", 1)[0]
+    basic = {"Authorization": "Basic dXNlcjpwYXNz"}
+    for _ in range(server_module.LOGIN_MAX_FAILURES + 5):
+        assert ok(srv, "GET", "/api/profile", headers={**basic, "Cookie": cookie})["profile"] is not None
+    for _ in range(server_module.LOGIN_MAX_FAILURES + 5):  # without the cookie: "log in", but no failed attempt
+        resp, data = request(srv, "GET", "/api/profile", headers=basic)
+        assert resp.status == 401 and data["error"] == server_module.LOGIN_REQUIRED
+    ok(srv, "GET", "/api/profile", headers={"Cookie": cookie})
+    ok(srv, "GET", "/api/profile", headers={"Authorization": f"Bearer {TOKEN}"})
+    resp, _ = request(srv, "GET", "/api/profile", headers={"Authorization": "Bearer wrong-guess-0000", "Cookie": cookie})
+    assert resp.status == 401  # a Bearer header is still the credential that counts
 
 
 def test_run_manager_keeps_legacy_constructor(settings):

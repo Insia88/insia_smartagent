@@ -9,8 +9,12 @@ Targets both MS Word and Hancom Hangul (한글):
   wrapped lines align under the text, markers kept as written.
 - Markdown tables → real Word tables: explicit borders, shaded header row that
   repeats on page breaks, fixed column widths (Hangul ignores autofit).
-- Fill-in placeholders ([대표자 성명], [확인 필요: …], [○]) highlighted yellow.
+- Fill-in placeholders ([대표자 성명], [확인 필요: …], [○]) highlighted yellow,
+  everywhere (also in the reference list), except phrases the profile marks
+  as required (e.g. "[광고]").
 - Footer: "INSIA 초안 — 제출 전 사람 검토 필수 | N / M".
+- Characters XML forbids (pasted from PowerPoint/PDF: \\x0b, \\x0c, NUL, ESC …)
+  are cleaned first; any other failure is an ``ExportError`` in Korean.
 
 python-docx is imported lazily; a missing install raises
 ``MissingDependencyError`` with the pip command.
@@ -20,14 +24,17 @@ from __future__ import annotations
 
 import importlib
 import io
+import logging
 import re
 import unicodedata
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 from ..models import Draft, Profile
-from .common import (EXTRA_HINT, TOP_LEVEL_MARKERS, Block, MissingDependencyError, inline_segments, is_hashtag_line,
-                     parse_blocks, strip_inline)
+from .common import (EXTRA_HINT, TOP_LEVEL_MARKERS, Block, ExportError, MissingDependencyError, clean_draft,
+                     inline_segments, is_hashtag_line, is_kept_phrase, parse_blocks, strip_inline, xml_safe)
+
+log = logging.getLogger(__name__)
 
 FONT_LATIN = "Malgun Gothic"
 FONT_EAST_ASIA = "맑은 고딕"
@@ -73,7 +80,18 @@ _NUMERIC_CELL = re.compile(r"^(약\s?)?[-+]?[\d,.]+\s?(원|%|%p|개|명|건|회|
 _BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _LABEL_PAREN = re.compile(r"^(\([^()\n]{1,16}\))(\s*)")
 _LABEL_COLON = re.compile(r"^([^\s:：\[\]]{1,10})([:：])(\s)")
-_REFERENCE_HEADINGS = ("참고자료", "참고 자료", "참고문헌", "출처")
+# A reference-list heading is one made only of these words (after numbering
+# and punctuation are removed): "참고자료", "5. 참고 자료 및 출처", "출처 목록".
+# "3-2. 국내 매출처 확보 계획" or "학습 데이터 출처와 수집 방법" are not.
+_HEADING_NUMBER = re.compile(r"^\s*(?:[\dⅠ-Ⅻⅰ-ⅻ]+(?:[-.]\d+)*[.)]?|[(（]\d+[)）]|[①-⑳]|[가-하][.)])\s*")
+_HEADING_NOISE = re.compile(r"[\s()（）\[\]<>「」『』·•,/&:：.\-]")
+_REF_WORD = r"(?:참고자료|참고문헌|출처목록|자료출처|인용자료|출처|참고|references?|sources?|bibliography)"
+_REFERENCE_HEADING = re.compile(rf"{_REF_WORD}(?:(?:및|와|과|and)?{_REF_WORD})*", re.IGNORECASE)
+
+
+def is_reference_heading(text: str) -> bool:
+    core = _HEADING_NOISE.sub("", _HEADING_NUMBER.sub("", strip_inline(text or "")))
+    return bool(core) and _REFERENCE_HEADING.fullmatch(core) is not None
 
 
 def require_docx():
@@ -159,6 +177,8 @@ class _Builder:
         self.meta = meta
         self.profile = profile
         self.channel_label = channel_label
+        # phrases that must stay as written (ad disclosures …): never highlighted as fill-ins
+        self.keep = tuple(p.strip() for p in (profile.required_phrases if profile else []) if p and p.strip())
         self.in_references = False
         self.references_level = 0
         self.last_was_table = False
@@ -257,8 +277,8 @@ class _Builder:
         self._insert(h1_ppr, border)
 
         props = self.doc.core_properties
-        props.title = self.draft.title
-        props.subject = f"{self.channel_label} 초안"
+        props.title = xml_safe(self.draft.title, soft_break=" ")
+        props.subject = xml_safe(f"{self.channel_label} 초안", soft_break=" ")
         props.author = "INSIA 스마트에이전트"
         props.last_modified_by = "INSIA 스마트에이전트"
         props.comments = "AI 초안 — 제출·게시 전 사람 검토 필수"
@@ -303,6 +323,7 @@ class _Builder:
     # -- runs ------------------------------------------------------------------
 
     def _hyperlink(self, paragraph, url: str, size: float | None) -> None:
+        url = xml_safe(url, soft_break="")
         target = quote(url, safe=":/?#[]@!$&'()*+,;=%~-._")
         r_id = paragraph.part.relate_to(target, self.RT.HYPERLINK, is_external=True)
         link = self.OxmlElement("w:hyperlink")
@@ -326,7 +347,9 @@ class _Builder:
 
     def _runs(self, paragraph, text: str, *, size: float | None = None, color: str | None = None,
               bold: bool = False, italic: bool = False, links: bool = True, highlight: bool = True) -> None:
-        pieces = _BR.split(text)
+        # last line of defence: the draft is cleaned in build_docx, but meta,
+        # profile names … also end up here and lxml refuses XML-illegal characters
+        pieces = _BR.split(xml_safe(text))
         for index, piece in enumerate(pieces):
             if index:
                 paragraph.add_run().add_break()
@@ -343,7 +366,8 @@ class _Builder:
                     run.font.size = self.Pt(size)
                 if color:
                     self._set_color(run.font, color)
-                if seg.kind == "placeholder" and highlight and not self.in_references:
+                # an unfilled [확인 필요: …] matters in the reference list too
+                if seg.kind == "placeholder" and highlight and not is_kept_phrase(seg.text, self.keep):
                     run.font.highlight_color = self.HIGHLIGHT.YELLOW
 
     def _paragraph(self, *, style: str | None = None, before: float | None = None, after: float | None = None,
@@ -373,7 +397,8 @@ class _Builder:
         if self.meta:
             meta = self._paragraph(align=self.ALIGN.CENTER, after=10)
             self._runs(meta, self.meta, size=9, color=MUTED, links=False)
-        self._blind_notice()
+        if self.draft.channel == "bizplan":  # the blind rule is for business plans only
+            self._blind_notice()
 
     def _blind_notice(self) -> None:
         exposed = exposed_names(self.draft, self.profile)
@@ -408,8 +433,7 @@ class _Builder:
         level = max(1, min(3, block.level - level_offset))
         paragraph = self._paragraph(style=f"Heading {level}")
         self._runs(paragraph, text, links=False)
-        compact = text.replace(" ", "")
-        if any(h.replace(" ", "") in compact for h in _REFERENCE_HEADINGS):
+        if is_reference_heading(text):
             self.in_references, self.references_level = True, block.level
         elif self.in_references and block.level <= self.references_level:
             self.in_references = False
@@ -604,5 +628,18 @@ def exposed_names(draft: Draft, profile: Profile | None) -> list[str]:
 
 
 def build_docx(draft: Draft, *, meta: str = "", profile: Profile | None = None, channel_label: str = "") -> bytes:
-    """Render ``draft`` as a .docx document and return the file bytes."""
-    return _Builder(draft, meta=meta, profile=profile, channel_label=channel_label or draft.channel).build()
+    """Render ``draft`` as a .docx document and return the file bytes.
+
+    Raises ``MissingDependencyError`` without python-docx and ``ExportError``
+    (Korean message) for anything else that goes wrong while building.
+    """
+    try:
+        builder = _Builder(clean_draft(draft), meta=xml_safe(meta, soft_break=" "), profile=profile,
+                           channel_label=xml_safe(channel_label or draft.channel, soft_break=" "))
+        return builder.build()
+    except ExportError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — never a bare ValueError/500 for the user
+        log.warning("docx build failed for a %s draft", draft.channel, exc_info=True)
+        raise ExportError(f"Word(.docx) 파일을 만들지 못했어요 (오류: {exc.__class__.__name__}). "
+                          "md나 txt로 내보내 보고, 계속 안 되면 본문에 복사해 온 특수 문자가 없는지 확인해 주세요.") from exc

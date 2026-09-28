@@ -46,7 +46,7 @@
 | `POST /api/login` · `/api/logout` | 4KB |
 | 나머지 JSON | 64KB |
 
-`Content-Length`가 필요합니다(chunked 전송은 411). 한도를 넘으면 본문을 읽기 전에 413으로 답합니다. `NaN`, `Infinity`, 너무 깊게 중첩된 JSON은 400입니다.
+`Content-Length`가 필요합니다(chunked 전송은 411). 한도를 넘으면 본문을 읽기 전에 413으로 답합니다. `NaN`, `Infinity`, `1e999`처럼 무한대가 되는 수, 절댓값이 9,007,199,254,740,991(2⁵³−1)보다 큰 정수, 너무 깊게 중첩된 JSON은 400입니다. 본문이 `Content-Length`보다 짧게 끝나면 400, 헤더만 보내고 본문을 120초 동안 보내지 않으면 408입니다.
 
 ### 동시 작업 수
 
@@ -57,6 +57,13 @@
 ```
 
 같은 콘텐츠에 재검수·수정 요청이 이미 돌고 있거나, 같은 캘린더 슬롯이 초안을 만드는 중이면 `409`와 진행 중인 `run_id`를 돌려줍니다.
+
+에이전트가 아직 쓰고 있는 콘텐츠는 사람이 직접 고쳐 저장하는 것(`PUT /api/items/<id>/draft`)도 `409`입니다. 에이전트가 이전 버전으로 작업하는 중이라, 지금 저장하면 그 결과가 사람이 고친 버전 위에 현재 버전으로 올라가기 때문이에요. 이런 경우예요.
+
+- 그 콘텐츠에 재검수·수정 요청 작업이 도는 중
+- 그 콘텐츠를 만든 실행(`pipeline`·`slot`, 이어서 실행 포함)이 아직 도는 중. 실행 중에도 채널마다 v1이 먼저 보관함에 보이지만, 실행이 끝날 때까지 다음 수정본·최종본이 더 붙어요
+
+같은 이유로 그 콘텐츠를 만든 실행이 도는 동안에는 재검수·수정 요청도 `409`이고, 실행의 콘텐츠 하나에 재검수·수정 요청이 돌거나 사람이 저장하는 중이면 그 실행을 이어서 실행하는 것도 `409`입니다. 모두 이 서버에서 도는 작업만 알 수 있어요(CLI로 따로 돌리는 실행은 모름).
 
 ### 상태 코드
 
@@ -72,10 +79,14 @@
 | 404 | 없는 경로 또는 없는 id |
 | 405 | 그 경로에서 지원하지 않는 메서드 (`Allow` 헤더 참고) |
 | 409 | 지금 상태에서는 할 수 없어요 (승인 차단, 잘못된 상태 전환, 이미 실행 중 등) |
+| 408 | 요청 본문이 제시간(120초)에 도착하지 않았어요 |
 | 413 · 415 · 411 | 본문이 너무 큼 · JSON이 아님 · Content-Length 없음 |
+| 414 | 주소(URL)가 너무 길어요 (64KB 넘음) |
 | 429 | 동시 작업 수 초과, 또는 로그인 실패가 너무 많음 (`Retry-After`) |
 | 501 | 선택 설치 패키지가 없음 (예: Word 내보내기에 python-docx 필요) |
 | 502 | AI 백엔드(Anthropic API) 호출 실패 |
+
+서버가 라우팅 전에 거절하는 요청(414, 잘못된 요청 줄 400, 헤더가 너무 큼 431, 지원하지 않는 메서드 501)도 같은 `{"error": "…", "status": N}` 모양으로 답합니다. 응답을 받기 전에 연결을 끊은 클라이언트는 오류로 기록하지 않습니다(디버그 로그만).
 
 ---
 
@@ -84,13 +95,19 @@
 기본 실행(`insia serve`)은 내 PC(`127.0.0.1`)에서만 열리고 토큰이 없습니다. 다른 기기에서 접속하려면 토큰이 **반드시** 필요합니다.
 
 - `--host 0.0.0.0`처럼 루프백이 아닌 주소로 열 때 토큰이 없으면 서버가 시작하지 않습니다.
+- `--public-host`(`INSIA_PUBLIC_HOSTS`)나 `--trust-proxy`(`INSIA_TRUST_PROXY=1`)를 쓸 때도 토큰이 없으면 시작하지 않습니다. 리버스 프록시가 앞에 있으면 `127.0.0.1`로 열어도 바깥에서 접속할 수 있기 때문이에요.
+- IPv6도 됩니다: `--host ::1`은 IPv6 루프백이라 토큰 없이 열리고, `--host ::`(IPv4·IPv6 모든 주소)는 `0.0.0.0`처럼 토큰이 필요합니다. IPv6를 쓸 수 없는 컴퓨터에서는 시작할 때 `--host 127.0.0.1`을 쓰라고 안내해요.
 - 토큰은 `INSIA_ACCESS_TOKEN` 환경 변수나 `--token`으로 정합니다. 12자 이상, 공백 없는 영문·숫자·기호만 됩니다. 예: `python -c "import secrets; print(secrets.token_urlsafe(24))"`
 - 토큰 모드에서는 `/api/login`, `/api/logout`을 뺀 모든 `/api` 요청에 아래 중 하나가 필요합니다.
   - `Authorization: Bearer <토큰>` 헤더 (스크립트용)
   - `insia_token` 쿠키 (`POST /api/login`이 설정, 브라우저용. SSE `EventSource`도 이 쿠키로 인증돼요)
+- `Bearer`가 아닌 `Authorization` 헤더(예: 앞단 nginx `auth_basic`·Caddy `basicauth`가 그대로 넘기는 `Basic …`)는 이 서버의 토큰이 아니라서 무시하고 쿠키로 인증합니다. 틀린 시도로 세지도 않아요. 반대로 `Bearer` 헤더가 있으면 그 값이 틀렸을 때 쿠키가 맞아도 401입니다.
 - 인증이 없으면 `/api/health`를 포함해 모두 `401`과 `{"login": true}`를 돌려줍니다. 대시보드는 이걸 보고 로그인 화면을 띄웁니다. 없는 경로도 로그인 전에는 404가 아니라 401입니다.
 - 토큰 비교는 상수 시간(`hmac.compare_digest`)으로 합니다.
 - 틀린 토큰(로그인, Bearer, 쿠키 모두)은 클라이언트 IP마다 **1분에 10번**까지입니다. 넘으면 맞는 토큰이라도 잠시 `429`(`Retry-After` 초)입니다.
+  - IPv6 클라이언트는 주소 하나가 아니라 **/64 네트워크 하나**를 한 클라이언트로 셉니다. 가입자 한 명(집 회선, 서버 한 대)이 보통 /64 전체를 받아서, 주소마다 세면 주소를 바꿔 가며 계속 시도할 수 있기 때문이에요. `::ffff:203.0.113.9`처럼 IPv4를 담은 주소(`--host ::`로 열었을 때 IPv4 클라이언트가 이렇게 보여요)는 IPv4 주소 `203.0.113.9`와 같은 클라이언트예요.
+  - 토큰을 비교하기 **전에** 시도 한 번을 먼저 셉니다. 그래서 연결을 여러 개 열어 한꺼번에 보내도 1분에 10번보다 많이 비교하지 않고, 나머지는 비교 없이 `429`입니다. 맞는 토큰이면 센 한 번을 돌려줘서, 정상 요청은 제한을 쓰지 않아요.
+  - 로그인(`POST /api/login`)에 성공하면 그 IP의 실패 기록이 지워집니다.
 
 ### 쿠키
 
@@ -113,7 +130,7 @@ INSIA_ACCESS_TOKEN=... insia serve --host 127.0.0.1 --port 8765 --public-host in
 
 - `--public-host`는 여러 번 쓸 수 있습니다.
 - 컨테이너처럼 환경 변수로만 설정할 때는 `INSIA_PUBLIC_HOSTS=insia.example.com,www.example.com`(쉼표로 구분)과 `INSIA_TRUST_PROXY=1`을 쓰면 됩니다. 명령줄 옵션을 주면 그쪽이 먼저입니다.
-- HTTPS를 앞단 프록시(Caddy, nginx)가 처리하면 `--trust-proxy`를 켜세요. 그래야 `Origin: https://…`를 같은 출처로 인정하고, 쿠키에 `Secure`를 붙이고, 로그인 실패 제한에 `X-Forwarded-For`의 마지막 주소(프록시가 붙인 값)를 씁니다. 프록시 없이 `--trust-proxy`를 켜면 누구나 이 헤더를 꾸밀 수 있으니 켜지 마세요.
+- HTTPS를 앞단 프록시(Caddy, nginx)가 처리하면 `--trust-proxy`를 켜세요(토큰이 있어야 켜집니다). 그래야 `Origin: https://…`를 같은 출처로 인정하고, 쿠키에 `Secure`를 붙이고, 로그인 실패 제한에 `X-Forwarded-For`의 마지막 주소(프록시가 붙인 값)를 씁니다. 프록시 없이 `--trust-proxy`를 켜면 누구나 이 헤더를 꾸밀 수 있으니 켜지 마세요.
 - 프록시는 원래 `Host`를 그대로 넘겨야 합니다. nginx 예:
 
 ```nginx
@@ -259,8 +276,13 @@ location / {
 | `revise` | 수정 요청 → 새 버전 → 자동 재검수 | `POST /api/items/<id>/revise` | 불가 |
 | `edit` | 사람이 직접 고친 버전 저장 (즉시 끝남) | `PUT /api/items/<id>/draft` | — |
 
-상태(`status`): `running` 실행 중 · `completed` 완료 · `failed` 실패 · `cancelled` 중단함 · `interrupted` 서버가 꺼져서 멈춤.
-서버가 켜질 때 이전 프로세스가 남긴 `running` 실행은 모두 `interrupted`로 바뀌고, 이벤트 스트림 끝에 `run.failed`(`data.interrupted: true`)가 붙습니다.
+상태(`status`): `running` 실행 중 · `completed` 완료 · `failed` 실패 · `cancelled` 중단함 · `interrupted` 실행하던 프로그램이 멈춰서 중단됨.
+
+실행마다 그 실행을 돌리는 프로세스(pid·호스트)와 신호(heartbeat, 30초마다 갱신)가 기록됩니다. 서버가 켜질 때, 그리고 `insia run-due`·`insia resume`이 시작할 때 `running`으로 남은 실행 중 **실행하던 프로세스가 없어진 것만** `interrupted`로 바꿉니다: 같은 컴퓨터에서 그 프로세스가 끝났거나, 컴퓨터가 다시 켜졌거나, 신호가 10분 넘게 끊긴 경우입니다. 다른 프로세스(예: cron의 `insia run-due`)가 돌리는 실행은 그대로 두니, 서버를 켜는 시점이 CLI 실행과 겹쳐도 됩니다. 정리된 실행은 이벤트 스트림 끝에 `run.failed`(`data.interrupted: true`, `data.resumable`)가 붙고, 그 실행이 만들던 캘린더 슬롯만 다시 `planned`로 돌아갑니다(이미 있던 초안이 있으면 `drafted` 유지). `pipeline`/`slot`은 [이어서 실행](#post-apirunsidresume)할 수 있고, 작업(review/revise/edit)은 오류 메시지대로 보관함에서 다시 시작합니다.
+
+서버는 켜진 뒤에도 1분마다 다시 확인해서, 시작할 때는 판단할 수 없던 실행도 실행하던 프로세스가 없어지면 다시 켜지 않아도 `interrupted`로 정리합니다. 두 번 연달아 확인했을 때도 신호가 없어야 정리하니, 잠자기에서 깨어난 노트북의 CLI 실행은 신호를 다시 보낼 시간이 있어요. 예를 들어 Docker로 업데이트해서(`docker compose up -d --build`) 컨테이너가 새로 만들어지면, 이전 컨테이너가 돌리던 실행은 다른 컴퓨터의 실행처럼 보여서 바로 정리되지 않고, 마지막 신호에서 10분쯤 지나면 자동으로 `interrupted`가 됩니다(그동안은 `running`으로 보이고, 이어서 실행은 `force: true`로만 됩니다).
+
+실행이 이렇게 정리되거나 다른 곳에서 `force`로 넘겨받으면, 그 실행을 아직 돌리고 있던 원래 프로세스(예: 잠자기에서 깨어난 노트북)는 다음 AI 호출 전에 멈추고, 그 뒤로는 그 실행의 이벤트·상태·버전·검수를 기록하지 않으며 캘린더 슬롯도 건드리지 않습니다. 새 주인이 만드는 중이거나 이미 초안을 연결한 슬롯이 다시 `planned`로 돌아가 같은 초안이 두 번 만들어지는 일은 없어요.
 
 ### `POST /api/runs`
 
@@ -321,8 +343,9 @@ location / {
 | `brief`, `options`, `profile` | 실행에 쓴 브리프, 옵션(`doc_ids`, `slot_id` 등), 프로필 스냅숏 |
 | `plan`, `research` | 저장된 계획(`Plan`)과 리서치 팩(`ResearchPack`) |
 | `progress` | `{"channels": {"linkedin": "completed", "bizplan": "failed"}, …}` — 이어서 실행의 근거 |
+| `owner` | `{"pid", "host", "heartbeat_at"}` — 이 실행을 돌리는(돌렸던) 프로세스와 마지막 신호 시각 |
 | `result` | 이 서버가 최근에 실행했다면 전체 `RunResult` (아니면 `null`; 결과물은 `items`로 보관함에서 보세요) |
-| `job` | 작업이면 `JobResult`: `{run_id, kind, item, version, review, format_checks, slot}` (이 서버가 최근에 실행한 것만) |
+| `job` | 작업이면 `JobResult`: `{run_id, kind, item, version, review, format_checks, slot, base_version, current_version, superseded, superseded_by_human_edit}` (이 서버가 최근에 실행한 것만). 작업이 도는 동안 사람이 새 버전을 저장했으면 `superseded`(사람이면 `superseded_by_human_edit`도) `true` — [재검수](#post-apiitemsidreview)·[수정 요청](#post-apiitemsidrevise) 참고 |
 | `resumable` | 이어서 실행할 수 있는지 |
 | `cancel_requested` | 중단을 요청했는지 |
 | `events_url` | SSE 주소 |
@@ -353,9 +376,10 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 
 요청(모두 선택): `{"force": false, "options": {"speed": 0, "max_cost_usd": 5, "mode": "live"}}`
 
-- `options.max_cost_usd`: 예산 초과로 멈췄다면 상한을 올려서 이어가세요.
+- `options.max_cost_usd`: 이 실행의 새 예산 상한. 예산 초과로 멈췄다면 상한을 올려서 이어가세요. 안 주면 **그 실행을 시작할 때의 상한**을 그대로 씁니다. 서버 기본값은 시작할 때 상한이 없었거나, 예산 초과로 멈춘 실행인데 서버 기본값이 그 상한보다 높을 때만 씁니다.
 - `mode`를 안 주면 원래 실행의 모드를 씁니다(서버 기본값이 `auto`일 때).
-- `force: true`: 다른 곳에서 `running`으로 표시된 실행을 억지로 이어갑니다. 정말 멈춘 게 확실할 때만 쓰세요.
+- `force: true`: 다른 곳에서 `running`으로 표시된 실행을 억지로 넘겨받아 이어갑니다. 원래 프로세스가 살아 있으면 다음 AI 호출 전에 멈추고, 이벤트·상태·버전·검수·슬롯을 더는 기록하지 않습니다(그때까지 쓴 비용은 사용량에 남아요). 정말 멈춘 게 확실할 때만 쓰세요(실행하던 프로세스가 없어진 실행은 서버·CLI가 알아서 `interrupted`로 정리합니다).
+- `slot` 실행은 이어서 도는 동안 슬롯을 다시 `generating`으로 잡아 같은 슬롯의 초안이 두 번 만들어지지 않게 하고, 실패하면 슬롯을 원래 상태로 돌려놓습니다. 그사이 다른 실행이 슬롯을 만드는 중이면 이어서 실행하지 않고, 더 나중에 만든 초안이 슬롯에 있으면 슬롯은 그대로 두고 이 실행의 콘텐츠만 끝냅니다.
 
 응답 `202`: `POST /api/runs`와 같은 링크 + `"resumed": true`. 이벤트는 같은 `events_url`에서 이어집니다(`seq`도 이어짐).
 
@@ -366,6 +390,8 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 | 이 서버에서 이미 실행 중 | 409 |
 | 다른 곳에서 `running`으로 표시됨 | 409 (`"can_force": true`) |
 | 모든 채널을 이미 마침 | 409 |
+| 이 실행의 콘텐츠에 재검수·수정 요청이 도는 중 | 409 (`run_id`는 그 작업, `item_id`) |
+| 이 실행의 콘텐츠를 사람이 저장하는 중 | 409 (잠시 뒤 다시 시도) |
 
 ### `POST /api/runs/<id>/cancel`
 
@@ -395,8 +421,11 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 {"items": [{"id": "it_20260928-101039-7073_linkedin", "run_id": "20260928-101039-7073", "channel": "linkedin",
             "title": "반복 업무를 덜어 낸 방법", "status": "draft", "version": 2, "score": 86, "passed": true,
             "scheduled_at": "", "published_at": "", "published_url": "", "note": "",
-            "created_at": "2026-09-28T10:10:39.209Z", "updated_at": "2026-09-28T10:10:39.216Z"}]}
+            "created_at": "2026-09-28T10:10:39.209Z", "updated_at": "2026-09-28T10:10:39.216Z",
+            "approved_version": 0, "approval_forced": false, "approved_score": null, "approved_at": ""}]}
 ```
+
+`approved_version`·`approved_score`·`approved_at`·`approval_forced`는 마지막 승인 기록입니다(승인한 버전, 그 버전의 검수 점수, 시각, 검수를 통과하지 못한 버전을 "그래도 승인"했는지). 게시한 뒤에도 남는 기록이라, `approval_forced`가 `true`이고 상태가 `approved`·`scheduled`·`published`면 대시보드는 "강제 승인"으로 표시합니다. 승인한 적이 없으면 `0`·`null`·`""`·`false`입니다.
 
 잘못된 `status`/`channel`은 400.
 
@@ -439,15 +468,29 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
  "slot": null}
 ```
 
-오류: 제목·본문이 비었거나 너무 김(400; 제목 300자, 본문 10만 자), 없는 콘텐츠(404).
+오류: 제목·본문이 비었거나 너무 김(400; 제목 300자, 본문 10만 자), 없는 콘텐츠(404), 에이전트가 그 콘텐츠를 아직 쓰는 중(409: 재검수·수정 요청 작업, 또는 그 콘텐츠를 만든 실행이 아직 도는 중).
+
+작업이 도는 중이면 저장하지 않고 이렇게 답합니다. `job`은 도는 작업의 종류(`review`, `revise`, `pipeline`, `slot`)예요. 작업이 끝나면 새 버전을 확인한 뒤 다시 저장하세요(대시보드는 고치던 내용을 그대로 두고 오류를 보여 줘요).
+
+```json
+{"error": "에이전트가 이 콘텐츠를 수정하는 중이에요 (실행 20260928-101041-bb02). 작업이 끝나면 새 버전을 확인한 뒤 다시 저장해 주세요.",
+ "status": 409, "run_id": "20260928-101041-bb02", "job": "revise", "item_id": "it_…_linkedin"}
+```
+
+그 콘텐츠를 만든 실행이 아직 도는 중이면:
+
+```json
+{"error": "에이전트가 아직 이 콘텐츠를 쓰고 검수하는 중이에요 (실행 20260928-101500-a1b2). 실행이 끝나면 최신 버전을 확인한 뒤 다시 저장해 주세요.",
+ "status": 409, "run_id": "20260928-101500-a1b2", "job": "pipeline", "item_id": "it_20260928-101500-a1b2_linkedin"}
+```
 
 ### `POST /api/items/<id>/review`
 
 재검수 작업을 시작합니다. 본문 `{}` 또는 `{"options": {"mode": "mock", "speed": 1}}`.
 
-응답 `201`: `{"run_id", "kind": "review", "mode", "events_url", "status_url", "cancel_url", "item_id"}`. 진행은 `events_url`로 보고, 끝나면 `GET /api/runs/<run_id>`의 `job.review`나 `GET /api/items/<id>`에서 결과를 봅니다. 검수는 버전을 새로 만들지 않고 현재 버전에 붙습니다.
+응답 `201`: `{"run_id", "kind": "review", "mode", "events_url", "status_url", "cancel_url", "item_id"}`. 진행은 `events_url`로 보고, 끝나면 `GET /api/runs/<run_id>`의 `job.review`나 `GET /api/items/<id>`에서 결과를 봅니다. 검수는 버전을 새로 만들지 않고 작업을 시작할 때의 현재 버전(`job.base_version`)에 붙습니다. 검수하는 동안 사람이 새 버전을 저장했으면 점수는 검수한 버전에만 붙고, 새 버전이 현재 버전(`job.current_version`, 검수 전)으로 남습니다(`job.superseded: true`, 사람이 저장했으면 `superseded_by_human_edit: true`, `run.completed` 이벤트에도 같은 값).
 
-오류: 없는 콘텐츠 404, 버전 없음 400, 같은 콘텐츠에 작업이 이미 도는 중 409, 동시 작업 초과 429.
+오류: 없는 콘텐츠 404, 버전 없음 400, 같은 콘텐츠에 작업이 이미 도는 중 409, 그 콘텐츠를 만든 실행이 아직 도는 중 409(`run_id`는 그 실행), 사람이 고친 내용을 저장하는 중 409, 동시 작업 초과 429.
 
 ### `POST /api/items/<id>/revise`
 
@@ -455,7 +498,11 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 
 요청: `{"instructions": "도입부를 두 문장으로 줄이고 사례를 하나 넣어 주세요", "options": {"speed": 1}}` (`instructions`는 선택, 4,000자까지)
 
-응답 `201`: review와 같은 모양(`"kind": "revise"`). 새 버전은 `source: "agent"`, `instructions`에 지시가 저장됩니다.
+응답 `201`: review와 같은 모양(`"kind": "revise"`). 새 버전은 `source: "agent"`, `instructions`에 지시가 저장됩니다. 오류는 review와 같습니다.
+
+수정하는 동안 사람이 새 버전을 저장했으면(예: v3에서 시작했는데 v4가 저장됨) 수정 결과는 **현재 버전이 되지 않습니다**. 수정 결과는 v5로 기록에 남고, 사람이 저장한 v4의 내용이 v6으로 다시 올라가 현재 버전이 됩니다(`change_log` 첫 줄에 이유가 적힘). 내보내기·승인은 계속 사람이 고친 내용을 씁니다. 결과의 `job.superseded_by_human_edit: true`, `job.version`(수정 결과 v5), `job.current_version`(v6), `job.base_version`(v3)과 `run.completed` 이벤트의 같은 필드로 알 수 있습니다. 수정 결과를 쓰고 싶으면 v5 내용을 확인해서 직접 고쳐 저장하거나 다시 수정 요청을 보내세요.
+
+수정본을 저장한 뒤 **재검수하는 동안** 사람이 새 버전을 저장해도 마찬가지입니다. 재검수 점수는 수정본에 붙고, 사람이 저장한 버전이 그보다 새 버전이라 그대로 현재 버전으로 남습니다. 이때도 `job.superseded`·`superseded_by_human_edit`가 `true`이고 `job.current_version`이 사람이 저장한 버전이라, 대시보드가 같은 안내를 보여 줄 수 있어요.
 
 ### `POST /api/items/<id>/status`
 
@@ -469,7 +516,7 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 | 무엇이든 → `archived`, archived → `draft` | 보관 · 복원 |
 | approved → draft · needs_changes, scheduled → approved | 되돌리기 |
 
-응답 `200 {"item": {…ContentItem…}}`.
+응답 `200 {"item": {…ContentItem…}}`. 승인하면 `approved_version`·`approved_score`·`approved_at`이 기록되고, `force: true`로 검수를 통과하지 못한(또는 검수 전) 버전을 승인하면 `approval_forced: true`로 남습니다.
 
 승인이 막히면 `409`:
 
@@ -496,16 +543,16 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 
 ```
 Content-Type: application/zip
-Content-Disposition: attachment; filename="2026-09-28_instagram_-3.zip"; filename*=UTF-8''2026-09-28_instagram_%EB%8D%B0%EB%AA%A8-…
+Content-Disposition: attachment; filename="2026-09-28_instagram_v2.zip"; filename*=UTF-8''2026-09-28_instagram_%EB%8D%B0%EB%AA%A8-…_v2.zip
 Cache-Control: no-store
 X-Content-Type-Options: nosniff
 Content-Security-Policy: default-src 'none'; sandbox
 X-Insia-Notes: PNG%20%EB%8C%80%EC%8B%A0%20slides.html%EC%9D%84%20%EB%84%A3%EC%97%88%EC%96%B4%EC%9A%94…
 ```
 
-- 파일 이름은 `<YYYY-MM-DD>_<채널>_<제목 슬러그>.<확장자>`이고, 한글 이름은 `filename*`(RFC 5987)에 있습니다. 대시보드는 `<a href="/api/items/<id>/export?format=…" download>`로 받으면 됩니다(같은 출처라 쿠키 인증도 됩니다).
+- 파일 이름은 `<YYYY-MM-DD>_<채널>_<제목 슬러그>_v<버전>.<확장자>`이고(예전 버전을 받아도 현재 버전 파일과 이름이 겹치지 않아요), 한글 이름은 `filename*`(RFC 5987)에 있습니다. 대시보드는 `<a href="/api/items/<id>/export?format=…" download>`로 받으면 됩니다(같은 출처라 쿠키 인증도 됩니다).
 - `X-Insia-Notes`: 함께 보여 줄 한국어 안내(예: PNG 대신 slides.html을 넣음, 사업계획서에 팀원 실명이 있음). 여러 줄을 `\n`으로 이은 뒤 퍼센트 인코딩했으니 `decodeURIComponent(value).split("\n")`로 읽으세요. 안내가 없으면 헤더도 없습니다.
-- `?info=1` → `{"filename": "2026-09-28_instagram_데모-….zip", "content_type": "application/zip", "size": 5175, "notes": ["PNG 대신 slides.html을 넣었어요 — …"]}`
+- `?info=1` → `{"filename": "2026-09-28_instagram_데모-…_v2.zip", "content_type": "application/zip", "size": 5175, "notes": ["PNG 대신 slides.html을 넣었어요 — …"]}`
 
 오류: 채널에 없는 형식·없는 버전(400), 없는 콘텐츠(404), python-docx 미설치(501 `{"error": "… pip install \"insia-smartagent[export]\" …", "package": "python-docx", "extra": "export"}`).
 
@@ -630,12 +677,12 @@ try:
           token=None,                          # None이면 INSIA_ACCESS_TOKEN
           public_hosts=["insia.example.com"],  # --public-host (여러 개)
           trust_proxy=True)                    # --trust-proxy
-except ServerConfigError as exc:               # ValueError: 토큰 없음·짧음, 잘못된 도메인, 워크스페이스 오류
+except ServerConfigError as exc:               # ValueError: 토큰 없음·짧음, 잘못된 도메인, IPv6 불가, 워크스페이스 오류
     print(f"오류: {exc}")
 except OSError as exc:                         # 포트 사용 중 등
     print(f"서버를 시작하지 못했어요: {exc}")
 ```
 
-- `make_server(settings, host="127.0.0.1", port=8765, web_dir=None, heartbeat=15.0, quiet=True, *, token=None, public_hosts=(), trust_proxy=False, workspace=None, max_live=None, max_mock=None)`는 서버 객체만 만듭니다(`serve_forever()`로 시작, `server_close()`로 정리 — 도는 작업을 중단하고 워크스페이스를 닫습니다).
+- `make_server(settings, host="127.0.0.1", port=8765, web_dir=None, heartbeat=15.0, quiet=True, *, token=None, public_hosts=(), trust_proxy=False, workspace=None, max_live=None, max_mock=None)`는 서버 객체만 만듭니다(`serve_forever()`로 시작, `server_close()`로 정리 — 도는 작업을 중단하고 워크스페이스를 닫습니다). 루프백이 아닌 `host`, `public_hosts`, `trust_proxy` 중 하나라도 있는데 토큰이 없으면 `ServerConfigError`입니다. `host`는 IPv6 주소(`::1`, `::`)도 됩니다.
 - `serve()`는 시작 안내(주소, 모드, 워크스페이스, 토큰 여부, 정리한 중단 실행 수)를 출력하고 Ctrl+C까지 돕니다.
-- 서버가 켜질 때 `running`으로 남은 실행을 `interrupted`로 정리합니다. 같은 워크스페이스에서 CLI 실행(`insia run`, `insia run-due`)이 도는 중에 서버를 켜면 그 실행도 중단됨으로 표시되니, 서버는 CLI 작업이 없을 때 켜세요.
+- 서버가 켜질 때 `running`으로 남은 실행 중 실행하던 프로세스가 없어진 것만 `interrupted`로 정리합니다([실행](#실행) 참고). 같은 워크스페이스에서 CLI 실행(`insia run`, `insia run-due`)이 도는 중에 서버를 켜도 그 실행은 그대로 이어집니다.

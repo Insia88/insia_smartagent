@@ -51,6 +51,14 @@ from .channels import check_format, finalize_review
 from .config import KST, Settings, has_credentials, load_sample_brief, resolve_mode
 from .models import (ALL_CHANNELS, Brief, ChannelResult, ContentItem, ContentItemDetail, Draft, Plan, Profile,
                      ResearchPack, Review, UserDocument)
+# Moved to library modules (the server can use them too); re-exported here for existing callers.
+from .documents import (DOC_EXTENSIONS, DOCS_EXTRA_HINT, IMAGE_EXTENSIONS, UNSUPPORTED_DOCS,  # noqa: F401
+                        _docx_text, _parse_json_text, _parse_yaml_text, _pdf_text, _yaml_module, clean_text,
+                        extract_document, load_structured_file, read_text_file)
+from .errors import CommandError, UsageError
+from .importer import (PROFILE_FIELDS, TEAM_FIELDS, ImportReport, _field_label, _list_fields,  # noqa: F401
+                       _SAFE_RUN_ID, _scalar_text, _team, _text_list, import_run_folder, import_run_id,
+                       profile_from_data)
 
 if TYPE_CHECKING:
     from .db import Workspace
@@ -75,16 +83,7 @@ CHANNEL_ALIASES = {
 }
 DEFAULT_PLAN_COUNTS = {"naver_blog": 2, "linkedin": 2, "instagram": 2}  # same as the dashboard's calendar form
 EXPORT_FORMATS = ("md", "txt", "html", "docx", "zip")
-DOCS_EXTRA_HINT = 'pip install "insia-smartagent[docs]"'
 TOKEN_HINT = "python -c \"import secrets; print(secrets.token_urlsafe(32))\""
-
-
-class UsageError(Exception):
-    """Wrong use of the command line (exit code 2). ``str(exc)`` is Korean."""
-
-
-class CommandError(Exception):
-    """The command could not do its job (exit code 1). ``str(exc)`` is Korean."""
 
 
 # ---------------------------------------------------------------------------
@@ -531,235 +530,12 @@ def _run_cost_from_bus(bus: Any) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Text files (Korean encodings)
-# ---------------------------------------------------------------------------
-
-
-def read_text_file(path: Path, what: str = "파일") -> str:
-    """UTF-8 (with or without BOM), then CP949/EUC-KR (Windows 메모장 'ANSI' 저장)."""
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        raise UsageError(f"{what}을(를) 찾을 수 없어요: {path}") from None
-    except IsADirectoryError:
-        raise UsageError(f"{what} 자리에 폴더를 적었어요: {path}") from None
-    except OSError as exc:
-        raise UsageError(f"{what}을(를) 읽을 수 없어요: {path} ({exc.strerror or exc})") from None
-    for encoding in ("utf-8-sig", "cp949"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    raise UsageError(f"{what}의 글자 인코딩을 알 수 없어요: {path}. UTF-8로 다시 저장해 주세요.")
-
-
-def _parse_json_text(text: str, path: Path) -> Any:
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise UsageError(f"JSON 형식이 올바르지 않아요: {path} ({exc.lineno}번째 줄 {exc.colno}번째 글자 근처: {exc.msg}). "
-                         "쉼표와 따옴표를 확인해 주세요.") from None
-
-
-def _yaml_module() -> Any:
-    try:
-        import yaml  # type: ignore[import-not-found]
-    except ImportError:
-        return None
-    return yaml
-
-
-def _parse_yaml_text(text: str, path: Path) -> Any:
-    yaml = _yaml_module()
-    if yaml is None:
-        raise UsageError(f"YAML 파일을 읽으려면 PyYAML이 필요해요. 설치: {DOCS_EXTRA_HINT} (또는 pip install pyyaml). "
-                         "설치 없이 하려면 JSON 양식을 쓰세요: insia profile edit-template --format json")
-    try:
-        return yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        mark = getattr(exc, "problem_mark", None)
-        where = f"{mark.line + 1}번째 줄 근처" if mark is not None else "위치 모름"
-        problem = getattr(exc, "problem", None) or str(exc).splitlines()[0]
-        raise UsageError(f"YAML 형식이 올바르지 않아요: {path} ({where}: {problem}). "
-                         "콜론(:)이나 #이 들어간 글은 \"큰따옴표\"로 감싸 주세요.") from None
-
-
-def load_structured_file(path: Path, what: str = "파일") -> Any:
-    """JSON or YAML (by extension; unknown extensions try JSON first)."""
-    text = read_text_file(path, what)
-    suffix = path.suffix.lower()
-    if suffix in (".yaml", ".yml"):
-        return _parse_yaml_text(text, path)
-    if suffix == ".json":
-        return _parse_json_text(text, path)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return _parse_yaml_text(text, path)
-
-
-# ---------------------------------------------------------------------------
 # Profile: labels, coercion, YAML/JSON template
 # ---------------------------------------------------------------------------
 
-# (label, hint) per Profile field — the template comments and ``profile show``.
-PROFILE_FIELDS: dict[str, tuple[str, str]] = {
-    "company_name": ("회사 이름", "예: 인시아랩"),
-    "service_name": ("서비스 이름", "예: INSIA 스마트에이전트"),
-    "one_liner": ("한 줄 소개", "예: 1인 창업자를 위한 AI 콘텐츠 비서"),
-    "description": ("서비스 설명", "무엇을 누구에게 어떻게 제공하는지 2~5문장"),
-    "industry": ("업종", "예: 마케팅 SaaS, 동네 베이커리"),
-    "stage": ("창업 단계", "예: 예비창업, 초기(3년 이내), 도약"),
-    "target_customers": ("목표 고객", "예: 콘텐츠 마케팅을 혼자 하는 1인 창업자"),
-    "problem": ("고객 문제", "고객이 지금 겪는 불편"),
-    "solution": ("해결 방법", "우리 서비스가 그 문제를 푸는 방식"),
-    "differentiators": ("차별점", "한 줄에 하나씩"),
-    "business_model": ("수익 모델", "예: 월 구독(베이직/프로)"),
-    "pricing": ("가격", "확정 가격이 아니면 '가정'이라고 적어 주세요"),
-    "traction": ("실적·지표", "기준 시점을 붙여 한 줄에 하나씩. 예: 베타 사용자 120명 (2026-08 기준)"),
-    "team": ("팀", "역할·역량만 사업계획서에 쓰고, 이름은 절대 쓰지 않아요 (블라인드 규정)"),
-    "tone": ("브랜드 톤", "예: 신뢰감 있고 친근한 전문가 톤, 과장 금지"),
-    "banned_words": ("금지 표현", "쓰면 안 되는 말, 한 줄에 하나씩. 예: 최고, 무조건"),
-    "required_phrases": ("필수 문구", "SNS 글에 꼭 넣을 문구. 예: #광고, 면책 문구"),
-    "default_hashtags": ("기본 해시태그", "예: #1인창업 (# 없이 적어도 붙여 줘요)"),
-    "cta": ("기본 행동 유도 문구", "예: 무료 체험 신청은 프로필 링크에서"),
-    "contact": ("문의처", "이메일, 네이버 톡톡 등"),
-    "naver_blog_url": ("네이버 블로그 주소", "https://blog.naver.com/..."),
-    "linkedin_url": ("링크드인 주소", "https://www.linkedin.com/in/..."),
-    "instagram_handle": ("인스타그램 계정", "예: @insia.kr"),
-    "brand_colors": ("브랜드 색", "카드뉴스용 #RRGGBB, 첫 번째가 주 색. 예: #0F766E"),
-    "notes": ("메모", "에이전트가 알아야 할 기타 사실"),
-}
+# PROFILE_FIELDS, TEAM_FIELDS and profile_from_data (loose JSON/YAML → Profile) live in importer.py.
 PROFILE_KEY_FIELDS = ("service_name", "one_liner", "target_customers", "problem", "solution", "differentiators", "tone",
                       "contact")
-TEAM_FIELDS: dict[str, tuple[str, str]] = {
-    "role": ("역할", "예: 대표, CTO"),
-    "name": ("실명", "사업계획서에는 절대 나오지 않아요"),
-    "background": ("역량", "학위·전공, 경력, 보유 역량"),
-    "hiring": ("채용 예정", "채용할 사람이면 true"),
-}
-_COLOR = re.compile(r"^#?([0-9A-Fa-f]{6})$")
-_TRUE_WORDS = {"true", "yes", "y", "1", "예", "네", "o", "채용", "채용예정"}
-_FALSE_WORDS = {"false", "no", "n", "0", "아니오", "아니요", "x", ""}
-
-
-def _list_fields() -> set[str]:
-    return {name for name, info in Profile.model_fields.items()
-            if typing.get_origin(info.annotation) is list and name != "team"}
-
-
-def _field_label(name: str) -> str:
-    return PROFILE_FIELDS.get(name, (name, ""))[0]
-
-
-def _scalar_text(value: Any, label: str) -> str:
-    if isinstance(value, (dict, list, tuple)):
-        raise UsageError(f"'{label}'에는 목록이 아니라 글을 적어 주세요.")
-    if isinstance(value, bool):
-        return "예" if value else "아니오"
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-    return str(value).strip()
-
-
-def _text_list(value: Any, label: str) -> list[str]:
-    if isinstance(value, dict):
-        raise UsageError(f"'{label}'에는 한 줄에 하나씩 목록으로 적어 주세요.")
-    if isinstance(value, str):
-        items = [re.sub(r"^\s*[-*•]\s*", "", line) for line in value.splitlines()]
-    elif isinstance(value, (list, tuple)):
-        items = [_scalar_text(v, label) for v in value if v is not None]
-    else:
-        items = [_scalar_text(value, label)]
-    return [item.strip() for item in items if item and item.strip()]
-
-
-def _team(value: Any) -> list[dict[str, Any]]:
-    entries = [value] if isinstance(value, dict) else value
-    if not isinstance(entries, (list, tuple)):
-        raise UsageError("'팀'은 role·name·background·hiring 항목을 가진 목록으로 적어 주세요.")
-    team: list[dict[str, Any]] = []
-    for index, entry in enumerate(entries, 1):
-        if entry is None:
-            continue
-        if not isinstance(entry, dict):
-            raise UsageError(f"팀 {index}번째 항목은 role·name·background·hiring을 가진 묶음이어야 해요.")
-        member: dict[str, Any] = {}
-        for key in ("role", "name", "background"):
-            if entry.get(key) is not None:
-                member[key] = _scalar_text(entry[key], f"팀 {index}번째 {TEAM_FIELDS[key][0]}")
-        hiring = entry.get("hiring")
-        if isinstance(hiring, bool):
-            member["hiring"] = hiring
-        elif hiring is not None:
-            word = str(hiring).strip().lower()
-            if word in _TRUE_WORDS:
-                member["hiring"] = True
-            elif word in _FALSE_WORDS:
-                member["hiring"] = False
-            else:
-                raise UsageError(f"팀 {index}번째 채용 예정(hiring)은 true 또는 false로 적어 주세요 (받은 값: {hiring!r})")
-        if not any(member.get(k) for k in ("role", "name", "background")) and not member.get("hiring"):
-            continue  # an empty template row
-        if not member.get("role"):
-            raise UsageError(f"팀 {index}번째에 역할(role)을 적어 주세요 (예: 대표, CTO, 채용 예정 개발자).")
-        team.append(member)
-    return team
-
-
-def profile_from_data(data: Any, source: str = "파일") -> tuple[Profile, list[str]]:
-    """A ``Profile`` from loose JSON/YAML data → ``(profile, ignored_keys)``.
-
-    Accepts ``{"profile": {...}}``, skips ``_comment``-style keys, turns
-    numbers/dates into text and a single string into a one-item list,
-    normalizes hashtags and brand colors. Raises ``UsageError`` (Korean).
-    """
-    from .db import normalize_hashtags
-
-    if data is None:
-        data = {}
-    if isinstance(data, dict) and isinstance(data.get("profile"), dict) and set(data) <= {"profile", "_안내", "_comment"}:
-        data = data["profile"]
-    if not isinstance(data, dict):
-        raise UsageError(f"{source}의 프로필은 항목: 값 묶음(객체)이어야 해요.")
-    list_fields = _list_fields()
-    clean: dict[str, Any] = {}
-    ignored: list[str] = []
-    for raw_key, value in data.items():
-        key = str(raw_key).strip()
-        if key.startswith("_") or key == "updated_at":
-            continue
-        if key not in Profile.model_fields:
-            ignored.append(key)
-            continue
-        if value is None:
-            continue
-        label = _field_label(key)
-        if key == "team":
-            clean[key] = _team(value)
-        elif key == "default_hashtags" and isinstance(value, str):
-            clean[key] = normalize_hashtags(value)  # "#a #b" or "a, b" on one line
-        elif key in list_fields:
-            clean[key] = _text_list(value, label)
-        else:
-            clean[key] = _scalar_text(value, label)
-    if "default_hashtags" in clean:
-        clean["default_hashtags"] = normalize_hashtags(clean["default_hashtags"])
-    if "brand_colors" in clean:
-        colors = []
-        for color in clean["brand_colors"]:
-            match = _COLOR.match(color.strip())
-            if not match:
-                raise UsageError(f"브랜드 색은 #RRGGBB 형식이어야 해요 (받은 값: {color!r}, 예: #0F766E)")
-            colors.append("#" + match.group(1).upper())
-        clean["brand_colors"] = colors
-    try:
-        profile = Profile.model_validate(clean)
-    except ValidationError as exc:
-        first = exc.errors()[0]
-        where = " · ".join(str(p) for p in first.get("loc", ()))
-        raise UsageError(f"프로필 형식이 올바르지 않아요 ({where}): {first.get('msg', '')}") from None
-    return profile, ignored
 
 
 def _profile_fill(profile: Profile) -> tuple[int, int, list[str]]:
@@ -855,125 +631,6 @@ def _write_output(text: str, out: str | None, *, force: bool, what: str) -> Path
     except OSError as exc:
         raise CommandError(f"{what}을(를) 저장하지 못했어요: {path} ({exc.strerror or exc})") from None
     return path
-
-
-# ---------------------------------------------------------------------------
-# User documents: text extraction
-# ---------------------------------------------------------------------------
-
-DOC_EXTENSIONS = {".txt": "text", ".text": "text", ".csv": "text", ".tsv": "text", ".log": "text", ".json": "text",
-                  ".md": "markdown", ".markdown": "markdown", ".pdf": "pdf", ".docx": "docx"}
-UNSUPPORTED_DOCS = {
-    ".hwp": "한글(HWP) 파일은 바로 읽을 수 없어요. 한글에서 '다른 이름으로 저장'으로 PDF나 DOCX로 바꾼 뒤 다시 올려 주세요.",
-    ".hwpx": "한글(HWPX) 파일은 바로 읽을 수 없어요. 한글에서 '다른 이름으로 저장'으로 PDF나 DOCX로 바꾼 뒤 다시 올려 주세요.",
-    ".doc": "예전 Word(.doc) 파일은 읽을 수 없어요. Word에서 .docx로 저장한 뒤 다시 올려 주세요.",
-    ".ppt": "발표 자료는 PDF로 내보낸 뒤 올려 주세요.",
-    ".pptx": "발표 자료는 PDF로 내보낸 뒤 올려 주세요.",
-    ".xls": "엑셀 파일은 CSV(쉼표로 구분)로 저장한 뒤 올려 주세요.",
-    ".xlsx": "엑셀 파일은 CSV(쉼표로 구분)로 저장한 뒤 올려 주세요.",
-    ".key": "Keynote 파일은 PDF로 내보낸 뒤 올려 주세요.",
-    ".pages": "Pages 파일은 PDF나 DOCX로 내보낸 뒤 올려 주세요.",
-}
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".bmp", ".tif", ".tiff"}
-
-
-def clean_text(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
-    text = "\n".join(line.rstrip() for line in text.split("\n"))
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def _pdf_text(path: Path) -> tuple[str, list[str]]:
-    try:
-        from pypdf import PdfReader  # type: ignore[import-not-found]
-    except ImportError:
-        raise CommandError(f"PDF를 읽으려면 pypdf가 필요해요. 설치: {DOCS_EXTRA_HINT} (또는 pip install pypdf)") from None
-    notes: list[str] = []
-    try:
-        reader = PdfReader(str(path))
-        if reader.is_encrypted:
-            try:
-                unlocked = reader.decrypt("")
-            except Exception:  # noqa: BLE001 - e.g. AES without the cryptography package
-                unlocked = 0
-            if not unlocked:
-                raise UsageError("암호가 걸린 PDF라 읽을 수 없어요. 암호를 푼 PDF로 저장하거나 글자를 복사해 .txt로 올려 주세요.")
-        pages = [page.extract_text() or "" for page in reader.pages]
-    except UsageError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - pypdf raises many types for broken files
-        raise UsageError(f"PDF를 읽지 못했어요: {path.name} ({type(exc).__name__}: {exc})") from None
-    empty = sum(1 for page in pages if not page.strip())
-    if pages and empty and empty < len(pages):
-        notes.append(f"{len(pages)}쪽 중 {empty}쪽에서 글자를 찾지 못했어요 (이미지로 된 쪽일 수 있어요).")
-    return "\n\n".join(pages), notes
-
-
-def _docx_text(path: Path) -> str:
-    try:
-        import docx  # type: ignore[import-not-found]
-        from docx.table import Table  # type: ignore[import-not-found]
-        from docx.text.paragraph import Paragraph  # type: ignore[import-not-found]
-    except ImportError:
-        raise CommandError(f"Word(.docx) 파일을 읽으려면 python-docx가 필요해요. 설치: {DOCS_EXTRA_HINT} "
-                           "(또는 pip install python-docx)") from None
-    try:
-        document = docx.Document(str(path))
-    except Exception as exc:  # noqa: BLE001
-        raise UsageError(f"Word 파일을 읽지 못했어요: {path.name} ({type(exc).__name__}: {exc})") from None
-    lines: list[str] = []
-    for child in document.element.body.iterchildren():
-        tag = child.tag.rsplit("}", 1)[-1]
-        if tag == "p":
-            paragraph = Paragraph(child, document)
-            text = paragraph.text.strip()
-            style = (paragraph.style.name if paragraph.style is not None else "") or ""
-            if text and (style.startswith("Heading") or style.startswith("제목") or style == "Title"):
-                text = f"## {text}"
-            lines.append(text)
-        elif tag == "tbl":
-            for row in Table(child, document).rows:
-                cells: list[str] = []
-                for cell in row.cells:
-                    value = " ".join(cell.text.split())
-                    if not cells or cells[-1] != value:  # merged cells repeat
-                        cells.append(value)
-                if any(cells):
-                    lines.append(" | ".join(cells))
-            lines.append("")
-    return "\n".join(lines)
-
-
-def extract_document(path: Path) -> tuple[str, str, list[str]]:
-    """``(text, kind, notes)`` for a user file. Refuses empty extraction (Korean ``UsageError``)."""
-    if not path.exists():
-        raise UsageError(f"파일을 찾을 수 없어요: {path}")
-    if path.is_dir():
-        raise UsageError(f"폴더가 아니라 파일을 지정해 주세요: {path}")
-    suffix = path.suffix.lower()
-    if suffix in UNSUPPORTED_DOCS:
-        raise UsageError(UNSUPPORTED_DOCS[suffix])
-    if suffix in IMAGE_EXTENSIONS:
-        raise UsageError("이미지 속 글자는 읽을 수 없어요. 글자를 옮겨 적은 .txt 파일이나 글자가 있는 PDF를 올려 주세요.")
-    kind = DOC_EXTENSIONS.get(suffix)
-    if kind is None:
-        supported = ", ".join(sorted(DOC_EXTENSIONS))
-        raise UsageError(f"읽을 수 없는 파일 형식이에요: {path.name} (가능: {supported})")
-    notes: list[str] = []
-    if kind == "pdf":
-        text, notes = _pdf_text(path)
-    elif kind == "docx":
-        text = _docx_text(path)
-    else:
-        text = read_text_file(path, "자료 파일")
-    text = clean_text(text)
-    if not text:
-        if kind == "pdf":
-            raise UsageError("PDF에서 글자를 찾지 못했어요. 스캔한 이미지 PDF일 수 있어요. 글자를 복사해 .txt로 저장해 올리거나, "
-                             "글자 인식(OCR)을 거친 PDF를 올려 주세요.")
-        raise UsageError(f"파일에 글자가 없어요: {path.name}")
-    return text, kind, notes
 
 
 def _safe_filename(name: str) -> str:
@@ -1115,8 +772,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
     printer = ProgressPrinter(quiet=args.quiet)
     with open_workspace(settings) as ws:
         run_id = _run_id(ws, args.run_id)
+        # runs left 'running' by a process that is gone (a killed run-due, a crash) are closed first
+        recovered = ws.recover_stale()
+        if recovered:
+            print(f"실행하던 프로그램이 멈춘 실행 {len(recovered)}개를 '중단됨'으로 정리했어요: {', '.join(recovered)}",
+                  file=sys.stderr)
         try:
-            result = resume_run(run_id, settings, ws, listener=printer, force=args.force)
+            # --max-cost-usd sets a new cap for this run; without it the run keeps the cap it was started with
+            result = resume_run(run_id, settings, ws, listener=printer, force=args.force,
+                                max_cost_usd=getattr(args, "max_cost_usd", None))
         except BudgetExceeded as exc:
             print(f"\n{exc}", file=sys.stderr)
             print(_budget_hint(run_id, exc.cap), file=sys.stderr)
@@ -1303,8 +967,9 @@ def cmd_items_approve(args: argparse.Namespace) -> int:
             message = str(exc).replace("'그래도 승인'을 눌러 주세요", "--force를 붙여 주세요")
             raise CommandError(f"{message}\n  그래도 승인: insia items approve {item_id} --force") from None
     print(f"승인했어요: {channel_label(item.channel)} v{item.version} · {item.title}")
-    if args.force and not item.passed:
-        print("  (검수를 통과하지 않은 버전을 사람이 직접 확인하고 승인했어요)")
+    if item.approval_forced:
+        score = f"{item.approved_score}점" if item.approved_score is not None else "검수 전"
+        print(f"  강제 승인으로 기록했어요: 검수를 통과하지 않은 v{item.approved_version}({score})을 사람이 직접 확인하고 승인했어요.")
     print(f"다음: insia items export {item_id}  →  직접 게시  →  insia items publish {item_id} --url <게시 주소>")
     return 0
 
@@ -1391,6 +1056,8 @@ def cmd_runs_list(args: argparse.Namespace) -> int:
     with open_workspace(settings) as ws:
         runs = ws.list_runs(limit=args.limit, kind=args.kind, status=args.status)
         home = _home(settings)
+        # 'running' rows whose process is gone (killed, crashed): resume/run-due/serve close them
+        orphaned = [r for r in runs if r["status"] == "running" and not (ws.run_owner(r["run_id"]) or {}).get("live")]
     if args.json:
         _print_json(runs)
         return 0
@@ -1404,9 +1071,17 @@ def cmd_runs_list(args: argparse.Namespace) -> int:
                      RUN_STATUS_LABELS.get(run["status"], run["status"]), _usd(run.get("cost_usd")),
                      _kst(run.get("created_at")), channels, run.get("topic") or ""])
     print_table(["실행 ID", "종류", "상태", "비용", "시작", "채널", "주제"], rows, max_widths=[0, 0, 0, 0, 0, 24, 36])
-    stuck = [r for r in runs if r["status"] in ("interrupted", "failed") and r["kind"] in ("pipeline", "slot")]
+    stuck = [r for r in runs if r["status"] in ("interrupted", "failed", "cancelled") and r["kind"] in ("pipeline", "slot")]
     if stuck:
         print(f"\n멈춘 실행 {len(stuck)}개는 이어서 할 수 있어요: insia resume {stuck[0]['run_id']}")
+    gone = [r for r in orphaned if r["kind"] in ("pipeline", "slot")]
+    if gone:
+        print(f"'실행 중'으로 남았지만 실행하던 프로그램이 멈춘 실행 {len(gone)}개: insia resume {gone[0]['run_id']} "
+              "('중단됨'으로 정리한 뒤 남은 작업만 이어서 해요)")
+    jobs = [r for r in orphaned if r["kind"] not in ("pipeline", "slot")]
+    if jobs:
+        print(f"'실행 중'으로 남았지만 멈춘 작업(재검수·수정 요청 등) {len(jobs)}개는 이어서 할 수 없어요. "
+              "보관함에서 같은 작업을 다시 시작해 주세요.")
     return 0
 
 
@@ -1768,8 +1443,8 @@ def cmd_plan_week(args: argparse.Namespace) -> int:
 
 def cmd_run_due(args: argparse.Namespace) -> int:
     from .actions import generate_slot
-    from .db import WorkspaceError
-    from .pipeline import BudgetExceeded, PipelineError, prepare_run
+    from .db import RunTakenOverError, WorkspaceError
+    from .pipeline import BudgetExceeded, PipelineError, RunCancelled, prepare_run
 
     settings = _settings_from_args(args, **_fast(args))
     if not args.out:
@@ -1779,6 +1454,21 @@ def cmd_run_due(args: argparse.Namespace) -> int:
     until = _resolve_day(args.until, settings) or settings.today
     printer = ProgressPrinter(quiet=args.quiet)
     with open_workspace(settings) as ws:
+        if not args.dry_run:
+            # a killed/crashed run-due (or server) left runs 'running' and slots 'generating': close them so the
+            # slots come back as 'planned' (runs another live process is working on are left alone)
+            recovered = ws.recover_stale()
+            if recovered:
+                print(f"지난번에 끝나지 못한 실행 {len(recovered)}개를 '중단됨'으로 정리했어요 ({', '.join(recovered)}). "
+                      "만들다 멈춘 슬롯은 이번에 다시 만들어요.")
+        for stuck in (s for s in ws.list_slots(date_to=until) if s.status == "generating"):
+            where = f"{stuck.date} {channel_label(stuck.channel)} · {stuck.topic}"
+            if stuck.run_id and (ws.run_owner(stuck.run_id) or {}).get("live"):
+                print(f"건너뜀: {where} — 지금 다른 곳에서 초안을 만드는 중이에요 (실행 {stuck.run_id})")
+            elif args.dry_run:
+                print(f"멈춘 슬롯: {where} — 초안을 만들다 멈췄어요. --dry-run 없이 실행하면 정리하고 다시 만들어요.")
+            else:
+                print(f"멈춘 슬롯: {where} — 방금 멈춘 것 같아요. 1분쯤 뒤 insia run-due를 다시 실행하면 만들어요.")
         due = ws.due_slots(until)
         if not due:
             print(f"{until}까지 만들 초안이 없어요.")
@@ -1812,6 +1502,9 @@ def cmd_run_due(args: argparse.Namespace) -> int:
             except BudgetExceeded as exc:
                 failed.append((slot, str(exc)))
                 print(f"→ 예산 상한에 걸렸어요: {exc}", file=sys.stderr)
+            except (RunCancelled, RunTakenOverError) as exc:  # another process took this run over (it goes on there)
+                skipped.append((slot, str(exc)))
+                print(f"→ 건너뛰었어요: {exc}")
             except WorkspaceError as exc:  # claimed by another process meanwhile, or already drafted
                 skipped.append((slot, str(exc)))
                 print(f"→ 건너뛰었어요: {exc}")
@@ -1904,368 +1597,8 @@ def cmd_calendar_move(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# import-run (Claude Code run folders)
+# import-run (Claude Code run folders): the importer itself is importer.import_run_folder
 # ---------------------------------------------------------------------------
-
-_DRAFT_FILE = re.compile(r"^(?P<channel>[a-z_]+)\.r(?P<round>\d+)\.json$")
-_SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")  # same rule as the workspace
-_JSON_BLOCK = re.compile(r"```(?:json|JSON)?\s*\n(.*?)\n```", re.DOTALL)
-
-
-@dataclass
-class _ChannelImport:
-    channel: str
-    rounds: list[tuple[Draft, Review | None]] = field(default_factory=list)
-    result: ChannelResult | None = None
-    best_score: int | None = None
-    item_id: str = ""
-    added: int = 0
-    reviews_updated: int = 0
-    score_changes: list[str] = field(default_factory=list)
-
-
-@dataclass
-class ImportReport:
-    run_id: str
-    folder: str
-    created: bool
-    topic: str
-    plan: bool
-    research: tuple[int, int] | None
-    channels: list[_ChannelImport]
-    problems: list[str]
-    notes: list[str]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "run_id": self.run_id,
-            "folder": self.folder,
-            "created": self.created,
-            "topic": self.topic,
-            "plan": self.plan,
-            "research": {"findings": self.research[0], "sources": self.research[1]} if self.research else None,
-            "items": {c.channel: {"item_id": c.item_id, "rounds": [d.round for d, _ in c.rounds],
-                                  "scores": [r.score if r else None for _, r in c.rounds],
-                                  "passed": c.result.passed if c.result else None, "versions_added": c.added,
-                                  "reviews_updated": c.reviews_updated} for c in self.channels},
-            "problems": self.problems,
-            "notes": self.notes,
-        }
-
-
-def import_run_id(folder: Path) -> str:
-    """``cc-<folder name>`` (ASCII-safe; a short hash keeps Korean folder names distinct)."""
-    name = folder.name
-    base = re.sub(r"[^A-Za-z0-9._-]+", "-", name).replace("..", ".").strip("-._")
-    if base != name or not base:
-        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:6]
-        base = f"{base[:50]}-{digest}" if base else digest
-    return f"cc-{base[:70]}"
-
-
-def _load_model(path: Path, model: type[BaseModel], what: str, problems: list[str]) -> Any:
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except OSError as exc:
-        problems.append(f"{what} 파일을 읽지 못했어요: {path.name} ({exc.strerror or exc})")
-        return None
-    try:
-        return model.model_validate_json(text)
-    except ValidationError as exc:
-        first = exc.errors()[0]
-        where = ".".join(str(p) for p in first.get("loc", ())) or "-"
-        problems.append(f"{what} 형식이 올바르지 않아요: {path.name} ({exc.error_count()}개 오류, 예: {where} {first.get('msg', '')})")
-        return None
-
-
-def _plan_from_markdown(path: Path) -> Plan | None:
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except OSError:
-        return None
-    for block in reversed(_JSON_BLOCK.findall(text)):
-        try:
-            return Plan.model_validate_json(block)
-        except ValidationError:
-            continue
-    return None
-
-
-def _review_event(review: Review) -> dict[str, Any]:
-    verdicts = {"supported": 0, "unsupported": 0, "needs_source": 0}
-    for fact in review.fact_checks:
-        verdicts[fact.verdict] = verdicts.get(fact.verdict, 0) + 1
-    return {"channel": review.channel, "round": review.round, "score": review.score, "passed": review.passed,
-            "rubric": review.rubric, "issues": review.issues, "format_checks": review.format_checks,
-            "fact_checks": verdicts, "needs_research": review.needs_research, "summary": review.summary}
-
-
-def _emit_import_events(ws: "Workspace", run_id: str, brief: Brief, plan: Plan | None, research: ResearchPack | None,
-                        channels: list[_ChannelImport], settings: Settings, model: str, folder: Path) -> None:
-    """A replayable event stream for the dashboard (first import only)."""
-    from .agents import orchestrator, reviewer
-    from .agents.common import AgentContext
-    from .backends.mock_backend import sim_seconds
-    from .events import EventBus, SimClock
-    from .pipeline import event_sink
-
-    bus = EventBus(run_id, clock=SimClock(0))
-    sink = event_sink(ws, run_id)
-    bus.add_listener(sink)
-    ctx = AgentContext(bus=bus, backend=None, settings=settings, brief=brief, simulated=True)  # type: ignore[arg-type]
-    advance = bus.clock.advance
-    try:
-        bus.emit("run.started", "system", {
-            "brief": brief, "channels": [c.channel for c in channels], "mode": "import", "model": model,
-            "max_rounds": max([len(c.rounds) - 1 for c in channels] + [settings.max_rounds]),
-            "pass_score": settings.pass_score, "kind": "import",
-        })
-        ctx.log(f"Claude Code 실행 폴더를 보관함으로 가져왔어요: {folder.name}")
-        if plan is not None:
-            advance(sim_seconds("plan"))
-            orchestrator.emit_plan(ctx, plan)
-        if research is not None:
-            for source in research.sources:
-                advance(sim_seconds("research_source"))
-                bus.emit("research.source", "researcher", {"source": source})
-            for finding in research.findings:
-                advance(sim_seconds("research_finding"))
-                bus.emit("research.finding", "researcher", {"finding": finding})
-            bus.emit("research.completed", "researcher", {"findings": len(research.findings), "sources": len(research.sources),
-                                                          "gaps": list(research.gaps), "followup": False})
-        for entry in channels:
-            for index, (draft, review) in enumerate(entry.rounds):
-                advance(sim_seconds("draft" if draft.round == 0 else "revise", entry.channel, draft.round))
-                orchestrator.emit_draft(ctx, draft)
-                if review is None:
-                    continue
-                bus.emit("review.started", "reviewer", {"channel": entry.channel, "round": draft.round})
-                advance(sim_seconds("review", entry.channel, draft.round))
-                bus.emit("review.completed", "reviewer", _review_event(review))
-                if not review.passed and index < len(entry.rounds) - 1:
-                    bus.emit("revision.requested", "reviewer", {"channel": entry.channel, "round": draft.round,
-                                                                "issues": len(review.issues), "top_issue": reviewer.top_issue(review)})
-            if entry.result is not None and entry.best_score is not None:
-                orchestrator.complete_channel(ctx, entry.result, entry.best_score)
-        finished = [c for c in channels if c.result is not None]
-        bus.emit("run.completed", "system", {
-            "duration_s": round(bus.clock.now(), 1),
-            "scores": {c.channel: c.best_score for c in finished},
-            "passed": {c.channel: c.result.passed for c in finished if c.result is not None},
-            "output_dir": None, "items": {c.channel: c.item_id for c in channels}, "kind": "import",
-        })
-    finally:
-        bus.remove_listener(sink)
-
-
-def _store_channel(ws: "Workspace", run_id: str, brief: Brief, entry: _ChannelImport) -> None:
-    """Versions for one channel, idempotently.
-
-    Rounds already stored unchanged are kept (their review is updated when the
-    file changed); from the first changed/new round on, the rounds are added
-    again in order so the newest version is always the latest round. When the
-    best-scoring round is not the last one, it is added once more as the
-    newest version (same rule as the pipeline).
-    """
-    from .db import pipeline_item_id
-
-    item_id = pipeline_item_id(run_id, entry.channel)
-    entry.item_id = item_id
-    first = entry.rounds[0][0]
-    ws.ensure_item(item_id, entry.channel, first.title, run_id=run_id, brief=brief)
-    stored: dict[int, Any] = {}
-    for version in ws.list_run_versions(run_id, entry.channel):
-        stored[version.draft.round] = version  # newest version of a round wins
-    changed_from = len(entry.rounds)
-    for index, (draft, _) in enumerate(entry.rounds):
-        existing = stored.get(draft.round)
-        if existing is None or existing.draft.model_dump() != draft.model_dump():
-            changed_from = index
-            break
-    for draft, review in entry.rounds[:changed_from]:
-        existing = stored[draft.round]
-        if review is not None and (existing.review is None or existing.review.model_dump() != review.model_dump()):
-            ws.attach_review(existing.id, review)
-            entry.reviews_updated += 1
-    for draft, review in entry.rounds[changed_from:]:
-        ws.add_version(item_id, draft, source="agent", review=review, run_id=run_id)
-        entry.added += 1
-    reviewed = [(d, r) for d, r in entry.rounds if r is not None]
-    pending = entry.rounds[-1][1] is None
-    if entry.result is not None and not pending and entry.result.final.round != reviewed[-1][0].round:
-        # the newest version *this import* stored (a later human edit in the library is left alone)
-        ours = sorted(ws.list_run_versions(run_id, entry.channel), key=lambda v: v.version)
-        latest = ours[-1] if ours else None
-        if latest is None or latest.draft.model_dump() != entry.result.final.model_dump():
-            best_review = next(r for d, r in reviewed if d.round == entry.result.final.round)
-            ws.add_version(item_id, entry.result.final, source="agent", review=best_review, run_id=run_id)
-            entry.added += 1
-
-
-def import_run_folder(ws: "Workspace", folder: Path, settings: Settings, *, run_id: str | None = None) -> ImportReport:
-    """Import a Claude Code run folder (layout: ``.claude/agents/orchestrator.md``) into the workspace.
-
-    ``brief.json`` and at least one ``drafts/<channel>.r<N>.json`` are
-    required (``UsageError`` otherwise). Every other file is validated; an
-    invalid file is skipped and reported in ``problems``. Reviews are
-    re-finalized with the current code (format checks, score, verdict) using
-    the folder's ``profile.json`` when present. Re-importing the same folder
-    updates the run in place (no duplicate items or versions).
-    """
-    folder = folder.expanduser()
-    if not folder.is_dir():
-        raise UsageError(f"실행 폴더를 찾을 수 없어요: {folder}")
-    folder = folder.resolve()
-    problems: list[str] = []
-    notes: list[str] = []
-    brief_path = folder / "brief.json"
-    if not brief_path.is_file():
-        raise UsageError(f"brief.json이 없어요: {folder}. Claude Code 실행 폴더(outputs/<날짜>-<주제>/)를 지정해 주세요.")
-    brief_problems: list[str] = []
-    brief = _load_model(brief_path, Brief, "브리프(brief.json)", brief_problems)
-    if brief is None:
-        raise UsageError(brief_problems[0])
-
-    plan: Plan | None = None
-    if (folder / "plan.json").is_file():
-        plan = _load_model(folder / "plan.json", Plan, "계획(plan.json)", problems)
-    if plan is None and (folder / "plan.md").is_file():
-        plan = _plan_from_markdown(folder / "plan.md")
-        if plan is None:
-            notes.append("plan.md 끝에 Plan JSON 코드 블록이 없어 계획은 가져오지 않았어요.")
-    if plan is None and not (folder / "plan.json").is_file() and not (folder / "plan.md").is_file():
-        notes.append("계획 파일(plan.json/plan.md)이 없어요.")
-    research: ResearchPack | None = None
-    if (folder / "research.json").is_file():
-        research = _load_model(folder / "research.json", ResearchPack, "리서치(research.json)", problems)
-    else:
-        notes.append("리서치 파일(research.json)이 없어요. 재검수·수정 요청 때 근거 없이 진행돼요.")
-
-    profile: Profile | None = None
-    if (folder / "profile.json").is_file():
-        try:
-            data = load_structured_file(folder / "profile.json", "profile.json")
-            loaded, _ = profile_from_data(data, "profile.json")
-            from .db import profile_is_empty
-
-            profile = None if profile_is_empty(loaded) else loaded
-        except UsageError as exc:
-            problems.append(f"profile.json을 쓰지 못했어요: {exc}")
-    doc_ids: list[str] = []
-    if (folder / "documents.json").is_file():
-        try:
-            raw = json.loads((folder / "documents.json").read_text(encoding="utf-8-sig"))
-            if isinstance(raw, dict):
-                raw = raw.get("documents", [])
-            docs = [UserDocument.model_validate(d) for d in raw or []]
-        except (OSError, ValueError, ValidationError) as exc:
-            problems.append(f"documents.json 형식이 올바르지 않아요 ({type(exc).__name__})")
-        else:
-            doc_ids = [d.id for d in docs]
-            known = {d.id: d for d in ws.list_documents()}
-            missing = [d.id for d in docs if d.id not in known or known[d.id].text != d.text]
-            if missing:
-                notes.append(f"실행에 쓴 자료 {len(docs)}개 중 {len(missing)}개({', '.join(missing)})는 이 워크스페이스에 같은 내용이 없어요. "
-                             "필요하면 insia docs add로 넣어 주세요.")
-
-    draft_dir, review_dir = folder / "drafts", folder / "reviews"
-    by_channel: dict[str, dict[int, Draft]] = {}
-    for path in sorted(draft_dir.glob("*.json")) if draft_dir.is_dir() else []:
-        match = _DRAFT_FILE.match(path.name)
-        if not match or match.group("channel") not in ALL_CHANNELS:
-            problems.append(f"초안 파일 이름이 <채널>.r<N>.json 형식이 아니라 건너뛰었어요: drafts/{path.name}")
-            continue
-        channel, number = match.group("channel"), int(match.group("round"))
-        draft = _load_model(path, Draft, "초안", problems)
-        if draft is None:
-            continue
-        if draft.channel != channel:
-            problems.append(f"drafts/{path.name}의 채널이 파일 이름과 달라요 ({draft.channel}). 건너뛰었어요.")
-            continue
-        if draft.round != number:
-            notes.append(f"drafts/{path.name}의 round({draft.round})를 파일 이름에 맞춰 {number}로 읽었어요.")
-            draft = draft.model_copy(update={"round": number})
-        by_channel.setdefault(channel, {})[number] = draft
-    if not by_channel:
-        raise UsageError(f"가져올 초안이 없어요: {folder / 'drafts'}에 <채널>.r<N>.json 파일이 필요해요. "
-                         + (problems[0] if problems else ""))
-
-    entries: list[_ChannelImport] = []
-    order = [c for c in brief.channels if c in by_channel] + [c for c in ALL_CHANNELS if c in by_channel and c not in brief.channels]
-    for channel in order:
-        entry = _ChannelImport(channel)
-        rounds = by_channel[channel]
-        for number in sorted(rounds):
-            draft = rounds[number]
-            review: Review | None = None
-            path = review_dir / f"{channel}.r{number}.json"
-            if path.is_file():
-                recorded = _load_model(path, Review, "검수", problems)
-                if recorded is not None:
-                    review = finalize_review(recorded, draft, brief, pass_score=settings.pass_score, profile=profile)
-                    if review.score != recorded.score or review.passed != recorded.passed:
-                        entry.score_changes.append(f"R{number} {recorded.score}→{review.score}점")
-            entry.rounds.append((draft, review))
-        for path in sorted(review_dir.glob(f"{channel}.r*.json")) if review_dir.is_dir() else []:
-            match = _DRAFT_FILE.match(path.name)
-            if match and int(match.group("round")) not in rounds:
-                problems.append(f"reviews/{path.name}에 맞는 초안이 없어 건너뛰었어요.")
-        unreviewed = [d.round for d, r in entry.rounds[:-1] if r is None]
-        if unreviewed:
-            notes.append(f"{channel_label(channel)} R{', R'.join(map(str, unreviewed))}에는 검수 파일이 없어요.")
-        reviewed = [(d, r) for d, r in entry.rounds if r is not None]
-        if reviewed:
-            reviews = [r for _, r in reviewed]
-            best = max(range(len(reviews)), key=lambda i: (reviews[i].passed, reviews[i].score, i))  # like the pipeline
-            entry.result = ChannelResult(channel=channel, final=reviewed[best][0], drafts=[d for d, _ in reviewed],  # type: ignore[arg-type]
-                                         reviews=reviews, passed=reviews[best].passed, rounds=len(reviewed) - 1)
-            entry.best_score = reviews[best].score
-        if entry.rounds[-1][1] is None:
-            notes.append(f"{channel_label(channel)} 마지막 초안 R{entry.rounds[-1][0].round}은 검수 전이에요. 보관함에서 재검수할 수 있어요.")
-        entries.append(entry)
-
-    run_id = run_id or import_run_id(folder)
-    existing = ws.get_run(run_id)
-    if existing is not None:
-        if existing["kind"] != "import":
-            raise UsageError(f"이미 같은 id의 실행이 있어요: {run_id}. --run-id로 다른 id를 정해 주세요.")
-        previous = (existing.get("options") or {}).get("source_folder")
-        if previous and previous != str(folder) and (existing.get("brief") or {}).get("topic") != brief.topic:
-            raise UsageError(f"다른 폴더({previous})에서 가져온 실행과 id가 겹쳐요: {run_id}. --run-id로 다른 id를 정해 주세요.")
-    meta: dict[str, Any] = {}
-    if (folder / "meta.json").is_file():
-        try:
-            loaded_meta = json.loads((folder / "meta.json").read_text(encoding="utf-8-sig"))
-            meta = loaded_meta if isinstance(loaded_meta, dict) else {}
-        except (OSError, ValueError):
-            meta = {}
-    model = str(meta.get("model") or "claude-code")
-    options = {"source": "claude-code", "source_folder": str(folder), "pass_score": settings.pass_score,
-               "doc_ids": doc_ids, "use_profile": profile is not None,
-               "imported_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")}
-    created = existing is None
-    if created:
-        ws.create_run(run_id, brief, kind="import", options=options, mode="import", model=model, profile=profile)
-    fields: dict[str, Any] = {"plan": plan, "research": research, "options": options, "model": model}
-    if profile is not None:
-        fields["profile"] = profile
-    try:
-        ws.update_run(run_id, **{k: v for k, v in fields.items() if v is not None or k in ("plan", "research")})
-        for entry in entries:
-            _store_channel(ws, run_id, brief, entry)
-        if created or ws.last_event(run_id) is None:  # one event stream per imported run (dashboard replay)
-            _emit_import_events(ws, run_id, brief, plan, research, entries, settings, model, folder)
-    except BaseException as exc:  # never leave an import run "running"
-        try:
-            ws.update_run(run_id, status="failed", error=f"가져오기 실패: {_error_text(exc)}")
-        except Exception:  # noqa: BLE001 - keep the original error
-            pass
-        raise
-    summary = " · ".join(problems[:3])
-    ws.update_run(run_id, status="completed", error=summary, cost_usd=0.0)
-    return ImportReport(run_id=run_id, folder=str(folder), created=created, topic=brief.topic, plan=plan is not None,
-                        research=(len(research.findings), len(research.sources)) if research else None,
-                        channels=entries, problems=problems, notes=notes)
 
 
 def cmd_import_run(args: argparse.Namespace) -> int:
@@ -2409,6 +1742,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         raise UsageError(
             "도메인(--public-host / INSIA_PUBLIC_HOSTS)으로 열면 리버스 프록시를 거쳐 바깥에서 접속할 수 있어서 접근 토큰이 "
             f"꼭 필요해요. INSIA_ACCESS_TOKEN 환경 변수나 --token으로 정해 주세요. 토큰 만들기: {TOKEN_HINT}")
+    behind_proxy = bool(args.trust_proxy) or server_module.env_flag("INSIA_TRUST_PROXY")
+    if behind_proxy and not token:  # --trust-proxy says a proxy is in front: same exposure as a domain
+        raise UsageError(
+            "리버스 프록시(--trust-proxy / INSIA_TRUST_PROXY) 뒤에서 열면 127.0.0.1로 열어도 바깥에서 접속할 수 있어서 "
+            f"접근 토큰이 꼭 필요해요. INSIA_ACCESS_TOKEN 환경 변수나 --token으로 정해 주세요. 토큰 만들기: {TOKEN_HINT}")
     make_server = server_module.make_server
     try:
         parameters = inspect.signature(make_server).parameters
@@ -2635,6 +1973,19 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--out", help="결과 파일 폴더 (기본 outputs)")
     resume.add_argument("--no-save", action="store_true", help="결과 파일을 저장하지 않아요")
     resume.set_defaults(func=cmd_resume)
+    # --max-cost-usd means something else for resume (without it the run keeps the cap it was started with). The engine
+    # parent's action object is shared with the other commands, so resume gets its own copy with its own help.
+    import copy
+
+    shared_cap = resume._option_string_actions["--max-cost-usd"]
+    resume_cap = copy.copy(shared_cap)
+    resume_cap.help = ("이 실행의 새 예산 상한 (안 주면 처음 실행할 때 정한 상한을 그대로 써요. 그때 상한이 없었으면 "
+                       "INSIA_MAX_COST_USD, 0 = 상한 없음)")
+    resume._actions[resume._actions.index(shared_cap)] = resume_cap
+    for group in resume._action_groups:
+        group._group_actions[:] = [resume_cap if action is shared_cap else action for action in group._group_actions]
+    for option in resume_cap.option_strings:
+        resume._option_string_actions[option] = resume_cap
 
     review = sub.add_parser("review", parents=[ws, engine], help="보관함 콘텐츠를 다시 검수해요",
                             description="콘텐츠의 최신 버전을 검수 에이전트가 다시 채점해요.")

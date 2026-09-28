@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
+import socket
+import struct
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -351,3 +355,303 @@ def test_run_limit_holds_under_a_burst(settings, monkeypatch):
         release.set()
         for record in started:
             record.thread.join(timeout=5)
+
+
+# -- overflowing JSON numbers (finding 15) ----------------------------------------
+
+
+@pytest.mark.parametrize("number", [b"1e999", b"-1e999", b"1" + b"0" * 400, b"-" + b"9" * 17, b"NaN"])
+def test_overflowing_numbers_get_400_not_500(server, number):
+    raw = b'{"start": "2026-09-28", "counts": {"naver_blog": ' + number + b'}, "options": {"mode": "mock"}}'
+    resp, body = request(server, "POST", "/api/calendar/plan", raw)
+    assert resp.status == 400, body
+    assert "쓸 수 없는 숫자" in json.loads(body)["error"]
+
+
+def test_parse_json_body_number_rules():
+    assert server_module.parse_json_body(b'{"a": 9007199254740991, "b": -9007199254740991, "c": 1.5, "d": 1e308}') == {
+        "a": 2 ** 53 - 1, "b": -(2 ** 53 - 1), "c": 1.5, "d": 1e308}
+    for raw in (b'{"a": 9007199254740992}', b'{"a": 1e999}', b'[-1e400]', b'{"a": Infinity}', b'{"a": NaN}',
+                b'{"a": 1' + b"0" * 5000 + b"}"):
+        with pytest.raises(server_module.JsonNumberError):
+            server_module.parse_json_body(raw)
+    with pytest.raises(ValueError):
+        server_module.parse_json_body(b"{nope")
+
+
+# -- malformed or abandoned requests: no 500, no traceback (finding 16) -----------
+
+
+def _no_error_logs(caplog, capfd):
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not errors, [r.getMessage()[:200] for r in errors]
+    assert "Traceback" not in capfd.readouterr().err
+
+
+def test_long_static_paths_are_404_without_a_traceback(server, caplog, capfd):
+    with caplog.at_level(logging.DEBUG, logger="insia_agents.server"):
+        for length in (300, 60_000):  # one segment longer than NAME_MAX (ENAMETOOLONG), then a 60 KB path
+            resp, body = request(server, "GET", "/" + "a" * length)
+            assert resp.status == 404 and json.loads(body)["error"] == "파일을 찾을 수 없어요", length
+        resp, body = request(server, "GET", "/assets/" + "b" * 300 + "/x.js")
+        assert resp.status == 404
+        resp, body = request(server, "GET", "/api/" + "a" * 70_000)  # over the stdlib request-line limit
+        assert resp.status == 414 and json.loads(body) == {"error": "주소(URL)가 너무 길어요.", "status": 414}
+    _no_error_logs(caplog, capfd)
+
+
+def _raw(server, data: bytes, *, shutdown_write: bool = False, wait: float = 10.0) -> bytes:
+    sock = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=wait)
+    sock.sendall(data)
+    if shutdown_write:
+        sock.shutdown(socket.SHUT_WR)
+    chunks = []
+    try:
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        sock.close()
+    return b"".join(chunks)
+
+
+def test_stalled_request_body_gets_408(server, monkeypatch, caplog, capfd):
+    monkeypatch.setattr(server_module.InsiaHandler, "timeout", 0.5)
+    head = b"POST /api/runs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n"
+    with caplog.at_level(logging.DEBUG, logger="insia_agents.server"):
+        answer = _raw(server, head + b'{"topic"')  # the rest never comes
+        assert answer.startswith(b"HTTP/1.0 408"), answer[:200]
+        assert "제시간에 도착하지 않았어요".encode() in answer
+        answer = _raw(server, head + b'{"topic": "t"}', shutdown_write=True)  # the client hung up early
+        assert answer.startswith(b"HTTP/1.0 400") and "Content-Length보다 짧아요".encode() in answer
+    _no_error_logs(caplog, capfd)
+    assert json.loads(request(server, "GET", "/api/runs")[1])["runs"] == []
+
+
+def test_client_that_hangs_up_is_not_an_error(server, monkeypatch, caplog, capfd):
+    def gone(self, *args, **kwargs):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    with caplog.at_level(logging.DEBUG, logger="insia_agents.server"):
+        monkeypatch.setattr(server_module.InsiaHandler, "_error", gone)  # every error answer finds the client gone
+        for path in ("/api/nope", "/nope.js"):
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+            conn.request("GET", path)
+            with pytest.raises((http.client.RemoteDisconnected, ConnectionError)):
+                conn.getresponse()
+            conn.close()
+        monkeypatch.undo()
+        for _ in range(20):  # real resets: SO_LINGER 0 closes with RST before the answer is written
+            sock = socket.create_connection(("127.0.0.1", server.server_address[1]))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            sock.sendall(b"GET /api/does-not-exist HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            sock.close()
+        time.sleep(0.3)
+        assert request(server, "GET", "/api/health")[0].status == 200
+    _no_error_logs(caplog, capfd)
+    assert any("연결이 끊겼어요" in r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG)
+
+
+def test_handle_error_logs_real_errors_but_not_disconnects(server, caplog):
+    with caplog.at_level(logging.DEBUG, logger="insia_agents.server"):
+        try:
+            raise ConnectionResetError(104, "reset")
+        except ConnectionResetError:
+            server.handle_error(None, ("127.0.0.1", 1))
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            server.handle_error(None, ("127.0.0.1", 1))
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1 and "boom" in errors[0].getMessage()
+
+
+# -- IPv6 binds (finding 17) --------------------------------------------------------
+
+
+def _ipv6_loopback_works() -> bool:
+    if not socket.has_ipv6:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+def test_ipv6_literals_pick_the_ipv6_family_and_count_as_loopback():
+    assert server_module.address_family_for("::1") == socket.AF_INET6
+    assert server_module.address_family_for("[::1]") == socket.AF_INET6
+    assert server_module.address_family_for("::") == socket.AF_INET6
+    for host in ("127.0.0.1", "0.0.0.0", "", "localhost", "insia.example.com"):
+        assert server_module.address_family_for(host) == socket.AF_INET, host
+    assert server_module.is_loopback_bind("::1") and server_module.is_loopback_bind("[::1]")
+    assert not server_module.is_loopback_bind("::")
+
+
+def test_ipv6_wildcard_still_needs_a_token(settings):
+    with pytest.raises(server_module.ServerConfigError, match="접근 토큰이 필요해요"):
+        make_server(settings, host="::", port=0)
+
+
+TOKEN = "unit-test-token-0123456789"
+FAKE_PORT = 48765
+
+
+class _StandInListenSocket:
+    """The listening socket, for machines without IPv6: records what the server asks for. Like the real
+    one, an AF_INET socket cannot bind an IPv6 literal (what made ``--host ::1`` crash before)."""
+
+    def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0, fileno=None):
+        self.family, self.type = family, type
+        self.options: list[tuple[int, int, int]] = []
+        self.bound = None
+
+    def setsockopt(self, level, option, value):
+        self.options.append((level, option, value))
+
+    def bind(self, address):
+        if self.family != socket.AF_INET6 and ":" in address[0]:
+            raise socket.gaierror(-9, "Address family for hostname not supported")
+        port = address[1] or FAKE_PORT
+        self.bound = (address[0], port, 0, 0) if self.family == socket.AF_INET6 else (address[0], port)
+
+    def getsockname(self):
+        return self.bound
+
+    def listen(self, backlog):
+        pass
+
+    def fileno(self):
+        return -1
+
+    def close(self):
+        pass
+
+
+def _stand_in_server(settings, monkeypatch, host, **kwargs):
+    with monkeypatch.context() as patch:  # only the listening socket is a stand-in
+        patch.setattr(socket, "socket", _StandInListenSocket)
+        return make_server(settings, host=host, port=0, **kwargs)
+
+
+def _exchange(srv, peer, method, path, *, host, body=None, headers=None):
+    """One request handled as if accepted from ``peer`` (an IPv6 4-tuple): the server's own per-request
+    thread (``process_request`` → handler → ``shutdown_request``) over a socket pair."""
+    ours, theirs = socket.socketpair()
+    theirs.settimeout(10)
+    data = json.dumps(body).encode("utf-8") if body is not None else b""
+    head = f"{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {len(data)}\r\n"
+    if body is not None:
+        head += "Content-Type: application/json\r\n"
+    head += "".join(f"{key}: {value}\r\n" for key, value in (headers or {}).items())
+    try:
+        theirs.sendall(head.encode("latin-1") + b"\r\n" + data)
+        srv.process_request(ours, peer)
+        resp = http.client.HTTPResponse(theirs)
+        resp.begin()
+        payload = resp.read()
+        return resp.status, resp.getheader("Set-Cookie"), payload
+    finally:
+        theirs.close()
+
+
+def test_ipv6_binds_use_an_ipv6_socket_and_the_wildcard_is_dual_stack(settings, monkeypatch):
+    """Runs on every machine (a stand-in socket), so the IPv6 bind path is checked even without IPv6."""
+    v6only_off = (socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    loop = _stand_in_server(settings, monkeypatch, "[::1]")
+    try:
+        assert loop.socket.family == socket.AF_INET6 and loop.socket.bound == ("::1", FAKE_PORT, 0, 0)
+        assert v6only_off not in loop.socket.options  # loopback stays IPv6-only
+        assert loop.url == f"http://[::1]:{FAKE_PORT}/" and not loop.token_required
+    finally:
+        loop.server_close()
+    wild = _stand_in_server(settings, monkeypatch, "::", token=TOKEN)
+    try:
+        assert wild.socket.family == socket.AF_INET6 and wild.socket.bound[0] == "::"
+        assert v6only_off in wild.socket.options  # "::" takes IPv4 clients too, like 0.0.0.0
+        assert wild.url == f"http://[::]:{FAKE_PORT}/" and wild.token_required
+    finally:
+        wild.server_close()
+    plain = _stand_in_server(settings, monkeypatch, "127.0.0.1")
+    try:
+        assert plain.socket.family == socket.AF_INET and plain.url == f"http://127.0.0.1:{FAKE_PORT}/"
+    finally:
+        plain.server_close()
+
+
+def test_requests_from_ipv6_clients_on_a_dual_stack_bind(settings, monkeypatch):
+    """The request side of ``--host ::`` with IPv6 peers: Host rules, login, and one limiter key per /64."""
+    srv = _stand_in_server(settings, monkeypatch, "::", token=TOKEN)
+    try:
+        def peer(address):
+            return (address, 50000, 0, 0)
+
+        def health(host, auth=True):
+            headers = {"Authorization": f"Bearer {TOKEN}"} if auth else {}
+            return _exchange(srv, peer("2001:db8:1:2::1"), "GET", "/api/health", host=host, headers=headers)
+
+        status, _, payload = health("[2001:db8::10]:8765")  # an IP literal on a wildcard bind
+        assert status == 200 and json.loads(payload)["token_required"] is True
+        assert health("[::1]:8765")[0] == 200 and health("[::1]:8765", auth=False)[0] == 401
+        assert health("evil.example")[0] == 403
+
+        def login(address, token="wrong-token-000000"):
+            return _exchange(srv, peer(address), "POST", "/api/login", host="[::1]:8765", body={"token": token})
+
+        statuses = [login(f"2001:db8:1:2::{i:x}")[0] for i in range(1, 11)]  # a new source address each time
+        assert statuses.count(401) == 9 and statuses[-1] == 429
+        assert login("2001:db8:1:2:abcd::99", TOKEN)[0] == 429  # the same /64 stays locked out
+        status, cookie, _ = login("2001:db8:1:3::1", TOKEN)  # another /64 logs in
+        assert status == 200 and cookie and cookie.startswith(f"{server_module.COOKIE_NAME}=")
+        for _ in range(10):
+            login("::ffff:198.51.100.7")  # an IPv4 client, as the dual-stack socket reports it
+        assert srv.limiter.retry_after("198.51.100.7") > 0
+    finally:
+        srv.server_close()
+
+
+def test_ipv6_loopback_bind(settings):
+    if not _ipv6_loopback_works():
+        # this machine has no IPv6: a clear Korean refusal instead of a misleading "port in use"
+        with pytest.raises(server_module.ServerConfigError, match="IPv6") as info:
+            make_server(settings, host="::1", port=0)
+        assert "--host 127.0.0.1" in str(info.value)
+        return
+    srv = make_server(settings, host="::1", port=0, heartbeat=0.2)
+    thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    try:
+        port = srv.server_address[1]
+        assert srv.address_family == socket.AF_INET6 and srv.url == f"http://[::1]:{port}/"
+        conn = http.client.HTTPConnection("::1", port, timeout=10)
+        conn.request("GET", "/api/health", headers={"Host": f"[::1]:{port}"})
+        resp = conn.getresponse()
+        assert resp.status == 200 and json.loads(resp.read())["token_required"] is False
+        conn.close()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    # "::" on a real socket: IPv4 clients get in too (dual stack) and count as their IPv4 address
+    wild = make_server(settings, host="::", port=0, heartbeat=0.2, token=TOKEN)
+    thread = threading.Thread(target=wild.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    try:
+        port = wild.server_address[1]
+        for _ in range(server_module.LOGIN_MAX_FAILURES):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/api/login", body=json.dumps({"token": "wrong-token-000000"}),
+                         headers={"Content-Type": "application/json"})
+            assert conn.getresponse().status in (401, 429)
+            conn.close()
+        assert wild.limiter.retry_after("127.0.0.1") > 0
+        conn = http.client.HTTPConnection("::1", port, timeout=10)  # ::1 is another client (key "::/64")
+        conn.request("GET", "/api/health", headers={"Host": f"[::1]:{port}", "Authorization": f"Bearer {TOKEN}"})
+        assert conn.getresponse().status == 200
+        conn.close()
+    finally:
+        wild.shutdown()
+        wild.server_close()

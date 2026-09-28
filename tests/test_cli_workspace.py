@@ -182,7 +182,10 @@ def test_profile_import_errors_are_korean(tmp_path, capsys, monkeypatch):
     assert code == 2 and "역할" in err
     assert run(capsys, "profile", "import", "missing.json")[0] == 2
     (tmp_path / "p.yaml").write_text('company_name: "a"\n', encoding="utf-8")
+    from insia_agents import documents  # the YAML reader moved there (cli re-exports it)
+
     monkeypatch.setattr(cli, "_yaml_module", lambda: None)
+    monkeypatch.setattr(documents, "_yaml_module", lambda: None)
     code, _, err = run(capsys, "profile", "import", "p.yaml")
     assert code == 2 and "PyYAML" in err and "pip install" in err
 
@@ -643,6 +646,38 @@ def test_import_run_input_errors(env, tmp_path, capsys):
     assert code == 2
 
 
+def test_import_and_document_helpers_are_a_library_without_the_cli(env, tmp_path):
+    """F11: importer/documents work without cli.py (the server can use them); cli re-exports the same objects."""
+    import subprocess
+
+    from insia_agents import documents, errors, importer
+    from insia_agents.config import Settings
+
+    for name in ("import_run_folder", "import_run_id", "ImportReport", "profile_from_data", "PROFILE_FIELDS"):
+        assert getattr(cli, name) is getattr(importer, name), name
+    for name in ("extract_document", "read_text_file", "load_structured_file", "clean_text", "DOCS_EXTRA_HINT"):
+        assert getattr(cli, name) is getattr(documents, name), name
+    assert cli.UsageError is errors.UsageError and cli.CommandError is errors.CommandError
+    probe = ("import sys; import insia_agents.importer, insia_agents.documents, insia_agents.errors; "
+             "print('insia_agents.cli' in sys.modules)")
+    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=60,
+                          env={**__import__("os").environ, "PYTHONPATH": str(ROOT / "src")})
+    assert done.returncode == 0 and done.stdout.strip() == "False", done.stderr
+
+    note = tmp_path / "메모.txt"
+    note.write_bytes("첫 줄\r\n\r\n\r\n\r\n둘째 줄".encode("cp949"))  # 메모장 'ANSI' 저장
+    assert documents.extract_document(note) == ("첫 줄\n\n둘째 줄", "text", [])
+    (tmp_path / "계획서.hwp").write_bytes(b"HWP Document File")
+    with pytest.raises(errors.UsageError, match="HWP"):
+        documents.extract_document(tmp_path / "계획서.hwp")
+    with open_ws(env) as ws:
+        report = importer.import_run_folder(ws, SAMPLE, Settings.from_env())
+        assert report.created and report.run_id == "cc-sample-run" and not report.problems
+        assert _versions(ws, report.run_id) == {"bizplan": 2, "naver_blog": 2, "linkedin": 1, "instagram": 1}
+        with pytest.raises(errors.UsageError, match="brief.json"):
+            importer.import_run_folder(ws, tmp_path, Settings.from_env())
+
+
 # ---------------------------------------------------------------------------
 # check
 # ---------------------------------------------------------------------------
@@ -700,6 +735,34 @@ def test_serve_requires_a_token_off_loopback_or_behind_a_domain(capsys, monkeypa
     assert code == 2 and "도메인" in err and "접근 토큰" in err  # loopback bind behind a reverse proxy
     monkeypatch.setenv("INSIA_PUBLIC_HOSTS", "insia.example.com")
     assert run(capsys, "serve", "--port", "8952")[0] == 2
+
+
+def test_serve_refuses_trust_proxy_without_a_token(capsys, monkeypatch):
+    """--trust-proxy / INSIA_TRUST_PROXY=1 means a reverse proxy is in front: not "only this computer" (finding 14)."""
+    from insia_agents import server as server_module
+
+    monkeypatch.delenv("INSIA_PUBLIC_HOSTS", raising=False)
+    monkeypatch.delenv("INSIA_TRUST_PROXY", raising=False)
+    started = []
+    monkeypatch.setattr(server_module, "make_server", lambda *a, **k: started.append(k) or FakeServer())
+    code, out, err = run(capsys, "serve", "--trust-proxy", "--port", "8952")
+    assert code == 2 and "리버스 프록시" in err and "접근 토큰" in err and "INSIA_ACCESS_TOKEN" in err
+    assert "이 컴퓨터에서만" not in out and started == []
+    monkeypatch.setenv("INSIA_TRUST_PROXY", "1")
+    code, _, err = run(capsys, "serve", "--port", "8952")
+    assert code == 2 and "INSIA_TRUST_PROXY" in err and started == []
+    code, out, _ = run(capsys, "serve", "--port", "8952", "--trust-proxy", "--token", "abcdefghijklmnop")
+    assert code == 0 and started[-1]["trust_proxy"] is True and started[-1]["token"] == "abcdefghijklmnop"
+
+
+def test_serve_ipv6_loopback_counts_as_loopback(capsys, monkeypatch):
+    from insia_agents import server as server_module
+
+    calls = []
+    monkeypatch.setattr(server_module, "make_server", lambda settings, host, *a, **k: calls.append(host) or FakeServer())
+    assert run(capsys, "serve", "--host", "::1", "--port", "8952")[0] == 0 and calls == ["::1"]  # no token needed
+    code, _, err = run(capsys, "serve", "--host", "::", "--port", "8952")
+    assert code == 2 and "접근 토큰" in err and calls == ["::1"]
 
 
 def test_serve_passes_token_hosts_and_proxy_to_make_server(capsys, monkeypatch):

@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import logging
 import zipfile
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,8 @@ from ..config import today_kst
 from ..models import ALL_CHANNELS, Brief, ContentItemDetail, Draft, DraftVersion, Profile, ResearchPack, Review
 from .common import (CONTENT_TYPES, ExportError, ExportFile, MissingDependencyError, export_filename, item_date,
                      select_version, slugify, to_kst_date)
+
+log = logging.getLogger(__name__)
 
 CHANNEL_FORMATS: dict[str, tuple[str, ...]] = {
     # first = the recommended format for that channel
@@ -90,7 +93,8 @@ class _Ctx:
         return self.version.review
 
     def filename(self, ext: str) -> str:
-        return export_filename(self.day, self.channel, self.draft.title or self.detail.item.title, ext)
+        return export_filename(self.day, self.channel, self.draft.title or self.detail.item.title, ext,
+                               version=self.version.version)
 
     def meta(self) -> str:
         parts = [f"{self.label} 초안", f"v{self.version.version}", self.day]
@@ -114,8 +118,11 @@ def export_item(detail: ContentItemDetail, fmt: str, profile: Profile | None = N
 
     ``fmt``: ``md`` | ``txt`` | ``html`` | ``docx`` | ``zip`` (see ``formats_for``).
     ``version``: a specific version number (default: the item's current version).
+    The file name always carries the version (``…_v3.docx``).
     Raises ``ExportError`` (Korean message) for unsupported formats or empty
     items, and ``MissingDependencyError`` when python-docx is not installed.
+    Any other failure while building the file is also reported as an
+    ``ExportError`` (the traceback goes to the log).
     """
     fmt = (fmt or "").strip().lower().lstrip(".")
     channel = detail.item.channel
@@ -129,7 +136,16 @@ def export_item(detail: ContentItemDetail, fmt: str, profile: Profile | None = N
     chosen = select_version(detail, version)
     ctx = _Ctx(detail=detail, version=chosen, draft=chosen.draft, profile=_coerce_profile(profile),
                day=item_date(detail, chosen))
-    return _EXPORTERS[fmt](ctx)
+    try:
+        return _EXPORTERS[fmt](ctx)
+    except ExportError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — surface a Korean message instead of a bare 500
+        log.warning("export of %s (v%s) as %s failed", detail.item.id, chosen.version, fmt, exc_info=True)
+        others = ", ".join(f for f in allowed if f != fmt)
+        raise ExportError(f"{label} {format_label(fmt, channel)} 파일을 만들지 못했어요 (오류: {exc.__class__.__name__}). "
+                          f"다른 형식({others})으로 내보내 보고, 계속 안 되면 본문에 복사해 온 특수 문자가 없는지 확인해 주세요."
+                          ) from exc
 
 
 def _export_md(ctx: _Ctx) -> ExportFile:
@@ -170,7 +186,8 @@ def _export_zip(ctx: _Ctx) -> ExportFile:
 
         data, notes = build_carousel_zip(ctx.draft, ctx.profile, meta=ctx.meta())
         return ExportFile(ctx.filename("zip"), CONTENT_TYPES["zip"], data, notes)
-    # Other channels: every other format of the item in one archive.
+    # Other channels: every other format of the item in one archive. One
+    # format failing never sinks the others; the reason goes into the notes.
     buffer = io.BytesIO()
     notes: list[str] = []
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -181,6 +198,13 @@ def _export_zip(ctx: _Ctx) -> ExportFile:
                 exported = _EXPORTERS[fmt](ctx)
             except MissingDependencyError as exc:
                 notes.append(str(exc))
+                continue
+            except ExportError as exc:
+                notes.append(f"{fmt}: {exc}")
+                continue
+            except Exception as exc:  # noqa: BLE001
+                log.warning("zip export of %s: %s failed", ctx.detail.item.id, fmt, exc_info=True)
+                notes.append(f"{fmt}: 파일을 만들지 못해 묶음에서 뺐어요 (오류: {exc.__class__.__name__})")
                 continue
             archive.writestr(exported.filename, exported.data)
             notes.extend(exported.notes)
@@ -366,23 +390,28 @@ def export_run_zip(workspace: Any, run_id: str) -> ExportFile:
                 detail = detail.model_copy(update={"brief": brief})
             written: list[str] = []
             for fmt in RUN_PRIMARY_FORMATS.get(channel, ("md",)):
+                # One item or format failing must never sink the whole run zip.
                 try:
                     exported = export_item(detail, fmt, profile)
+                    if fmt == "zip" and channel == "instagram":
+                        with zipfile.ZipFile(io.BytesIO(exported.data)) as inner:
+                            entries = [(f"{channel}/{info.filename}", inner.read(info)) for info in inner.infolist()]
+                    else:
+                        entries = [(f"{channel}/{exported.filename}", exported.data)]
                 except MissingDependencyError as exc:
                     notes.append(f"{label}: {exc}")
                     continue
                 except ExportError as exc:
                     notes.append(f"{label} {fmt}: {exc}")
                     continue
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("run zip %s: %s %s failed", run_id, detail.item.id, fmt, exc_info=True)
+                    notes.append(f"{label} {fmt}: 파일을 만들지 못했어요 (오류: {exc.__class__.__name__})")
+                    continue
                 notes.extend(f"{label}: {n}" for n in exported.notes)
-                if fmt == "zip" and channel == "instagram":
-                    with zipfile.ZipFile(io.BytesIO(exported.data)) as inner:
-                        for info in inner.infolist():
-                            put(f"{channel}/{info.filename}", inner.read(info))
-                            written.append(f"{channel}/{info.filename}")
-                else:
-                    put(f"{channel}/{exported.filename}", exported.data)
-                    written.append(f"{channel}/{exported.filename}")
+                for name, data in entries:
+                    put(name, data)
+                    written.append(name)
             current = select_version(detail)
             if current.review is not None:
                 put(f"{channel}/review.json", json.dumps(current.review.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n")

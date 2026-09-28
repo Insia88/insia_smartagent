@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass, field
 
 from .models import Brief, ChannelId, Draft, FormatCheck, Profile, Review, RubricScore
+from .prompt_loader import blind_leaks
 
 
 @dataclass(frozen=True)
@@ -297,7 +298,11 @@ def profile_checks(draft: Draft, profile: Profile) -> list[FormatCheck]:
     if draft.channel == "bizplan":
         names = [m.name.strip() for m in profile.team if m.name.strip() and len(m.name.strip()) >= 2]
         exposed = [n for n in names if _norm_space(n) in flat]
-        checks.append(_check("blind_names", "블라인드(실명 미노출)", not exposed, f"실명 {len(exposed)}개 노출" if exposed else "노출 없음", "팀원 실명은 ○○로 가림"))
+        # school/employer names from the team backgrounds, written in a career context ("카카오 출신")
+        leaks = blind_leaks(f"{draft.title}\n{draft.content}", [m.background for m in profile.team],
+                            keep=[profile.company_name, profile.service_name])
+        found = ([f"실명 {len(exposed)}개"] if exposed else []) + ([f"학교·직장명 {len(leaks)}개({', '.join(leaks)})"] if leaks else [])
+        checks.append(_check("blind_names", "블라인드(실명 미노출)", not found, " · ".join(found) + " 노출" if found else "노출 없음", "팀원 실명은 ○○로 가림"))
 
     return checks
 

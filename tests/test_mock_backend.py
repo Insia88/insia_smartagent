@@ -314,3 +314,44 @@ def test_real_sample_replay_is_unchanged_by_a_profile(settings):
     for channel in brief.channels:
         assert plain.draft(brief, plan, plain.research(brief, [], lambda t, d: None), channel) == \
             profiled.draft(brief, plan, profiled.research(brief, [], lambda t, d: None), channel)
+
+
+@pytest.mark.parametrize("background, ability", [
+    # the review's repro
+    ("서울대학교 경영학 졸업, 前 삼성전자 마케팅팀 8년", "○○ 경영학 졸업, 前 ○○ 마케팅팀 8년"),
+    # the verifier's repro (v30_mock.py): employers without a 前/(주)/…전자 marker were copied word for word
+    ("카카오 출신 PM 7년, 고려대 졸업", "○○ 출신 PM 7년, ○○ 졸업"),
+    ("네이버 검색광고팀 10년, 토스 PO 3년", "○○ 검색광고팀 10년, ○○ PO 3년"),
+    ("삼성SDS 10년, University of California, Berkeley MBA", "○○ 10년, ○○, ○○ MBA"),
+    # a startup nobody has heard of: unknown words are masked too (a whitelist, not a list of names)
+    ("리멤버앤컴퍼니에서 5년, 스타트업 PM", "○○에서 5년, 스타트업 PM"),
+    ("현 인시아랩 대표, 마케팅 10년", "현 인시아랩 대표, 마케팅 10년"),  # the applicant's own company may stay
+])
+def test_mock_bizplan_never_copies_team_schools_or_employers(brief, background, ability):
+    """Blind rule: the team table keeps only generic words (field, role, degree, years) from a background."""
+    from insia_agents.prompt_loader import blind_terms
+
+    profile = PROFILE.model_copy(update={"team": [TeamMember(role="대표", name="김민수", background=background)]})
+    research = template_research(brief, "2026-09-28", profile)
+    for round_ in (0, 1):
+        draft = template_draft(brief, research, "bizplan", round_, profile)
+        biz = draft.content
+        assert f"| 대표 | ○○○ | 대표 | {ability} (자사 자료) |" in biz  # was: the background verbatim
+        leaked = [term for term in blind_terms(background, keep=[PROFILE.company_name]) if term in biz]
+        assert leaked == [] and "김민수" not in biz
+        for word in ("카카오", "고려대", "네이버", "토스", "삼성", "Berkeley", "California", "리멤버"):
+            assert word not in biz.split("## 4.")[1], word
+        checks = {c.id: c for c in check_format(draft, brief, profile)}
+        assert checks["blind_names"].passed, checks["blind_names"].value
+
+
+def test_mock_sns_drafts_carry_every_required_phrase_whole(brief):
+    """The mock follows the same rule as the prompt: every required phrase, never cut."""
+    disclaimer = "※ 이 글은 제휴 활동의 일환으로 수수료를 받을 수 있으며, 가격과 조건은 게시일 기준이에요. " * 3
+    required = ["#광고아님", "#협찬없음", "#직접구매", "#솔직후기", disclaimer.strip()]
+    profile = PROFILE.model_copy(update={"required_phrases": required})
+    research = template_research(brief, "2026-09-28", profile)
+    for channel in ("naver_blog", "linkedin", "instagram"):
+        draft = template_draft(brief, research, channel, 1, profile)
+        checks = {c.id: c for c in check_format(draft, brief, profile)}
+        assert checks["required_phrases"].passed, (channel, checks["required_phrases"].value)

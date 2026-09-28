@@ -35,24 +35,31 @@ workspaces, so they keep hitting the prompt cache; the profile block carries
 its own breakpoint (reused by a channel's draft → revise and review rounds).
 
 Usage: ``on_usage`` receives a priced ``UsageRecord`` after every API
-response, ``pause_turn`` continuations and refusals included.
+response, ``pause_turn`` continuations and refusals included (after a refusal
+fallback the record covers every attempt in ``usage.iterations``).
+
+Budget: when ``on_usage`` has a ``check()`` method (the pipeline's
+``UsageMeter``), it is called before every HTTP request of a logical call —
+each ``pause_turn`` continuation and the research structuring call too — so a
+run over its cost cap stops before the next paid request (``check`` raises
+``BudgetExceeded``). A response that already arrived is never thrown away.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import unquote
 
 from pydantic import BaseModel, ValidationError
 
 from ..channels import CHANNELS
 from ..config import Settings
-from ..costs import env_key, load_prices, price_for, usage_from_response
+from ..costs import env_key, load_prices, price_for, response_models, usage_from_response
 from ..models import (Brief, ChannelId, ContentItem, ContentPlan, Draft, FormatCheck, Plan, Profile, ResearchPack,
                       ResearchQuestion, Review, Source)
-from ..planner import cap_counts, normalize_counts, normalize_plan, slot_days, weekday_label
+from ..planner import calendar_days, normalize_plan, weekday_label
 from ..prompt_loader import (PLANNER_PROMPT, agent_prompt, budget_documents, channel_guide, is_user_url,
                              render_documents, render_profile, user_sources)
 from ..schema import json_format
@@ -128,8 +135,8 @@ REVISE_HUMAN = (
 HUMAN_INSTRUCTIONS_TITLE = "사람의 수정 지시"
 CALENDAR_INSTRUCTION = (
     "회사 프로필, 주제(theme), 지난 게시물(history)을 보고 기간 안의 콘텐츠 계획 ContentPlan JSON을 만드세요. "
-    "채널별 개수(counts)를 정확히 지키고, 날짜는 available_days 중에서만 고르며, 같은 채널은 하루에 한 편만 둡니다. "
-    "history와 같은 주제·관점은 반복하지 마세요."
+    "채널별 개수(counts)를 정확히 지키고, 각 채널의 날짜는 channel_days에 있는 그 채널의 날짜 중에서만 고르며, "
+    "같은 채널은 하루에 한 편만 둡니다. history(이미 계획·예약된 글 포함)와 같은 주제·관점은 반복하지 마세요."
 )
 
 
@@ -507,12 +514,21 @@ def _text_block(text: str, *, cache: bool = False) -> dict[str, Any]:
     return block
 
 
+def _history_date(item: ContentItem) -> str:
+    return (item.published_at or item.scheduled_at or item.updated_at or item.created_at or "")[:10]
+
+
 def _history_rows(history: list[ContentItem]) -> list[dict[str, str]]:
-    rows = []
-    for item in history[:HISTORY_IN_PROMPT]:
-        when = (item.published_at or item.scheduled_at or item.updated_at or item.created_at or "")[:10]
-        rows.append({"date": when, "channel": item.channel, "status": item.status, "title": item.title})
-    return rows
+    """At most ``HISTORY_IN_PROMPT`` rows, oldest first. Upcoming rows (planned
+    slots, scheduled/approved items) come first — they are what a new plan
+    most easily repeats — with a third of the rows kept for the latest
+    published posts; within each group the latest dates win."""
+    upcoming = sorted((i for i in history if i.status != "published"), key=_history_date, reverse=True)
+    published = sorted((i for i in history if i.status == "published"), key=_history_date, reverse=True)
+    published_rows = min(len(published), max(HISTORY_IN_PROMPT // 3, HISTORY_IN_PROMPT - len(upcoming)))
+    chosen = upcoming[: HISTORY_IN_PROMPT - published_rows] + published[:published_rows]
+    return [{"date": _history_date(item), "channel": item.channel, "status": item.status, "title": item.title}
+            for item in sorted(chosen, key=_history_date)]
 
 
 class AnthropicBackend:
@@ -609,17 +625,27 @@ class AnthropicBackend:
         prices, web = load_prices(home=self.settings.home)
         record = usage_from_response(message, agent=agent, task=task, model=self.model,
                                      prices=prices, web_search_per_1k=web)
-        if price_for(record.model, prices=prices) is None and record.model not in self._unpriced:
-            self._unpriced.add(record.model)
-            self._notice("system", "warn",
-                         f"{record.model} 모델의 가격 정보가 없어 비용을 0달러로 기록해요. 워크스페이스의 prices.json이나 "
-                         f"INSIA_PRICE_{env_key(record.model)}_INPUT·_OUTPUT 환경 변수로 가격을 넣어 주세요.")
+        for model in response_models(message, self.model):  # every attempt's model, not only the served one
+            if price_for(model, prices=prices) is None and model not in self._unpriced:
+                self._unpriced.add(model)
+                self._notice("system", "warn",
+                             f"{model} 모델의 가격 정보가 없어 이 모델이 처리한 토큰 비용을 0달러로 기록해요"
+                             " (그만큼 누적 비용과 예산 상한에 잡히지 않아요). 워크스페이스의 prices.json이나 "
+                             f"INSIA_PRICE_{env_key(model)}_INPUT·_OUTPUT 환경 변수로 가격을 넣어 주세요.")
         try:
             self.on_usage(record)
         except BackendError:
             raise
         except Exception as exc:  # a broken recorder must not fail the run
             self._notice("system", "warn", f"사용량 기록 중 오류가 나서 이번 호출 비용을 저장하지 못했어요: {exc}")
+
+    def _check_budget(self) -> None:
+        """Before each paid request: let ``on_usage.check()`` (the pipeline's
+        ``UsageMeter``) stop a run that is already over its cost cap. Its
+        exception (``BudgetExceeded``) propagates unchanged."""
+        check = getattr(self.on_usage, "check", None)
+        if callable(check):
+            check()
 
     def stream_call(self, request: dict[str, Any], *, agent: str, task: str = "",
                     on_event: Callable[[Any], None] | None = None,
@@ -632,6 +658,7 @@ class AnthropicBackend:
         messages = list(request["messages"])
         turns: list[Any] = []
         for _ in range(self.settings.max_continuations + 1):
+            self._check_budget()  # every request is paid: stop before it once the cap is crossed
             try:
                 with stream_fn(**{**request, "messages": messages}) as stream:
                     for event in stream:
@@ -807,15 +834,18 @@ class AnthropicBackend:
         return revised.model_copy(update={"channel": draft.channel, "round": draft.round + 1})
 
     def plan_calendar(self, profile: Profile, theme: str, start: str, end: str, counts: dict[str, int],
-                      history: list[ContentItem]) -> ContentPlan:
-        days = slot_days(start, end)
-        capped, _ = cap_counts(normalize_counts(counts), len(days))
+                      history: list[ContentItem], *, days: Mapping[str, Sequence[str]] | None = None) -> ContentPlan:
+        capped, by_channel = calendar_days(start, end, counts, days)
+        if not capped:  # no channel has a free day: nothing to ask the model
+            return ContentPlan(summary="", slots=[])
+        every = sorted(set().union(*by_channel.values()))
         payload = {
             "theme": theme.strip(),
             "start": start,
             "end": end,
             "counts": dict(capped),
-            "available_days": [{"date": d, "weekday": weekday_label(d)} for d in days],
+            "available_days": [{"date": d, "weekday": weekday_label(d)} for d in every],
+            "channel_days": {channel: list(dates) for channel, dates in by_channel.items()},
             "history": _history_rows(history),
         }
         request = self.build_request(
@@ -826,4 +856,4 @@ class AnthropicBackend:
         )
         plan = self.structured_call(request, ContentPlan, agent="orchestrator", task="plan_calendar")
         assert isinstance(plan, ContentPlan)
-        return normalize_plan(plan, start, end, capped)
+        return normalize_plan(plan, start, end, capped, days=by_channel)

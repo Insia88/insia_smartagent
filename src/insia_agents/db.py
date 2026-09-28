@@ -14,6 +14,18 @@ Concurrency: one connection per ``Workspace`` opened with
 processes on the same workspace (CLI next to the server) are serialized by
 SQLite itself (WAL + busy timeout).
 
+Run ownership: a run row records which process works on it (pid, host, boot
+id, a random owner token) and a heartbeat that the owner refreshes every
+``HEARTBEAT_SECONDS`` while the run is going (``acquire_run`` → ``RunLease``).
+``recover_stale`` (``mark_interrupted`` at server start, ``insia run-due`` /
+``insia resume`` in the CLI) only takes over a ``running`` run whose owner is
+gone: a dead pid on this machine, a machine that restarted, or no heartbeat for
+``STALE_AFTER_SECONDS``; the server keeps checking in the background
+(``watch_stale_runs``). A taken-over owner notices (token mismatch) at its next
+checkpoint and stops; its later writes to the run, its items and versions are
+refused (``RunTakenOverError``), and it only hands a calendar slot back while
+the slot is still its own claim (``release_slot`` / ``link_slot``).
+
 Schema changes are forward-only: append a new SQL script to ``MIGRATIONS``;
 never edit one that has shipped.
 
@@ -24,13 +36,18 @@ ids, ``InvalidTransitionError`` / ``ApprovalBlockedError`` for status changes.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
+import os
 import re
 import secrets
+import socket
 import sqlite3
+import sys
 import threading
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -97,6 +114,34 @@ TRANSITIONS: dict[str, frozenset[str]] = {
 MAX_DOCUMENT_CHARS = 2_000_000
 MAX_NOTE_CHARS = 2_000
 INTERRUPTED_MESSAGE = "프로그램이 다시 시작되면서 실행이 중단됐어요. '이어서 실행'으로 남은 작업을 마칠 수 있어요."
+# Run kinds ``pipeline.resume_run`` can continue; every other kind (review/revise/edit/import) must be started again.
+RESUMABLE_RUN_KINDS = ("pipeline", "slot")
+JOB_KIND_LABELS = {"review": "재검수", "revise": "수정 요청", "edit": "직접 수정", "import": "가져오기"}
+
+# Run ownership (see the module docstring). A live owner refreshes ``runs.heartbeat_at`` every
+# HEARTBEAT_SECONDS from a background thread (also during long API calls); a run whose heartbeat is
+# older than STALE_AFTER_SECONDS belongs to a process that is gone or asleep and may be taken over.
+HEARTBEAT_SECONDS = 30.0
+STALE_AFTER_SECONDS = 600.0
+# A slot left 'generating' by a run that already ended (or was never created) is released after this.
+ORPHAN_SLOT_SECONDS = 60.0
+# How often a long-running process (the server) checks again for runs whose owner went away (watch_stale_runs).
+RECOVERY_WATCH_SECONDS = 60.0
+
+
+def interrupted_message(kind: str) -> str:
+    """What an interrupted run says: resumable kinds point to '이어서 실행', jobs to starting them again."""
+    if kind in RESUMABLE_RUN_KINDS:
+        return INTERRUPTED_MESSAGE
+    label = JOB_KIND_LABELS.get(kind)
+    what = f"{label} 작업" if label else "작업"
+    if kind == "import":
+        again = "'insia import-run'으로 같은 폴더를 다시 가져와 주세요 (중복 없이 갱신돼요)."
+    elif label:
+        again = f"보관함에서 같은 작업({label})을 다시 시작해 주세요."
+    else:
+        again = "같은 작업을 다시 시작해 주세요."
+    return f"프로그램이 다시 시작되면서 {what}이 중단됐어요. 이 작업은 이어서 할 수 없어서 {again}"
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 _ITEM_ID = re.compile(r"^it_[A-Za-z0-9._-]{1,120}$")
@@ -119,6 +164,10 @@ class NotFoundError(WorkspaceError):
 
 class InvalidTransitionError(WorkspaceError):
     pass
+
+
+class RunTakenOverError(WorkspaceError):
+    """Another process took this run over (its owner token changed): this process must stop writing to it."""
 
 
 class ApprovalBlockedError(WorkspaceError):
@@ -259,6 +308,19 @@ MIGRATIONS: list[str] = [
         updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS slots_date ON slots (date, status);
+    """,
+    # 2 — run ownership (owner process + heartbeat, so a restart only takes over runs whose owner is gone)
+    #     and the approval audit (forced approvals are recorded with the version and score they approved)
+    """
+    ALTER TABLE runs ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE runs ADD COLUMN owner_host TEXT NOT NULL DEFAULT '';
+    ALTER TABLE runs ADD COLUMN owner_boot TEXT NOT NULL DEFAULT '';
+    ALTER TABLE runs ADD COLUMN owner_token TEXT NOT NULL DEFAULT '';
+    ALTER TABLE runs ADD COLUMN heartbeat_at TEXT NOT NULL DEFAULT '';
+    ALTER TABLE items ADD COLUMN approval_forced INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE items ADD COLUMN approved_score INTEGER;
+    ALTER TABLE items ADD COLUMN approved_at TEXT NOT NULL DEFAULT '';
+    CREATE INDEX IF NOT EXISTS slots_run ON slots (run_id);
     """,
 ]
 
@@ -419,6 +481,180 @@ def normalize_hashtags(tags: Sequence[str] | str | None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Run ownership: process identity, liveness, leases
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=1)
+def this_host() -> str:
+    try:
+        return socket.gethostname() or ""
+    except OSError:
+        return ""
+
+
+@functools.lru_cache(maxsize=1)
+def boot_marker() -> str:
+    """Identifies the current OS boot ("" when unknown): a pid recorded before a reboot says nothing now.
+
+    Linux (containers included) has a boot id; Windows and macOS use the boot time (``t:<epoch>``).
+    """
+    try:
+        text = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        if text:
+            return text
+    except (OSError, ValueError):
+        pass
+    try:
+        import ctypes
+
+        if os.name == "nt":
+            tick_count = ctypes.windll.kernel32.GetTickCount64  # type: ignore[attr-defined]
+            tick_count.restype = ctypes.c_ulonglong
+            return f"t:{int(time.time() - tick_count() / 1000.0)}"
+        if sys.platform == "darwin":
+            import ctypes.util
+
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+
+            class _TimeVal(ctypes.Structure):
+                _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_long)]
+
+            value = _TimeVal()
+            size = ctypes.c_size_t(ctypes.sizeof(value))
+            if libc.sysctlbyname(b"kern.boottime", ctypes.byref(value), ctypes.byref(size), None, ctypes.c_size_t(0)) == 0 \
+                    and value.tv_sec > 0:
+                return f"t:{int(value.tv_sec)}"
+    except Exception:  # noqa: BLE001 - unknown just means the boot check is skipped
+        pass
+    return ""
+
+
+def _same_boot(recorded: str, current: str) -> bool | None:
+    """True/False when both markers are known; ``None`` when one is missing."""
+    if not recorded or not current:
+        return None
+    if recorded.startswith("t:") and current.startswith("t:"):  # boot times drift by a few seconds
+        try:
+            return abs(int(recorded[2:]) - int(current[2:])) <= 120
+        except ValueError:
+            return None
+    return recorded == current
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether process ``pid`` exists on this machine (unsure → True, so only the heartbeat decides)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":  # os.kill(pid, 0) would terminate the process on Windows
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: it exists
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # PermissionError: someone else's process
+        return True
+    try:  # Linux: a killed process its parent has not reaped yet is a zombie, not a worker
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        return stat.rsplit(")", 1)[-1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+_LEASES_LOCK = threading.Lock()
+_LEASES: dict[tuple[str, str], "RunLease"] = {}
+
+
+class RunLease:
+    """This process's claim on a running run: its owner token plus a heartbeat thread.
+
+    Created by ``Workspace.acquire_run`` (acquiring a run this process already
+    holds returns the same lease). The owner calls ``release()`` when the run
+    ends. ``lost`` becomes true once another process took the run over (the
+    stored token no longer matches): the owner then stops at its next
+    checkpoint, and its event/status writes raise ``RunTakenOverError``.
+    """
+
+    def __init__(self, workspace: "Workspace", run_id: str, token: str, interval: float) -> None:
+        self.workspace = workspace
+        self.run_id = run_id
+        self.token = token
+        self.interval = max(0.01, float(interval))
+        self.key = (workspace._key, run_id)
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread = threading.Thread(target=self._beat, name=f"insia-heartbeat-{run_id}", daemon=True)
+
+    @property
+    def lost(self) -> bool:
+        return self._lost.is_set()
+
+    @property
+    def released(self) -> bool:
+        return self._stop.is_set()
+
+    def mark_lost(self) -> None:
+        self._lost.set()
+
+    def verify(self) -> bool:
+        """Whether this process still owns the run, read from the database now (the heartbeat only notices every
+        ``HEARTBEAT_SECONDS``). A run taken over marks the lease lost. For checkpoints before paid calls."""
+        if self._lost.is_set():
+            return False
+        try:
+            mine = self.workspace._owns(self.run_id, self.token)
+        except Exception:  # noqa: BLE001 - cannot tell right now (closed, locked): the write guards still decide
+            return True
+        if not mine:
+            self._lost.set()
+        return mine
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _beat(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                mine = self.workspace._heartbeat(self.run_id, self.token)
+            except WorkspaceError:  # the workspace was closed
+                return
+            except Exception:  # noqa: BLE001 - e.g. the database stayed locked: try again next beat
+                log.warning("실행 %s의 heartbeat를 기록하지 못했어요", self.run_id, exc_info=True)
+                continue
+            if not mine:
+                log.warning("다른 곳에서 실행 %s를 넘겨받았어요. 이 프로세스는 여기서 멈춰요.", self.run_id)
+                self._lost.set()
+                return
+
+    def release(self) -> None:
+        """Stop the heartbeat and forget the lease (safe to call more than once)."""
+        self._stop.set()
+        with _LEASES_LOCK:
+            if _LEASES.get(self.key) is self:
+                del _LEASES[self.key]
+
+
+# ---------------------------------------------------------------------------
 # Workspace
 # ---------------------------------------------------------------------------
 
@@ -436,11 +672,17 @@ class Workspace:
             raise WorkspaceError(f"워크스페이스 폴더를 만들 수 없어요: {self.home} ({exc.strerror or exc})") from None
         self.db_path = self.home / DB_NAME
         try:
+            self._key = str(self.db_path.resolve())  # run leases are per database file and run id
+        except OSError:
+            self._key = str(self.db_path.absolute())
+        try:
             self._conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False, isolation_level=None)
         except sqlite3.Error as exc:
             raise WorkspaceError(f"워크스페이스 DB를 열 수 없어요: {self.db_path} ({exc})") from None
         self._conn.row_factory = sqlite3.Row
         self._closed = False
+        self._watcher: threading.Thread | None = None  # background recovery (watch_stale_runs)
+        self._watch_stop = threading.Event()
         try:
             with _LOCK:
                 self._conn.execute("PRAGMA busy_timeout = 30000")
@@ -479,6 +721,7 @@ class Workspace:
         return int(row[0]) if row else 0
 
     def close(self) -> None:
+        self._watch_stop.set()
         with _LOCK:
             if not self._closed:
                 self._closed = True
@@ -630,8 +873,14 @@ class Workspace:
         return True
 
     # -- runs --------------------------------------------------------------------
+    @staticmethod
+    def _owner_stamp(token: str = "") -> tuple[int, str, str, str, str]:
+        """(owner_pid, owner_host, owner_boot, owner_token, heartbeat_at) for this process, now."""
+        return os.getpid(), this_host(), boot_marker(), token, utc_now()
+
     def create_run(self, run_id: str, brief: Brief, *, kind: str = "pipeline", options: dict | None = None,
                    mode: str = "", model: str = "", profile: Profile | None = None, parent_item_id: str = "") -> None:
+        """Insert a ``running`` run owned by this process (pid/host recorded; ``acquire_run`` starts the heartbeat)."""
         if not _RUN_ID.match(run_id or "") or ".." in run_id:
             raise WorkspaceError(f"실행 id 형식이 올바르지 않아요: {run_id!r}")
         if not _KIND.match(kind or ""):
@@ -643,21 +892,39 @@ class Workspace:
             if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone():
                 raise WorkspaceError(f"이미 있는 실행 id예요: {run_id}")
             conn.execute(
-                "INSERT INTO runs (id, kind, status, brief, options, mode, model, profile, parent_item_id, created_at, updated_at) "
-                "VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO runs (id, kind, status, brief, options, mode, model, profile, parent_item_id, created_at, updated_at, "
+                "owner_pid, owner_host, owner_boot, owner_token, heartbeat_at) "
+                "VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (run_id, kind, brief.model_dump_json(), _dumps(options or {}), mode or "", model or "",
-                 profile.model_dump_json() if profile is not None else None, parent_item_id or "", now, now),
+                 profile.model_dump_json() if profile is not None else None, parent_item_id or "", now, now,
+                 *self._owner_stamp()),
             )
 
     _RUN_FIELDS = frozenset({"status", "error", "finished_at", "plan", "research", "cost_usd", "mode", "model", "options",
                              "profile", "progress", "parent_item_id"})
+
+    def _lease_for(self, run_id: str) -> RunLease | None:
+        lease = _LEASES.get((self._key, run_id))
+        return lease if lease is not None and not lease.released else None
+
+    @staticmethod
+    def _check_owner(conn: sqlite3.Connection, run_id: str, lease: RunLease | None) -> None:
+        """Refuse a write from this process when it holds ``run_id``'s lease but another process took the run over."""
+        if lease is None:
+            return
+        row = conn.execute("SELECT owner_token FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is not None and row["owner_token"] != lease.token:
+            lease.mark_lost()
+            raise RunTakenOverError(f"다른 곳에서 실행 {run_id}를 넘겨받았어요. 이 프로세스는 더 기록하지 않고 멈춰요.")
 
     def update_run(self, run_id: str, **fields: Any) -> None:
         """Update run columns: status, error, finished_at, plan (Plan), research (ResearchPack), cost_usd,
         mode, model, options (dict), profile (Profile), progress (dict), parent_item_id.
 
         A terminal status sets ``finished_at`` (unless given); going back to
-        ``running`` (resume) clears ``error`` and ``finished_at``.
+        ``running`` (resume) clears ``error`` and ``finished_at``. While this
+        process holds the run's lease, the update is refused with
+        ``RunTakenOverError`` once another process took the run over.
         """
         unknown = set(fields) - self._RUN_FIELDS
         if unknown:
@@ -688,21 +955,285 @@ class Workspace:
             values.setdefault("error", "")
         values["updated_at"] = utc_now()
         assignments = ", ".join(f"{key} = ?" for key in values)
+        lease = self._lease_for(run_id)
         with self._tx() as conn:
+            self._check_owner(conn, run_id, lease)
             cursor = conn.execute(f"UPDATE runs SET {assignments} WHERE id = ?", (*values.values(), run_id))
             if cursor.rowcount == 0:
                 raise NotFoundError(f"실행 {run_id}를 찾을 수 없어요")
 
     def claim_run(self, run_id: str, expected_status: str) -> bool:
-        """Atomically set a run back to ``running`` if its status is still ``expected_status``.
+        """Atomically set a run back to ``running`` (owned by this process) if its status is still ``expected_status``.
 
-        Two resumes of the same run (a double click) cannot both win.
+        Two resumes of the same run (a double click) cannot both win. Claiming a
+        run another process still holds (``expected_status='running'``, a forced
+        resume) takes it over: that process stops at its next checkpoint and
+        its later writes to the run, its items and its slot are refused. The
+        caller then takes the run with ``acquire_run``. A run this process is
+        running right now (``holds_run``) is never claimed: one owner per run
+        in a process.
         """
-        now = utc_now()
+        if self.holds_run(run_id):
+            return False
         with self._tx() as conn:
-            cursor = conn.execute("UPDATE runs SET status = 'running', error = '', finished_at = '', updated_at = ? "
-                                  "WHERE id = ? AND status = ?", (now, run_id, expected_status))
+            cursor = conn.execute(
+                "UPDATE runs SET status = 'running', error = '', finished_at = '', updated_at = ?, "
+                "owner_pid = ?, owner_host = ?, owner_boot = ?, owner_token = ?, heartbeat_at = ? WHERE id = ? AND status = ?",
+                (utc_now(), *self._owner_stamp(), run_id, expected_status))
         return cursor.rowcount == 1
+
+    def holds_run(self, run_id: str) -> bool:
+        """Whether this process is running ``run_id`` right now (it holds a lease that was not taken over)."""
+        lease = self._lease_for(run_id)
+        return lease is not None and not lease.lost
+
+    def acquire_run(self, run_id: str) -> RunLease:
+        """Mark this process as the run's owner and keep its heartbeat going until ``lease.release()``.
+
+        Acquiring a run this process already holds returns the same lease;
+        when another process took the run over meanwhile, that lease is marked
+        lost and ``RunTakenOverError`` is raised (the run is not taken back).
+        """
+        token = secrets.token_hex(12)
+        with self._tx() as conn:
+            existing = self._lease_for(run_id)
+            if existing is not None and not existing.lost:
+                self._check_owner(conn, run_id, existing)
+                return existing
+            cursor = conn.execute("UPDATE runs SET owner_pid = ?, owner_host = ?, owner_boot = ?, owner_token = ?, heartbeat_at = ? "
+                                  "WHERE id = ?", (*self._owner_stamp(token), run_id))
+            if cursor.rowcount == 0:
+                raise NotFoundError(f"실행 {run_id}를 찾을 수 없어요")
+        lease = RunLease(self, run_id, token, HEARTBEAT_SECONDS)
+        with _LEASES_LOCK:
+            previous = _LEASES.get(lease.key)
+            _LEASES[lease.key] = lease
+        if previous is not None and previous is not lease:
+            previous.mark_lost()
+            previous._stop.set()
+        lease.start()
+        return lease
+
+    def _heartbeat(self, run_id: str, token: str) -> bool:
+        """Refresh the run's heartbeat; False when the run is no longer ours (taken over or deleted)."""
+        with self._tx() as conn:
+            cursor = conn.execute("UPDATE runs SET heartbeat_at = ? WHERE id = ? AND owner_token = ?", (utc_now(), run_id, token))
+        return cursor.rowcount == 1
+
+    def _owns(self, run_id: str, token: str) -> bool:
+        """Whether ``token`` is still the run's stored owner token (False when taken over or deleted)."""
+        with self._read() as conn:
+            row = conn.execute("SELECT owner_token FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return row is not None and bool(token) and row["owner_token"] == token
+
+    def _guard_run(self, conn: sqlite3.Connection, run_id: str) -> None:
+        """Inside a write transaction: refuse a write made on behalf of ``run_id`` when this process held the run
+        but another process took it over (``RunTakenOverError``). Writes from processes without the lease pass."""
+        if run_id:
+            self._check_owner(conn, run_id, self._lease_for(run_id))
+
+    @staticmethod
+    def _last_sign(row: sqlite3.Row) -> datetime | None:
+        """The owner's last sign of life: its heartbeat or its last write to the run row, whichever is newer."""
+        moments = [m for m in (_parse_ts(row["heartbeat_at"]), _parse_ts(row["updated_at"])) if m is not None]
+        return max(moments) if moments else None
+
+    def _owner_alive(self, row: sqlite3.Row, now: datetime, stale_after: float, trust_own_pid: bool) -> bool:
+        """Whether the process recorded as a ``running`` run's owner may still be working on it.
+
+        - a lease this process holds → alive;
+        - no heartbeat (nor any write to the run) for ``stale_after`` seconds → gone (dead, or a machine that slept);
+        - no owner recorded (older INSIA) or another machine/container → only the heartbeat decides;
+        - this machine restarted since → gone;
+        - our own pid without our lease → an earlier process that had the same pid (e.g. a restarted
+          container) → gone, unless ``trust_own_pid`` (a long-running process that may be between
+          ``create_run`` and ``acquire_run``);
+        - otherwise: whether that pid is still running.
+        """
+        lease = self._lease_for(row["id"])
+        if lease is not None and not lease.lost and row["owner_token"] and row["owner_token"] == lease.token:
+            return True
+        beat = self._last_sign(row)
+        if beat is None or (now - beat).total_seconds() > stale_after:
+            return False
+        pid = int(row["owner_pid"] or 0)
+        host = row["owner_host"] or ""
+        if pid <= 0 or not host or host != this_host():
+            return True
+        if _same_boot(row["owner_boot"] or "", boot_marker()) is False:
+            return False
+        if pid == os.getpid():
+            return trust_own_pid
+        return pid_alive(pid)
+
+    def run_owner(self, run_id: str) -> dict | None:
+        """Who is (or was last) running the run: ``{pid, host, heartbeat_at, this_host, live}``.
+
+        ``live`` is only meaningful while the status is ``running`` (for other statuses it is False).
+        """
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        live = row["status"] == "running" and self._owner_alive(row, datetime.now(timezone.utc), STALE_AFTER_SECONDS, True)
+        beat = self._last_sign(row)
+        return {"pid": int(row["owner_pid"] or 0) or None, "host": row["owner_host"] or None,
+                "heartbeat_at": _fmt(beat) if beat is not None else None,
+                "this_host": bool(row["owner_host"]) and row["owner_host"] == this_host(), "live": live}
+
+    def _close_interrupted(self, conn: sqlite3.Connection, row: sqlite3.Row, now: str) -> None:
+        """Mark a ``running`` run ``interrupted`` and close its event stream (inside a transaction)."""
+        run_id = row["id"]
+        message = interrupted_message(row["kind"])
+        last = conn.execute("SELECT seq, type, t FROM events WHERE run_id = ? ORDER BY seq DESC LIMIT 1", (run_id,)).fetchone()
+        if last is None or last["type"] not in TERMINAL_TYPES:
+            seq = (last["seq"] if last else 0) + 1
+            t = float(last["t"]) if last else 0.0
+            event = {"seq": seq, "t": t, "ts": now, "run_id": run_id, "type": "run.failed", "agent": "system",
+                     "data": {"error": message, "interrupted": True, "resumable": row["kind"] in RESUMABLE_RUN_KINDS}}
+            conn.execute("INSERT INTO events (run_id, seq, type, agent, t, ts, event) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (run_id, seq, "run.failed", "system", t, now, _dumps(event)))
+        conn.execute("UPDATE runs SET status = 'interrupted', error = ?, finished_at = ?, updated_at = ?, owner_token = '' "
+                     "WHERE id = ? AND status = 'running'", (message, now, now, run_id))
+
+    def _release_slot(self, conn: sqlite3.Connection, slot: sqlite3.Row, now: str) -> None:
+        """A slot whose generating run is gone: link the run's item when it finished, keep an earlier draft,
+        or put the slot back to ``planned``."""
+        run_id = slot["run_id"] or ""
+        run = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone() if run_id else None
+        item_id = pipeline_item_id(run_id, slot["channel"]) if run_id else ""
+        if run is not None and run["status"] == "completed" and item_id and \
+                conn.execute("SELECT 1 FROM versions WHERE item_id = ?", (item_id,)).fetchone():
+            conn.execute("UPDATE items SET scheduled_at = ?, updated_at = ? WHERE id = ? AND scheduled_at = ''",
+                         (slot["date"], now, item_id))
+            conn.execute("UPDATE slots SET status = 'drafted', item_id = ?, updated_at = ? WHERE id = ?", (item_id, now, slot["id"]))
+        elif slot["item_id"] and conn.execute("SELECT 1 FROM items WHERE id = ?", (slot["item_id"],)).fetchone():
+            conn.execute("UPDATE slots SET status = 'drafted', updated_at = ? WHERE id = ?", (now, slot["id"]))
+        else:
+            conn.execute("UPDATE slots SET status = 'planned', updated_at = ? WHERE id = ?", (now, slot["id"]))
+
+    def _running_rows(self, conn: sqlite3.Connection, run_ids: Sequence[str] | None) -> list[sqlite3.Row]:
+        if run_ids is None:
+            return conn.execute("SELECT * FROM runs WHERE status = 'running'").fetchall()
+        wanted = [str(r) for r in run_ids if r]
+        if not wanted:
+            return []
+        return conn.execute(f"SELECT * FROM runs WHERE status = 'running' AND id IN ({', '.join('?' for _ in wanted)})",
+                            wanted).fetchall()
+
+    def recover_stale(self, *, run_ids: Sequence[str] | None = None, stale_after: float = STALE_AFTER_SECONDS,
+                      trust_own_pid: bool = False, sweep_orphans: bool | None = None) -> list[str]:
+        """Take over ``running`` runs whose owner process is gone; returns their ids.
+
+        Each is marked ``interrupted`` (pipeline/slot runs are resumable; the
+        message tells jobs to start again), its event stream is closed with a
+        ``run.failed`` event (``data.interrupted = true``), and only the
+        calendar slots those runs were generating are released (the finished
+        item is linked, an earlier draft kept, otherwise ``planned``). A slot
+        left ``generating`` by a run that already ended, or never started, is
+        released too once it is ``ORPHAN_SLOT_SECONDS`` old (``sweep_orphans``;
+        by default only when ``run_ids`` is not given).
+
+        Runs whose owner may still be working (see ``_owner_alive``) are left
+        alone, so this is safe while other processes (the server, a cron
+        ``insia run-due``) are running. A taken-over owner that is in fact
+        still running stops at its next checkpoint and cannot write to the
+        run, its items or its slot any more. ``run_ids`` limits the check to
+        those runs; ``trust_own_pid=True`` is for a long-running process that
+        may itself be starting runs right now.
+        """
+        now_dt = datetime.now(timezone.utc)
+        now = _fmt(now_dt)
+        taken: list[str] = []
+        with self._tx() as conn:
+            for row in self._running_rows(conn, run_ids):
+                if self._owner_alive(row, now_dt, stale_after, trust_own_pid):
+                    continue
+                self._close_interrupted(conn, row, now)
+                taken.append(row["id"])
+            if taken:
+                marks = ", ".join("?" for _ in taken)
+                for slot in conn.execute(f"SELECT * FROM slots WHERE status = 'generating' AND run_id IN ({marks})", taken).fetchall():
+                    self._release_slot(conn, slot, now)
+            if sweep_orphans if sweep_orphans is not None else run_ids is None:
+                orphan_before = _fmt(now_dt - timedelta(seconds=ORPHAN_SLOT_SECONDS))
+                orphans = conn.execute(
+                    "SELECT s.* FROM slots s LEFT JOIN runs r ON r.id = s.run_id WHERE s.status = 'generating' AND "
+                    "(s.run_id = '' OR ((r.id IS NULL OR r.status != 'running') AND s.updated_at < ?))", (orphan_before,)).fetchall()
+                for slot in orphans:
+                    self._release_slot(conn, slot, now)
+        return taken
+
+    def stale_runs(self, *, stale_after: float = STALE_AFTER_SECONDS, trust_own_pid: bool = True) -> dict[str, str]:
+        """``running`` runs whose owner looks gone right now → their owner's last sign of life (read-only)."""
+        now_dt = datetime.now(timezone.utc)
+        with self._read() as conn:
+            rows = self._running_rows(conn, None)
+        out: dict[str, str] = {}
+        for row in rows:
+            if not self._owner_alive(row, now_dt, stale_after, trust_own_pid):
+                beat = self._last_sign(row)
+                out[row["id"]] = _fmt(beat) if beat is not None else ""
+        return out
+
+    def _recovery_tick(self, suspects: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+        """One round of the background recovery (``watch_stale_runs``).
+
+        A run is taken over only when its owner already looked gone at the
+        previous round with the same last sign of life, so an owner that just
+        woke up (a laptop back from sleep) gets a full round to send its next
+        heartbeat. Orphan slots are released too. Returns ``(taken, suspects
+        for the next round)``.
+        """
+        now_suspects = self.stale_runs(stale_after=STALE_AFTER_SECONDS)
+        confirmed = [run_id for run_id, sign in now_suspects.items() if suspects.get(run_id) == sign]
+        taken = self.recover_stale(run_ids=confirmed, stale_after=STALE_AFTER_SECONDS, trust_own_pid=True, sweep_orphans=True)
+        return taken, {run_id: sign for run_id, sign in now_suspects.items() if run_id not in taken}
+
+    def watch_stale_runs(self) -> bool:
+        """Keep taking over runs whose owner is gone, every ``RECOVERY_WATCH_SECONDS``, while this workspace is open.
+
+        For a long-running process (the server; ``mark_interrupted`` starts
+        it): a run the start-up check could not judge yet — another
+        machine/container with a recent heartbeat, e.g. the container an
+        update replaced, or a CLI run killed later — is recovered once its
+        owner is gone, without a restart. Idempotent; returns whether a new
+        watcher started. ``close()`` stops it.
+        """
+        with _LOCK:
+            if self._closed or (self._watcher is not None and self._watcher.is_alive()):
+                return False
+            stop = self._watch_stop = threading.Event()
+            self._watcher = threading.Thread(target=self._watch_loop, args=(stop,), name="insia-run-recovery", daemon=True)
+            self._watcher.start()
+        return True
+
+    def _watch_loop(self, stop: threading.Event) -> None:
+        suspects: dict[str, str] = {}
+        while not stop.wait(RECOVERY_WATCH_SECONDS):
+            try:
+                taken, suspects = self._recovery_tick(suspects)
+            except WorkspaceError:  # closed
+                return
+            except Exception:  # noqa: BLE001 - e.g. the database stayed locked: try again next round
+                log.warning("멈춘 실행을 확인하지 못했어요", exc_info=True)
+                continue
+            if taken:
+                log.warning("실행하던 프로세스가 멈춘 실행 %d개를 '중단됨'으로 정리했어요: %s", len(taken), ", ".join(taken))
+
+    def mark_interrupted(self, *, watch: bool = True) -> int:
+        """On startup: take over runs left ``running`` by a process that is gone (``recover_stale``).
+
+        Returns the number of runs marked ``interrupted``. Runs another live
+        process is working on (a cron ``insia run-due`` while the server
+        starts) are left alone. With ``watch`` (the default) the check keeps
+        running in the background (``watch_stale_runs``), so runs whose owner
+        goes away later are recovered too.
+        """
+        taken = len(self.recover_stale())
+        if watch:
+            self.watch_stale_runs()
+        return taken
 
     def _run_summary(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         brief = _loads(row["brief"], {}) or {}
@@ -728,7 +1259,8 @@ class Workspace:
         }
 
     def get_run(self, run_id: str) -> dict | None:
-        """Run detail as a JSON-serializable dict (brief, options, profile snapshot, plan, research, progress, …)."""
+        """Run detail as a JSON-serializable dict (brief, options, profile snapshot, plan, research, progress,
+        owner = ``{pid, host, heartbeat_at}`` of the process that runs / last ran it, …)."""
         with self._read() as conn:
             row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
             if row is None:
@@ -741,11 +1273,15 @@ class Workspace:
             "plan": _loads(row["plan"]),
             "research": _loads(row["research"]),
             "progress": _loads(row["progress"], {}) or {},
+            "owner": {"pid": int(row["owner_pid"] or 0) or None, "host": row["owner_host"] or None,
+                      "heartbeat_at": row["heartbeat_at"] or None},
         })
         return data
 
-    def list_runs(self, limit: int = 50, *, kind: str | None = None, status: str | None = None) -> list[dict]:
-        """Run summaries, newest first (optionally filtered by ``kind`` / ``status``)."""
+    def list_runs(self, limit: int = 50, *, kind: str | None = None, status: str | None = None,
+                  parent_item_id: str | None = None) -> list[dict]:
+        """Run summaries, newest first (optionally filtered by ``kind`` / ``status`` / ``parent_item_id``:
+        the jobs run on one content item)."""
         where, params = [], []
         if kind:
             where.append("kind = ?")
@@ -753,6 +1289,9 @@ class Workspace:
         if status:
             where.append("status = ?")
             params.append(status)
+        if parent_item_id:
+            where.append("parent_item_id = ?")
+            params.append(str(parent_item_id).strip())
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         limit = max(1, min(int(limit or 50), 1000))
         with self._read() as conn:
@@ -761,10 +1300,16 @@ class Workspace:
 
     # -- events ------------------------------------------------------------------
     def append_event(self, run_id: str, event: dict) -> None:
-        """Store one event (the dict emitted by ``EventBus``). A missing ``seq`` gets the next number."""
+        """Store one event (the dict emitted by ``EventBus``). A missing ``seq`` gets the next number.
+
+        Refused with ``RunTakenOverError`` when this process holds the run's
+        lease but another process took the run over.
+        """
         if not isinstance(event, dict):
             raise WorkspaceError("이벤트는 객체여야 해요")
+        lease = self._lease_for(run_id)
         with self._tx() as conn:
+            self._check_owner(conn, run_id, lease)
             seq = event.get("seq")
             if not isinstance(seq, int) or isinstance(seq, bool) or seq <= 0:
                 last = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events WHERE run_id = ?", (run_id,)).fetchone()[0]
@@ -791,33 +1336,6 @@ class Workspace:
             row = conn.execute("SELECT event FROM events WHERE run_id = ? ORDER BY seq DESC LIMIT 1", (run_id,)).fetchone()
         return json.loads(row["event"]) if row else None
 
-    def mark_interrupted(self) -> int:
-        """On startup: runs still ``running`` belong to a process that died.
-
-        Marks them ``interrupted`` (resumable), closes their event stream with
-        a ``run.failed`` event (``data.interrupted = true``) so replays end
-        cleanly, and puts calendar slots stuck in ``generating`` back to
-        ``planned``. Returns the number of runs marked.
-        """
-        now = utc_now()
-        with self._tx() as conn:
-            run_ids = [row["id"] for row in conn.execute("SELECT id FROM runs WHERE status = 'running'").fetchall()]
-            for run_id in run_ids:
-                last = conn.execute("SELECT seq, type, t FROM events WHERE run_id = ? ORDER BY seq DESC LIMIT 1", (run_id,)).fetchone()
-                if last is not None and last["type"] in TERMINAL_TYPES:
-                    continue
-                seq = (last["seq"] if last else 0) + 1
-                t = float(last["t"]) if last else 0.0
-                event = {"seq": seq, "t": t, "ts": now, "run_id": run_id, "type": "run.failed",
-                         "agent": "system", "data": {"error": INTERRUPTED_MESSAGE, "interrupted": True}}
-                conn.execute("INSERT INTO events (run_id, seq, type, agent, t, ts, event) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                             (run_id, seq, "run.failed", "system", t, event["ts"], _dumps(event)))
-            if run_ids:
-                conn.execute("UPDATE runs SET status = 'interrupted', error = ?, finished_at = ?, updated_at = ? WHERE status = 'running'",
-                             (INTERRUPTED_MESSAGE, now, now))
-            conn.execute("UPDATE slots SET status = 'planned', updated_at = ? WHERE status = 'generating'", (now,))
-        return len(run_ids)
-
     # -- content items -------------------------------------------------------------
     @staticmethod
     def _item(row: sqlite3.Row) -> ContentItem:
@@ -827,6 +1345,8 @@ class Workspace:
             version=max(1, int(row["version"] or 0)), score=row["score"], passed=None if passed is None else bool(passed),
             scheduled_at=row["scheduled_at"], published_at=row["published_at"], published_url=row["published_url"],
             note=row["note"], created_at=row["created_at"], updated_at=row["updated_at"],
+            approved_version=int(row["approved_version"] or 0), approval_forced=bool(row["approval_forced"]),
+            approved_score=row["approved_score"], approved_at=row["approved_at"] or "",
         )
 
     @staticmethod
@@ -874,9 +1394,13 @@ class Workspace:
             return self._item(self._item_row(conn, item_id))
 
     def ensure_item(self, item_id: str, channel: str, title: str, *, run_id: str = "", brief: Brief | None = None) -> ContentItem:
-        """Create the item if it does not exist yet; return it either way."""
+        """Create the item if it does not exist yet; return it either way.
+
+        Refused (``RunTakenOverError``) when this process held ``run_id`` but another process took it over.
+        """
         brief = _as_model(Brief, brief, "브리프")
         with self._tx() as conn:
+            self._guard_run(conn, run_id)
             row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
             if row is None:
                 self._insert_item(conn, item_id, channel, title, run_id=run_id, brief=brief)
@@ -934,19 +1458,58 @@ class Workspace:
         """Append a version (numbered 1, 2, …) and refresh the item's summary and status.
 
         ``run_id`` is the run (pipeline or job) that produced it; the pipeline
-        uses it to find its own rounds again on resume.
+        uses it to find its own rounds again on resume. Refused
+        (``RunTakenOverError``) when this process held that run but another
+        process took it over.
         """
         draft = _as_model(Draft, draft, "초안")
         review = _as_model(Review, review, "검수 결과")
         with self._tx() as conn:
+            self._guard_run(conn, run_id)
             version = self._insert_version(conn, item_id, draft, source=source, review=review, instructions=instructions,
                                            run_id=run_id, role="round")
             self._refresh_item(conn, item_id)
         return version
 
-    def attach_review(self, version_id: str, review: Review) -> None:
+    def add_job_version(self, item_id: str, draft: Draft, *, base_version: int, source: str = "agent",
+                        review: Review | None = None, instructions: str = "", run_id: str = "",
+                        label: str = "수정 요청") -> tuple[DraftVersion, DraftVersion | None]:
+        """Append a job's result that was made from version ``base_version``; returns ``(new, restored)``.
+
+        When the item's latest version is still ``base_version`` this is
+        ``add_version`` (``restored`` is None). When the item moved on while the
+        job ran (a person saved an edit, or another job added a version), the
+        job's version is kept in the history but does not silently become the
+        current one: the version that was current is appended again right
+        after it (role ``restored``, same content, source and review, with a
+        change-log note), so the latest version — what exports and approval
+        use — is still the newer work. The check and both inserts are one
+        transaction (refused like ``add_version`` when the job was taken over).
+        """
+        draft = _as_model(Draft, draft, "초안")
         review = _as_model(Review, review, "검수 결과")
         with self._tx() as conn:
+            self._guard_run(conn, run_id)
+            latest = conn.execute("SELECT * FROM versions WHERE item_id = ? ORDER BY version DESC LIMIT 1", (item_id,)).fetchone()
+            version = self._insert_version(conn, item_id, draft, source=source, review=review, instructions=instructions,
+                                           run_id=run_id, role="round")
+            restored: DraftVersion | None = None
+            if latest is not None and int(latest["version"]) != int(base_version):
+                kept = self._version(latest)
+                note = (f"{label}이 진행되는 동안 v{kept.version} 버전이 저장돼서, 그 내용을 다시 현재 버전으로 올렸어요 "
+                        f"({label} 결과는 v{version.version}, v{int(base_version)} 기준)")
+                copy = kept.draft.model_copy(update={"change_log": [note, *kept.draft.change_log]})
+                restored = self._insert_version(conn, item_id, copy, source=kept.source, review=kept.review,
+                                                instructions=kept.instructions, run_id=run_id, role="restored")
+            self._refresh_item(conn, item_id)
+        return version, restored
+
+    def attach_review(self, version_id: str, review: Review, *, run_id: str = "") -> None:
+        """Store ``review`` on a version. ``run_id`` is the run (pipeline or job) that made the review: refused
+        (``RunTakenOverError``) when this process held it but another process took it over."""
+        review = _as_model(Review, review, "검수 결과")
+        with self._tx() as conn:
+            self._guard_run(conn, run_id)
             row = conn.execute("SELECT item_id FROM versions WHERE id = ?", (version_id,)).fetchone()
             if row is None:
                 raise NotFoundError(f"버전 {version_id}를 찾을 수 없어요")
@@ -1024,6 +1587,11 @@ class Workspace:
         - approved → scheduled (needs ``scheduled_at``) | published; scheduled → published.
         - any → archived; archived → draft (restore).
         - published sets ``published_at`` to now when it is empty.
+
+        Every approval is recorded on the item: ``approved_version``,
+        ``approved_score`` (its review score, None without a review),
+        ``approved_at`` and ``approval_forced`` (true when ``force`` approved a
+        version that had not passed review — the dashboard shows '강제 승인').
         """
         if status not in CONTENT_STATUSES:
             raise WorkspaceError(f"알 수 없는 상태예요: {status!r} ({', '.join(CONTENT_STATUSES)} 중 하나)")
@@ -1051,6 +1619,9 @@ class Workspace:
                                    "승인하거나, 내용을 직접 확인했다면 '그래도 승인'을 눌러 주세요.")
                     raise ApprovalBlockedError(message, item_id=item_id, version=number, score=review.score if review else None)
                 values["approved_version"] = int(latest["version"])
+                values["approved_score"] = review.score if review is not None else None
+                values["approval_forced"] = 0 if (review is not None and review.passed) else 1
+                values["approved_at"] = utc_now()
             if status == "scheduled":
                 when = scheduled_at if scheduled_at is not None else row["scheduled_at"]
                 if not (when or "").strip():
@@ -1100,15 +1671,20 @@ class Workspace:
 
         Every draft round becomes a version (source=agent) with its review;
         rounds already stored by this run are not duplicated (safe to call
-        again, e.g. after a resume). When the best-scoring round is not the
-        last one, the best draft is added once more as the newest version, so
-        "the latest version" is always the final text.
+        again, e.g. after a resume). When the newest version this run stored
+        is not the final draft — the best-scoring round is an earlier one, or
+        a later round was written but its review failed — the final draft is
+        added once more as the newest version (role ``final``, with its
+        review), so "the latest version" is always the final text. Refused
+        (``RunTakenOverError``) when this process held the run but another
+        process took it over.
         """
         result = _as_model(ChannelResult, result, "채널 결과")
         brief = _as_model(Brief, brief, "브리프")
         item_id = pipeline_item_id(run_id, result.channel)
         reviews_by_round = {review.round: review for review in result.reviews}
         with self._tx() as conn:
+            self._guard_run(conn, run_id)
             if conn.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone() is None:
                 self._insert_item(conn, item_id, result.channel, result.final.title, run_id=run_id, brief=brief)
             stored = {
@@ -1124,17 +1700,31 @@ class Workspace:
                                          run_id=run_id, role="round")
                 elif review is not None and (_loads(row["review"]) != review.model_dump(mode="json")):
                     conn.execute("UPDATE versions SET review = ? WHERE id = ?", (review.model_dump_json(), row["id"]))
-            last_round = result.drafts[-1].round if result.drafts else result.final.round
-            if result.final.round != last_round:
-                exists = conn.execute("SELECT 1 FROM versions WHERE item_id = ? AND run_id = ? AND role = 'final'",
-                                      (item_id, run_id)).fetchone()
-                if exists is None:
+            newest = conn.execute("SELECT round, role, draft, review FROM versions WHERE item_id = ? AND run_id = ? "
+                                  "ORDER BY version DESC LIMIT 1", (item_id, run_id)).fetchone()
+            if newest is not None and not self._is_final_copy(newest, result.final):
+                later = int(newest["round"]) > result.final.round and newest["review"] is None and newest["role"] == "round"
+                if later:  # e.g. the reviewer failed on the last revision: fall back to the best reviewed round
+                    note = (f"R{int(newest['round'])} 수정본은 검수를 마치지 못해서, 검수를 받은 R{result.final.round} 버전을 "
+                            "최종본으로 다시 올렸어요")
+                else:
                     note = f"R{result.final.round} 버전이 가장 점수가 높아 최종본으로 골랐어요"
-                    final = result.final.model_copy(update={"change_log": [note, *result.final.change_log]})
-                    self._insert_version(conn, item_id, final, source="agent", review=reviews_by_round.get(result.final.round),
-                                         instructions="", run_id=run_id, role="final")
+                final = result.final.model_copy(update={"change_log": [note, *result.final.change_log]})
+                self._insert_version(conn, item_id, final, source="agent", review=reviews_by_round.get(result.final.round),
+                                     instructions="", run_id=run_id, role="final")
             self._refresh_item(conn, item_id)
             return self._item(self._item_row(conn, item_id))
+
+    @staticmethod
+    def _is_final_copy(row: sqlite3.Row, final: Draft) -> bool:
+        """Whether a stored version holds ``final``'s text (its change log may differ: a final copy has a note)."""
+        if int(row["round"]) != int(final.round):
+            return False
+        try:
+            stored = Draft.model_validate_json(row["draft"])
+        except ValidationError:
+            return False
+        return (stored.title, stored.content, stored.hashtags) == (final.title, final.content, final.hashtags)
 
     def item_plan(self, item_id: str) -> Plan | None:
         """The plan of the pipeline run that produced the item (if any)."""
@@ -1325,20 +1915,164 @@ class Workspace:
                 conn.execute(f"UPDATE slots SET {assignments} WHERE id = ?", (*values.values(), slot_id))
             return self._slot(conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone())
 
+    def _slot_run_busy(self, conn: sqlite3.Connection, slot: sqlite3.Row, run_id: str, now: datetime) -> str:
+        """The id of another run that is working on this slot right now ("" if none).
+
+        On the way, a ``running`` run whose owner is gone is taken over (marked
+        ``interrupted``) and a slot left ``generating`` by a run that is gone
+        (or ended/never started ``ORPHAN_SLOT_SECONDS`` ago) is released like
+        ``recover_stale`` does; the caller must read the slot again.
+        """
+        other_id = slot["run_id"] or ""
+        if other_id and other_id == run_id:
+            return ""
+        stamp = _fmt(now)
+        other = conn.execute("SELECT * FROM runs WHERE id = ?", (other_id,)).fetchone() if other_id else None
+        if other is not None and other["status"] == "running":
+            if self._owner_alive(other, now, STALE_AFTER_SECONDS, trust_own_pid=True):
+                return other_id
+            self._close_interrupted(conn, other, stamp)
+            if slot["status"] == "generating":
+                self._release_slot(conn, slot, stamp)
+            return ""
+        if slot["status"] == "generating":
+            updated = _parse_ts(slot["updated_at"])
+            if not other_id or updated is None or (now - updated).total_seconds() > ORPHAN_SLOT_SECONDS:
+                self._release_slot(conn, slot, stamp)
+        return ""
+
     def claim_slot(self, slot_id: str, run_id: str, *, force: bool = False) -> CalendarSlot:
-        """Atomically mark a slot ``generating`` for ``run_id`` (refuses a slot already
-        generating or drafted unless ``force``)."""
+        """Atomically mark a slot ``generating`` for ``run_id``.
+
+        Refuses a slot already generating or drafted unless ``force``, and
+        always refuses a slot another live run is working on (``force`` is for
+        regenerating a draft, not for two generations at once). A slot left
+        ``generating`` by a run whose process is gone is recovered first, so it
+        can be generated again without ``force``.
+        """
+        now = datetime.now(timezone.utc)
         with self._tx() as conn:
             row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
             if row is None:
                 raise NotFoundError(f"캘린더 슬롯 {slot_id}를 찾을 수 없어요")
+            busy = self._slot_run_busy(conn, row, run_id, now)
+            if busy:
+                raise WorkspaceError(f"이 슬롯은 지금 다른 실행({busy})이 초안을 만드는 중이에요. 그 실행이 끝난 뒤 다시 시도해 주세요.")
+            row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
             if row["status"] == "generating" and not force:
                 raise WorkspaceError("이 슬롯은 이미 초안을 만드는 중이에요")
             if row["status"] == "drafted" and row["item_id"] and not force:
                 raise WorkspaceError(f"이미 초안이 있어요 (보관함 {row['item_id']}). 다시 만들려면 force로 요청해 주세요.")
             conn.execute("UPDATE slots SET status = 'generating', run_id = ?, updated_at = ? WHERE id = ?",
-                         (run_id, utc_now(), slot_id))
+                         (run_id, _fmt(now), slot_id))
             return self._slot(conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone())
+
+    def refresh_slot(self, slot_id: str) -> CalendarSlot | None:
+        """Read a slot, first recovering it when the run generating it is gone (its process died → the run is
+        marked ``interrupted`` and the slot released; a slot orphaned by an ended run → released).
+
+        For request handlers that check ``status == 'generating'`` before starting a job.
+        """
+        now = datetime.now(timezone.utc)
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
+            if row is None:
+                return None
+            if row["status"] == "generating":
+                self._slot_run_busy(conn, row, "", now)
+                row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
+            return self._slot(row)
+
+    def reclaim_slot(self, slot_id: str, run_id: str) -> CalendarSlot | None:
+        """For resuming a calendar-slot run: mark its slot ``generating`` for ``run_id`` again.
+
+        Returns the slot as it was (to restore it when the resume fails), or
+        ``None`` when the slot is left alone: it no longer exists, or a draft
+        made after this run started already fills it (the resumed run then
+        finishes its own item without taking the slot back). Raises
+        ``WorkspaceError`` when another live run is generating the slot.
+        """
+        now = datetime.now(timezone.utc)
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
+            if row is None:
+                return None
+            busy = self._slot_run_busy(conn, row, run_id, now)
+            if busy:
+                raise WorkspaceError(f"이 슬롯은 지금 다른 실행({busy})이 초안을 만드는 중이에요. 그 실행이 끝난 뒤 보관함을 확인해 주세요.")
+            row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
+            if row["status"] == "drafted" and row["item_id"] and (row["run_id"] or "") != run_id:
+                newer = conn.execute("SELECT 1 FROM items i JOIN runs mine ON mine.id = ? WHERE i.id = ? AND i.created_at > mine.created_at",
+                                     (run_id, row["item_id"])).fetchone()
+                if newer is not None:
+                    return None
+            before = self._slot(row)
+            conn.execute("UPDATE slots SET status = 'generating', run_id = ?, updated_at = ? WHERE id = ?",
+                         (run_id, _fmt(now), slot_id))
+            return before
+
+    @staticmethod
+    def _still_claims(conn: sqlite3.Connection, slot: sqlite3.Row, run_id: str, owner_token: str | None) -> bool:
+        """Whether ``slot`` is still ``run_id``'s claim and, with ``owner_token``, the run still that process's."""
+        if not run_id or (slot["run_id"] or "") != run_id:
+            return False
+        if owner_token is not None:
+            run = conn.execute("SELECT owner_token FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if run is not None and run["owner_token"] != owner_token:
+                return False
+        return True
+
+    def release_slot(self, slot_id: str, run_id: str, *, status: str = "planned", item_id: str | None = None,
+                     set_run_id: str | None = None, owner_token: str | None = None) -> CalendarSlot | None:
+        """Hand back a slot ``run_id`` was generating, after that run failed or stopped.
+
+        ``status`` is ``planned`` (so it can be generated again) or the state
+        it had before a regeneration or resume (``drafted`` with ``item_id``,
+        ``skipped``); ``set_run_id`` restores the slot's earlier run id. It
+        only happens while the slot is still that run's claim (``generating``
+        for ``run_id``) and, with ``owner_token`` (the lease token of the
+        process that claimed it), while the run still belongs to that process.
+        When another process took the run over (``recover_stale``, a forced
+        resume) or another run claimed the slot meanwhile, the slot is left to
+        them: returns None. Otherwise returns the updated slot.
+        """
+        if status not in SLOT_STATUSES or status == "generating":
+            raise WorkspaceError(f"슬롯을 돌려놓을 상태가 올바르지 않아요: {status!r}")
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
+            if row is None or row["status"] != "generating" or not self._still_claims(conn, row, run_id, owner_token):
+                return None
+            values: dict[str, Any] = {"status": status, "updated_at": utc_now()}
+            if item_id is not None:
+                values["item_id"] = item_id
+            if set_run_id is not None:
+                values["run_id"] = set_run_id
+            assignments = ", ".join(f"{key} = ?" for key in values)
+            conn.execute(f"UPDATE slots SET {assignments} WHERE id = ?", (*values.values(), slot_id))
+            return self._slot(conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone())
+
+    def link_slot(self, slot_id: str, run_id: str, item_id: str, *, owner_token: str | None = None) -> CalendarSlot | None:
+        """After ``run_id`` finished a slot's draft: mark the slot ``drafted`` with ``item_id`` and give the item the
+        slot date as ``scheduled_at`` (when it has none).
+
+        Only while the slot is still that run's (same checks as
+        ``release_slot``; a slot the user skipped meanwhile stays skipped).
+        Returns the slot, unchanged when it was left alone, or None when it no
+        longer exists.
+        """
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
+            if row is None:
+                return None
+            if row["status"] != "skipped" and self._still_claims(conn, row, run_id, owner_token) and \
+                    conn.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone() is not None:
+                now = utc_now()
+                conn.execute("UPDATE items SET scheduled_at = ?, updated_at = ? WHERE id = ? AND scheduled_at = ''",
+                             (row["date"], now, item_id))
+                conn.execute("UPDATE slots SET status = 'drafted', item_id = ?, updated_at = ? WHERE id = ?",
+                             (item_id, now, slot_id))
+                row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
+            return self._slot(row)
 
     def due_slots(self, until_date: str) -> list[CalendarSlot]:
         """Planned slots on or before ``until_date`` (for ``insia run-due``)."""

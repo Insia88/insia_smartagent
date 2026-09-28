@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import date
 
@@ -234,6 +235,9 @@ def test_plan_week_with_a_live_backend_and_structured_output(settings, prompts_d
     assert [(s.date, s.channel, s.topic) for s in result.slots] == [
         ("2026-10-05", "naver_blog", "블로그 A"), ("2026-10-06", "linkedin", "링크드인 A"), ("2026-10-09", "naver_blog", "일요일 블로그")]
     assert result.notices == ["네이버 블로그은(는) 3편을 요청했지만 2편만 계획됐어요."]
+    body = client.calls[0]["messages"][0]["content"][-1]["text"]
+    payload = json.loads(body.split("```json\n", 1)[1].rsplit("```", 1)[0])
+    assert payload["channel_days"] == {"naver_blog": slot_days(*WEEK), "linkedin": slot_days(*WEEK)}
     assert [r.task for r in workspace.usage] == ["plan_calendar"] and workspace.usage[0].model == "claude-opus-5"
     assert "이미 게시한 글" in client.calls[0]["messages"][0]["content"][-1]["text"]
 
@@ -251,3 +255,254 @@ def test_plan_week_with_the_real_workspace(settings, tmp_path):
     again = plan_week(workspace, MockBackend(settings), "AI 마케팅 자동화", *WEEK, {"naver_blog": 2, "linkedin": 1})
     assert not ({topic_key(s.topic) for s in again.slots} & {topic_key(s.topic) for s in result.slots})
     assert workspace.usage_summary()["by_task"]["plan_calendar"]["usd"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Weekends per channel (finding 20)
+# ---------------------------------------------------------------------------
+
+from collections import Counter  # noqa: E402
+
+from insia_agents.models import ALL_CHANNELS  # noqa: E402
+from insia_agents.planner import (  # noqa: E402
+    DEFAULT_WEEKEND_CHANNELS,
+    calendar_days,
+    channel_days,
+    fit_plan,
+    plan_capacity,
+    repeats_history,
+    weekend_channel_set,
+)
+
+
+def test_weekend_channel_set_parsing():
+    assert weekend_channel_set(None) == set(DEFAULT_WEEKEND_CHANNELS) == set()  # weekdays only, as before
+    assert weekend_channel_set("blog, ig") == {"naver_blog", "instagram"}
+    assert weekend_channel_set(["linkedin"]) == {"linkedin"}
+    assert weekend_channel_set("all") == weekend_channel_set(True) == set(ALL_CHANNELS)
+    assert weekend_channel_set("none") == weekend_channel_set("") == weekend_channel_set(False) == set()
+    with pytest.raises(PlanningError, match="알 수 없는 채널"):
+        weekend_channel_set(["tiktok"])
+
+
+def test_channel_days_follow_the_weekend_rule():
+    days = channel_days(*WEEK, ["naver_blog", "linkedin"], weekend_channels=["naver_blog"])
+    assert days["naver_blog"][-2:] == ["2026-10-10", "2026-10-11"] and len(days["naver_blog"]) == 7
+    assert days["linkedin"] == slot_days(*WEEK)
+    lone_weekend = channel_days("2026-10-10", "2026-10-11", ["linkedin"], weekend_channels=())
+    assert lone_weekend["linkedin"] == ["2026-10-10", "2026-10-11"]  # a range with no weekday: every day
+
+
+def test_a_weekday_cap_names_the_weekend_exclusion(settings):
+    """The review's repro: instagram 7 over Mon..Sun used to blame the one-post-per-day rule."""
+    week = plan_week(FakeWorkspace(), MockBackend(settings), "AI 마케팅", *WEEK, {"instagram": 7, "linkedin": 2},
+                     profile=PROFILE, history=[])
+    assert Counter(s.channel for s in week.slots) == {"instagram": 5, "linkedin": 2}
+    assert all(date.fromisoformat(s.date).weekday() < 5 for s in week.slots)
+    # was: '인스타그램은(는) 하루 한 편까지라 7편 대신 5편만 계획해요.'
+    assert week.notices == ["인스타그램은(는) 주말을 빼고 평일에 하루 한 편까지라 이 기간(평일 5일)에는 7편 대신 5편만 계획해요."]
+
+
+def test_weekends_are_allowed_per_channel(settings):
+    week = plan_week(FakeWorkspace(), MockBackend(settings), "AI 마케팅", *WEEK, {"instagram": 7, "linkedin": 7},
+                     profile=PROFILE, history=[], weekend_channels=["instagram", "blog"])
+    assert Counter(s.channel for s in week.slots) == {"instagram": 7, "linkedin": 5}
+    assert {"2026-10-10", "2026-10-11"} <= {s.date for s in week.slots if s.channel == "instagram"}
+    assert not {"2026-10-10", "2026-10-11"} & {s.date for s in week.slots if s.channel == "linkedin"}
+    assert week.notices == ["링크드인은(는) 주말을 빼고 평일에 하루 한 편까지라 이 기간(평일 5일)에는 7편 대신 5편만 계획해요."]
+    assert "주말 포함" in week.summary
+    everyone = plan_week(FakeWorkspace(), MockBackend(settings), "AI 마케팅", *WEEK, {"linkedin": 7},
+                         profile=PROFILE, history=[], weekend_channels="all")
+    assert len(everyone.slots) == 7 and everyone.notices == []
+    over = plan_week(FakeWorkspace(), MockBackend(settings), "AI 마케팅", *WEEK, {"blog": 9}, profile=PROFILE,
+                     history=[], weekend_channels="blog")
+    assert over.notices == ["네이버 블로그은(는) 하루 한 편까지라 9편 대신 7편만 계획해요."]
+
+
+def test_normalize_plan_with_per_channel_days_is_idempotent():
+    days = {"naver_blog": ["2026-10-05", "2026-10-10"], "linkedin": ["2026-10-06"]}
+    raw = ContentPlan(summary="s", slots=[_slot("2026-10-10", topic="토요일 블로그"), _slot("2026-10-10", channel="linkedin", topic="토요일 링크드인"),
+                                          _slot("2026-10-11", topic="일요일 블로그")])
+    plan = normalize_plan(raw, *WEEK, {"naver_blog": 2, "linkedin": 1}, days=days)
+    # Saturday is a blog day here, so that slot stays; Sunday is not, so it moves to the blog's other day;
+    # LinkedIn has only Tuesday
+    assert [(s.date, s.channel, s.topic) for s in plan.slots] == [
+        ("2026-10-05", "naver_blog", "일요일 블로그"), ("2026-10-06", "linkedin", "토요일 링크드인"),
+        ("2026-10-10", "naver_blog", "토요일 블로그")]
+    assert normalize_plan(plan, *WEEK, {"naver_blog": 2, "linkedin": 1}, days=days) == plan
+    capped, by_channel = calendar_days(*WEEK, {"naver_blog": 5, "linkedin": 1}, days)
+    assert capped == {"naver_blog": 2, "linkedin": 1} and by_channel == days
+
+
+# ---------------------------------------------------------------------------
+# Re-planning the same days (finding 21) and repeated topics (finding 29)
+# ---------------------------------------------------------------------------
+
+
+def _real_workspace(tmp_path):
+    db = pytest.importorskip("insia_agents.db")
+    return db.Workspace(tmp_path / "ws")
+
+
+def test_replanning_a_week_never_doubles_a_channel_on_a_day(settings, tmp_path):
+    workspace = _real_workspace(tmp_path)
+    try:
+        backend = MockBackend(settings)
+        plan_week(workspace, backend, "AI 마케팅", *WEEK, {"instagram": 7, "linkedin": 2}, weekend_channels=["instagram"])
+        again = plan_week(workspace, backend, "AI 마케팅", *WEEK, {"linkedin": 2})
+        stored = workspace.list_slots(date_from=WEEK[0], date_to=WEEK[1])
+        dup = {k: v for k, v in Counter((s.date, s.channel) for s in stored).items() if v > 1}
+        assert dup == {}  # was {('2026-10-05', 'linkedin'): 3, ('2026-10-08', 'linkedin'): 2}
+        assert len(again.slots) == 2
+        assert "이 기간에 이미 계획된 일정 2개(링크드인 2)가 있어, 같은 채널은 그날을 비워 두고 계획했어요." in again.notices
+        # a third plan asks for more LinkedIn posts than free weekdays: the notice says why
+        third = plan_week(workspace, backend, "AI 마케팅", *WEEK, {"linkedin": 3})
+        assert len(third.slots) == 1
+        assert third.notices[0] == ("링크드인은(는) 주말을 빼고 평일에 하루 한 편까지인데, 평일 5일 중 4일에는 이미 계획이 있어 "
+                                    "3편 대신 1편만 계획해요.")
+        # nothing left: no backend call, a clear notice
+        calls: list[UsageRecord] = []
+        backend.on_usage = calls.append
+        full = plan_week(workspace, backend, "AI 마케팅", *WEEK, {"linkedin": 1, "instagram": 1},
+                         weekend_channels=["instagram"])
+        assert full.slots == [] and calls == [] and full.notices == [
+            "링크드인은(는) 이 기간에 올릴 수 있는 평일 5일에 모두 이미 계획이 있어 새로 계획하지 않았어요.",
+            "인스타그램은(는) 이 기간에 올릴 수 있는 7일에 모두 이미 계획이 있어 새로 계획하지 않았어요.",
+            "새로 계획할 수 있는 날이 없어요. 기간을 바꾸거나 기존 계획을 건너뛴 뒤 다시 시도해 주세요."]
+        backend.on_usage = None
+        # a skipped slot frees its day again
+        victim = next(s for s in stored if s.channel == "linkedin")
+        workspace.update_slot(victim.id, status="skipped")
+        freed = plan_week(workspace, backend, "AI 마케팅", *WEEK, {"linkedin": 1})
+        assert [s.date for s in freed.slots] == [victim.date]
+    finally:
+        workspace.close()
+
+
+def test_plan_capacity_counts_drafted_and_generating_slots_as_taken(settings):
+    capped, free, notices = plan_capacity({"linkedin": 5}, *WEEK, taken={"linkedin": ["2026-10-05", "2026-10-06"]})
+    assert capped == {"linkedin": 3} and free["linkedin"] == ["2026-10-07", "2026-10-08", "2026-10-09"]
+    assert "이미 계획이 있어" in notices[0]
+
+    class Busy(FakeWorkspace):
+        def list_slots(self, *, date_from=None, date_to=None):
+            return [CalendarSlot(id=f"sl_{st}", date=day, channel="linkedin", topic=f"기존 {st}", status=st)
+                    for st, day in (("drafted", "2026-10-05"), ("generating", "2026-10-06"), ("skipped", "2026-10-07"))]
+
+    week = plan_week(Busy(), MockBackend(settings), "주제", *WEEK, {"linkedin": 5})
+    assert sorted(s.date for s in week.slots) == ["2026-10-07", "2026-10-08", "2026-10-09"]
+
+
+def test_repeats_history_ignores_short_topics_inside_long_ones():
+    keys = {topic_key("AI 마케팅 자동화 체크리스트 10가지")}
+    assert not repeats_history("A", keys) and not repeats_history("AI", keys) and not repeats_history("마케팅", keys)
+    assert repeats_history("AI 마케팅 자동화 체크리스트", keys)  # the long topic contains this 8+ character one
+    assert repeats_history("ai 마케팅 자동화 체크리스트 10가지!", keys)
+
+
+def test_repeats_history_still_catches_short_korean_topics():
+    """Follow-up: requiring 8+ characters on both sides let 5–7 syllable Korean topics through
+    (HEAD caught them). Five Hangul syllables are enough to name a topic."""
+    keys = {topic_key("재고 관리 엑셀 체크리스트 10가지")}
+    assert repeats_history("엑셀 체크리스트", keys)  # 7 syllables (was False)
+    assert repeats_history("재고 관리 엑셀", keys)  # 6 syllables (was False)
+    assert not repeats_history("재고 관리", keys)  # 4 syllables: a broad subject, not the same post
+    # symmetric: a short history title inside a longer new topic
+    assert repeats_history("카페 사장님을 위한 재고 관리 엑셀 체크리스트", {topic_key("엑셀 체크리스트")})
+    assert not repeats_history("AI 마케팅 자동화 가이드", {topic_key("AI")})
+
+
+def test_fit_plan_drops_history_repeats_and_in_plan_duplicates_separately():
+    plan = ContentPlan(summary="s", slots=[_slot("2026-10-05", topic="재고 관리 엑셀 체크리스트 10가지"),
+                                           _slot("2026-10-06", channel="linkedin", topic="완전히 새 주제"),
+                                           _slot("2026-10-07", channel="instagram", topic="완전히 새 주제!")])
+    fitted = fit_plan(plan, *WEEK, {"naver_blog": 1, "linkedin": 1, "instagram": 1},
+                      avoid={topic_key("재고 관리 엑셀 체크리스트 10가지")})
+    assert [s.topic for s in fitted.plan.slots] == ["완전히 새 주제"]
+    assert [s.date for s in fitted.repeated] == ["2026-10-05"] and [s.date for s in fitted.duplicates] == ["2026-10-07"]
+    # without ``avoid`` topics are not compared (normalize_plan's behavior)
+    assert len(fit_plan(plan, *WEEK, {"naver_blog": 1, "linkedin": 1, "instagram": 1}).plan.slots) == 3
+
+
+def test_a_repeat_never_takes_the_place_of_a_usable_spare_slot():
+    """Verifier's repro (v29_order.py): the backend returns more slots than requested and the first
+    one repeats history. Deduping after the count cap used to throw the spare away and plan 0 posts."""
+    plan = ContentPlan(summary="s", slots=[_slot("2026-10-05", channel="linkedin", topic="1인 창업자의 콘텐츠 루틴 만들기"),
+                                           _slot("2026-10-07", channel="linkedin", topic="고객 인터뷰 질문 12개")])
+    fitted = fit_plan(plan, *WEEK, {"linkedin": 1}, avoid={topic_key("1인 창업자의 콘텐츠 루틴 만들기")})
+    assert [(s.date, s.topic) for s in fitted.plan.slots] == [("2026-10-07", "고객 인터뷰 질문 12개")]
+    assert [s.topic for s in fitted.repeated] == ["1인 창업자의 콘텐츠 루틴 만들기"]
+    # a duplicate inside the plan does not take the place either (it would have been the second post)
+    twins = ContentPlan(summary="s", slots=[_slot("2026-10-05", topic="블로그 주제 하나 입니다"),
+                                            _slot("2026-10-06", topic="블로그 주제 하나 입니다!"),
+                                            _slot("2026-10-08", topic="전혀 다른 블로그 주제")])
+    fitted = fit_plan(twins, *WEEK, {"naver_blog": 2}, avoid=set())
+    assert [s.date for s in fitted.plan.slots] == ["2026-10-05", "2026-10-08"] and len(fitted.duplicates) == 1
+    # idempotent with the same avoid set
+    again = fit_plan(fitted.plan, *WEEK, {"naver_blog": 2}, avoid=set())
+    assert again.plan == fitted.plan and not again.repeated and not again.duplicates
+
+
+def test_plan_week_keeps_the_spare_slot_and_words_each_notice_by_its_reason(settings, tmp_path):
+    workspace = _real_workspace(tmp_path)
+    try:
+        workspace.create_item("linkedin", "1인 창업자의 콘텐츠 루틴 만들기", status="published")
+
+        class Over(MockBackend):
+            def plan_calendar(self, profile, theme, start, end, counts, history, *, days=None):
+                return ContentPlan(summary="s", slots=[
+                    _slot("2026-10-05", channel="linkedin", topic="1인 창업자의 콘텐츠 루틴 만들기"),
+                    _slot("2026-10-06", channel="linkedin", topic="고객 인터뷰 질문 12개"),
+                    _slot("2026-10-07", channel="linkedin", topic="고객 인터뷰 질문 12개!"),
+                    _slot("2026-10-08", channel="linkedin", topic="가격표를 한 장으로 정리하는 법")])
+
+        week = plan_week(workspace, Over(settings), "t", *WEEK, {"linkedin": 2})
+        assert [(s.date, s.topic) for s in week.slots] == [("2026-10-06", "고객 인터뷰 질문 12개"),
+                                                            ("2026-10-08", "가격표를 한 장으로 정리하는 법")]
+        assert week.notices == [
+            "지난 게시물·기존 계획과 주제가 겹치는 슬롯 1개는 넣지 않았어요: 「1인 창업자의 콘텐츠 루틴 만들기」(링크드인 2026-10-05)",
+            "새 계획 안에서 다른 슬롯과 주제가 겹치는 슬롯 1개는 넣지 않았어요: 「고객 인터뷰 질문 12개!」(링크드인 2026-10-07)"]
+    finally:
+        workspace.close()
+
+
+def test_live_planner_never_saves_a_topic_that_is_already_planned(settings, prompts_dir, tmp_path):
+    """The review's repro: 61 published + 10 approved items push the planned slot out of the
+    60-row prompt, and the model returns the same topic again."""
+    (prompts_dir / "agents" / "planner.md").write_text("# planner", encoding="utf-8")
+    workspace = _real_workspace(tmp_path)
+    try:
+        for i in range(10):
+            workspace.create_item("instagram", f"예약된 인스타 {i}", status="approved")
+        for i in range(61):
+            workspace.create_item("linkedin", f"지난 링크드인 글 {i}", status="published")
+        topic = "재고 관리 엑셀 체크리스트 10가지"
+        workspace.add_slots([PlannedSlot(date="2026-10-06", channel="naver_blog", topic=topic, angle="체크리스트",
+                                         keywords=["재고 관리"], goal="검색")])
+        reply = ContentPlan(summary="s", slots=[
+            PlannedSlot(date="2026-10-07", channel="naver_blog", topic=topic, angle="체크리스트", keywords=["재고 관리"], goal="검색"),
+            PlannedSlot(date="2026-10-08", channel="naver_blog", topic="재고 회전율 쉽게 계산하는 법", angle="방법",
+                        keywords=["재고 회전율"], goal="검색")])
+        client = FakeClient([message([json_text(reply)])])
+        week = plan_week(workspace, AnthropicBackend(settings, client=client), "재고", "2026-10-05", "2026-10-09",
+                         {"naver_blog": 2})
+        body = client.calls[0]["messages"][0]["content"][-1]["text"]
+        payload = json.loads(body.split("```json\n", 1)[1].rsplit("```", 1)[0])
+        assert len(payload["history"]) == 60 and any(r["title"] == topic for r in payload["history"])  # was False
+        saved = sorted((s.date, s.topic) for s in workspace.list_slots())
+        assert saved == [("2026-10-06", topic), ("2026-10-08", "재고 회전율 쉽게 계산하는 법")]  # no second copy
+        assert any("주제가 겹치는 슬롯 1개" in n and topic in n for n in week.notices)
+        assert "네이버 블로그은(는) 2편을 요청했지만 1편만 계획됐어요." in week.notices
+    finally:
+        workspace.close()
+
+
+def test_plan_week_works_with_a_backend_that_does_not_take_days(settings):
+    class OldBackend(MockBackend):
+        def plan_calendar(self, profile, theme, start, end, counts, history):  # the pre-weekend signature
+            return ContentPlan(summary="s", slots=[_slot("2026-10-11", channel="linkedin", topic="일요일 링크드인"),
+                                                   _slot("2026-10-11", channel="instagram", topic="일요일 인스타")])
+
+    week = plan_week(FakeWorkspace(), OldBackend(settings), "주제", *WEEK, {"linkedin": 1, "instagram": 1},
+                     profile=PROFILE, history=[], weekend_channels=["instagram"])
+    assert {(s.date, s.channel) for s in week.slots} == {("2026-10-09", "linkedin"), ("2026-10-11", "instagram")}
