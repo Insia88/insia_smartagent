@@ -121,9 +121,9 @@
     if (!badge) return;
     if (isDemo() || !S.items || S.channel) { if (isDemo() || !S.items) badge.hidden = true; return; }
     var n = S.items.filter(function (i) { return i.status === 'draft' || i.status === 'needs_changes'; }).length;
-    badge.textContent = n ? String(n) : '';
+    badge.textContent = '';
+    if (n) U.appendChildren(badge, [el('span', { 'aria-hidden': 'true', text: String(n) }), el('span', { class: 'sr-only', text: ', 검토 대기 ' + n + '건' })]);
     badge.hidden = !n;
-    badge.setAttribute('aria-label', '검토 대기 ' + n + '건');
   }
 
   // ------------------------------------------------------------------ view API
@@ -552,7 +552,7 @@
       return el('button', {
         type: 'button', class: 'btn' + (primary ? ' btn--primary' : ''), 'data-key': 'act-' + key,
         'aria-expanded': ['approve', 'revise', 'schedule', 'publish', 'archive'].indexOf(key) >= 0 && (key !== 'approve' || !passed) ? String(S.panel === key) : null,
-        disabled: S.busy || disabled, text: label, onclick: onclick
+        disabled: S.busy || S.editing || disabled, text: label, onclick: onclick
       });
     }
     function toggle(key) { return function () { S.panel = S.panel === key ? '' : key; S.panelError = ''; renderDetail(false); focusPanel(); }; }
@@ -570,12 +570,14 @@
     if (st === 'scheduled') {
       buttons.push(btn('publish', '게시 완료 표시', true, toggle('publish')));
       buttons.push(btn('schedule', '예정일 바꾸기', false, toggle('schedule')));
+      buttons.push(btn('unschedule', '예정 취소', false, function () { setStatus({ status: 'approved' }, '게시 예정을 취소했어요. 승인 상태로 돌아갔어요.'); }));
     }
     if (st !== 'published' && st !== 'archived') {
       buttons.push(btn('review', '재검수', false, startReview, !!job));
       buttons.push(btn('revise', '수정 요청', false, toggle('revise'), !!job));
     }
     if (st !== 'archived') buttons.push(btn('archive', '보관', false, toggle('archive')));
+    else buttons.push(btn('unarchive', '보관 해제', true, function () { setStatus({ status: 'draft' }, '보관을 해제했어요. 초안으로 돌아갔어요.'); }));
 
     var stateLine = {
       draft: '사람 검토를 기다리는 초안이에요.',
@@ -583,14 +585,14 @@
       approved: '승인한 콘텐츠예요. 채널에 올린 뒤 게시 완료로 표시해 주세요.',
       scheduled: (item.scheduled_at ? ws.date.dateTime(item.scheduled_at) + '에 ' : '') + '게시할 예정이에요. 올린 뒤 게시 완료로 표시해 주세요.',
       published: '게시를 마쳤어요' + (item.published_at ? ' (' + ws.date.dateTime(item.published_at) + ')' : '') + '.',
-      archived: '보관한 콘텐츠예요. 내보내기는 계속 할 수 있어요.'
+      archived: '보관한 콘텐츠예요. 보관을 해제하면 초안으로 돌아가요. 내보내기는 계속 할 수 있어요.'
     }[st] || '';
 
     return el('section', { class: 'card actions-card', 'aria-labelledby': 'actTitle' }, [
       el('h3', { class: 'card-title', id: 'actTitle', text: '검토와 게시' }),
-      el('p', { class: 'card-sub', text: stateLine }),
+      el('p', { class: 'card-sub', text: S.editing ? '편집 중에는 승인·게시·재검수를 할 수 없어요. 먼저 저장하거나 편집을 취소해 주세요.' : stateLine }),
       buttons.length ? el('div', { class: 'action-row' }, buttons) : null,
-      actionPanel(item, latest, passed)
+      S.editing ? null : actionPanel(item, latest, passed)
     ]);
   }
 

@@ -1214,6 +1214,7 @@ a.btn--primary { color: var(--accent-ink); }
 .cal-cell[data-today="true"] .cc-num { color: var(--accent); font-weight: 700; }
 .cc-more { border: 0; background: none; padding: 2px 4px; font-size: var(--fs-xs); color: var(--accent); text-align: left; font-weight: 600; min-height: 24px; }
 .plan-form { gap: 12px; }
+.plan-notices { margin: 0; padding-left: 1.2em; font-size: var(--fs-xs); color: var(--ink-2); }
 .plan-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); }
 .plan-grid .field--wide { grid-column: 1 / -1; }
 .plan-span { font-size: var(--fs-xs); color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
@@ -1355,7 +1356,7 @@ a.btn--primary { color: var(--accent-ink); }
 .share i { display: block; height: 100%; background: var(--accent); }
 .run-topic { display: block; font-size: var(--fs-xs); color: var(--ink-2); }
 .run-kind { display: inline-block; margin-left: 6px; font-size: var(--fs-xs); color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
-.usage-tables { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); }
+.usage-tables { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); align-items: start; }
 @media (min-width: 1100px) { .usage-tables { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); } }
 .usage-note { font-size: var(--fs-xs); color: var(--muted); max-width: 90ch; }
 

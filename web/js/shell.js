@@ -14,6 +14,7 @@
   var current = null;
   var booted = false;
   var loginBack = null;
+  var deferredPlay = false;   // demo replay waits until the studio is first shown
 
   function parseHash() {
     var h = '';
@@ -61,6 +62,7 @@
     });
     if (prev && prev.view !== view && I.views[prev.view] && I.views[prev.view].hide) I.views[prev.view].hide();
     I.studio.setVisible(view === 'studio');
+    if (view === 'studio' && deferredPlay) { deferredPlay = false; I.play(); }
     var container = document.getElementById('view-' + view);
     if (view === 'login') renderLogin(container);
     else if (view !== 'studio' && I.views[view]) I.views[view].show(container, param, { focus: focus, prev: prev });
@@ -128,6 +130,7 @@
     ws.authMessage = '';
     I.studio.setServer(info);
     Object.keys(I.views).forEach(function (k) { if (I.views[k].reset) I.views[k].reset(); });
+    if (I.views.library && I.views.library.prefetch) I.views.library.prefetch();
   }
 
   // ------------------------------------------------------------------ boot
@@ -150,6 +153,9 @@
       else ws.mode = 'demo';
       booted = true;
       var r = parseHash();
+      if (ws.mode === 'live' && I.views.library && I.views.library.prefetch) I.views.library.prefetch();
+      // opened straight into another screen: start the stage replay when the studio is first shown
+      if (r && r.view !== 'studio' && I.player.playing) { I.pause(); deferredPlay = true; }
       if (ws.mode === 'auth') {
         go('login', '', { replace: true, focus: false, back: r && r.view !== 'login' ? r : null });
       } else if (r && !(r.view === 'login')) {

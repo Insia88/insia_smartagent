@@ -28,6 +28,7 @@
     planBusy: false,
     planError: '',
     planSummary: '',
+    planNotices: [],
     dialog: null,
     dialogSlot: null,
     dialogTrigger: null,
@@ -130,8 +131,11 @@
     ws.mount(C.container, [
       ui.viewHead('calendar', '캘린더', '한 주 테마로 게시 계획을 세우고, 날짜마다 정한 주제로 초안을 만들어요. 게시는 사람이 직접 해요.', [planBtn]),
       C.planOpen ? planForm() : null,
-      C.planSummary ? ui.notice('success', [el('b', { text: '계획을 세웠어요 · ' }), C.planSummary,
-        el('button', { type: 'button', class: 'btn btn--small btn--ghost notice-action', text: '닫기', onclick: function () { C.planSummary = ''; render(false); } })]) : null,
+      C.planSummary ? ui.notice(C.planNotices.length ? 'warn' : 'success', [
+        el('div', null, [el('b', { text: '계획을 세웠어요 · ' }), C.planSummary,
+          el('button', { type: 'button', class: 'btn btn--small btn--ghost notice-action', text: '닫기', onclick: function () { C.planSummary = ''; C.planNotices = []; render(false); } })]),
+        C.planNotices.length ? el('ul', { class: 'plan-notices' }, C.planNotices.map(function (n) { return el('li', { text: String(n) }); })) : null
+      ]) : null,
       nav,
       legend(),
       el('div', { class: 'cal-wrap' + (C.slots ? '' : ' is-loading'), 'aria-busy': C.slots ? 'false' : 'true' }, grid)
@@ -298,6 +302,7 @@
         C.planBusy = false;
         C.planOpen = false;
         C.planSummary = (plan.summary || resp.summary || '') + (slots.length ? ' (게시 ' + slots.length + '개)' : '');
+        C.planNotices = Array.isArray(plan.notices) ? plan.notices : [];
         C.mode = 'week';
         C.anchor = D.weekStart(s);
         C.slots = null;

@@ -360,8 +360,9 @@
       B.profile = saved;
       B.form = clone(saved);
       B.saving = false;
+      // same clock as the rest of the app (KST, from the server's updated_at)
       var now = new Date();
-      B.savedAt = (now.getHours() < 10 ? '0' : '') + now.getHours() + ':' + (now.getMinutes() < 10 ? '0' : '') + now.getMinutes();
+      B.savedAt = saved.updated_at ? ws.date.dateTime(saved.updated_at) : (now.getHours() < 10 ? '0' : '') + now.getHours() + ':' + (now.getMinutes() < 10 ? '0' : '') + now.getMinutes();
       if (ws.health) ws.health.profile_complete = COMPLETE.every(function (c) { return filled(saved, c[0]); });
       ui.toast('프로필을 저장했어요. 다음 실행부터 반영돼요.', 'success');
       render(false);

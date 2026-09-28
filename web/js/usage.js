@@ -20,6 +20,8 @@
     revise: '수정', plan_calendar: '캘린더 계획', calendar: '캘린더 계획'
   };
 
+  var KIND_LABEL = { review: '재검수', revise: '수정 요청', edit: '사람 수정', slot: '캘린더 초안', plan: '캘린더 계획', resume: '이어서 실행', other: '기타' };
+
   var S = { container: null, month: null, data: null, error: null, loading: false, focusDay: -1, ro: null, lastWidth: 0 };
 
   function show(container, param, ctx) {
@@ -76,7 +78,7 @@
 
   // ------------------------------------------------------------------ derived numbers
   function runDate(r) {
-    var iso = r.started_at || r.created_at || r.finished_at || '';
+    var iso = r.started_at || r.first_at || r.created_at || r.last_at || r.finished_at || '';
     if (iso) return iso;
     var m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(r.run_id || '');
     return m ? m[1] + '-' + m[2] + '-' + m[3] + 'T' + m[4] + ':' + m[5] + ':' + m[6] + 'Z' : '';
@@ -224,7 +226,11 @@
         el('tbody', null, runs.map(function (r) {
           var over = budget && usd(r.usd != null ? r.usd : r.cost_usd) > budget;
           return el('tr', { 'data-over': over ? 'true' : null }, [
-            el('td', null, [el('span', { class: 'mono', text: r.run_id || '' }), r.topic ? el('span', { class: 'run-topic', text: r.topic }) : null, r.kind && r.kind !== 'pipeline' ? el('span', { class: 'run-kind', text: r.kind }) : null]),
+            el('td', null, [
+              el('span', { class: 'mono', text: r.run_id || '실행 밖 호출' }),
+              r.kind && r.kind !== 'pipeline' ? el('span', { class: 'run-kind', text: KIND_LABEL[r.kind] || r.kind }) : null,
+              r.topic ? el('span', { class: 'run-topic', text: r.topic }) : null
+            ]),
             el('td', { class: 'nowrap', text: ws.date.dateTime(runDate(r)) }),
             el('td', { class: 'num', text: ws.fmtUsd(usd(r.usd != null ? r.usd : r.cost_usd), 2) + (over ? ' · 상한 초과' : '') }),
             el('td', { class: 'num', text: U.fmtNum(Number(r.input_tokens) || 0) }),
