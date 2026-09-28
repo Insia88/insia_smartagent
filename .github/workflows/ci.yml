@@ -28,6 +28,8 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
     steps:
       - uses: actions/checkout@v4
 

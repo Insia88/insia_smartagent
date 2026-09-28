@@ -112,6 +112,10 @@ def e2e(tmp_path_factory):
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "INSIA_ACCESS_TOKEN", "INSIA_PUBLIC_HOSTS", "INSIA_TRUST_PROXY",
                  "INSIA_MAX_LIVE_JOBS", "INSIA_MAX_MOCK_JOBS"):
         mp.delenv(name, raising=False)
+    # Playwright finds its downloaded browsers under the user's cache dir; pin it before HOME moves.
+    if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+        mp.setenv("PLAYWRIGHT_BROWSERS_PATH", str(Path(cache) / "ms-playwright"))
     mp.setenv("HOME", str(root))
     mp.setenv("INSIA_RENDER", "0")  # carousel zip → slides.html (no second browser inside the server)
     base = Settings.from_env(env={}, mode="mock", speed=0.0)
