@@ -65,6 +65,10 @@ class Settings:
     web_fetch_max_uses: int = 10
     max_continuations: int = 5  # pause_turn resumes per call
     max_workers: int = 4  # live mode: channels in parallel
+    home: Path = Path("workspace")  # workspace (SQLite db, exports, uploads, logs); env INSIA_HOME
+    max_cost_usd: float = 0.0  # per-run budget cap in USD (0 = no cap); env INSIA_MAX_COST_USD
+    max_document_chars: int = 60_000  # user materials sent to the model per run; env INSIA_MAX_DOCUMENT_CHARS
+    use_profile: bool = True  # include the workspace company profile in prompts
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None, **overrides: object) -> "Settings":
@@ -87,6 +91,15 @@ class Settings:
         )
         if env.get("INSIA_OUT_DIR"):
             base = replace(base, out_dir=Path(env["INSIA_OUT_DIR"]))
+        if (env.get("INSIA_HOME") or "").strip():
+            base = replace(base, home=Path(env["INSIA_HOME"].strip()).expanduser())
+        for key, attr, cast in (("INSIA_MAX_COST_USD", "max_cost_usd", float), ("INSIA_MAX_DOCUMENT_CHARS", "max_document_chars", int)):
+            raw = (env.get(key) or "").strip()
+            if raw:
+                try:
+                    base = replace(base, **{attr: cast(raw)})
+                except ValueError as exc:
+                    raise ValueError(f"{key}={raw!r}: 숫자여야 해요") from exc
         clean = {k: v for k, v in overrides.items() if v is not None}
         settings = replace(base, **clean) if clean else base
         settings.validate()
@@ -107,6 +120,10 @@ class Settings:
             raise ValueError("pass_score는 0~100 사이여야 해요")
         if not 0 <= self.speed <= 100:
             raise ValueError("speed는 0~100 사이여야 해요 (1 = 실제 시간, 2 = 2배 빠르게, 0 = 기다리지 않음)")
+        if not (self.max_cost_usd >= 0 and self.max_cost_usd == self.max_cost_usd and self.max_cost_usd != float("inf")):
+            raise ValueError("max_cost_usd는 0 이상인 유한한 숫자여야 해요 (0 = 상한 없음)")
+        if not 0 <= self.max_document_chars <= 1_000_000:
+            raise ValueError("max_document_chars는 0~1,000,000 사이여야 해요")
 
 
 # Fallback copy of examples/sample-run/brief.json (used when the repo's
