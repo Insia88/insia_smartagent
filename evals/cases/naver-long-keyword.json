@@ -1,0 +1,62 @@
+{
+  "id": "naver-long-keyword",
+  "title": "네이버 블로그 — 긴 메인 키워드와 40자 제목",
+  "description": "메인 키워드가 긴 편(24자)이라 제목 40자 안에 키워드를 온전히 넣기 어려워요. 제목 길이·키워드, 소제목 3개, 이미지 자리 3개, 태그 5~10개를 지키고, 정책자금 금액·금리 같은 수치는 리서치 팩에 있는 것만 써야 해요.",
+  "source": "synthetic",
+  "tags": [
+    "naver_blog",
+    "title",
+    "policy"
+  ],
+  "brief": {
+    "topic": "소상공인 정책자금, 처음 신청하는 사장님을 위한 준비 순서",
+    "goal": "검색 유입과 이웃 추가",
+    "audience": "정책자금을 처음 알아보는 소상공인",
+    "channels": [
+      "naver_blog"
+    ],
+    "tone": "차근차근 설명하는 친절한 톤",
+    "keywords": [
+      "소상공인 정책자금 신청 방법 2026년 총정리",
+      "정책자금",
+      "소상공인"
+    ],
+    "notes": "",
+    "language": "ko"
+  },
+  "must": [
+    {
+      "type": "checks_pass",
+      "checks": [
+        "title_length",
+        "title_keyword",
+        "headings",
+        "images",
+        "tags",
+        "length"
+      ]
+    },
+    {
+      "type": "max_unsupported_numbers",
+      "value": 0,
+      "note": "지원 한도·금리는 공고 원문(리서치 팩)에 있는 값만"
+    }
+  ],
+  "should": [
+    {
+      "type": "min_citation_coverage",
+      "value": 0.7
+    },
+    {
+      "type": "min_score",
+      "value": 80
+    },
+    {
+      "type": "reviewer_passed"
+    },
+    {
+      "type": "max_rounds",
+      "value": 1
+    }
+  ]
+}

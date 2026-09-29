@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- BUILD:HEAD-START -->
+<title>INSIA 에이전트 스튜디오</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=Orbit&display=swap">
+<!-- BUILD:HEAD-END -->
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<!-- BUILD:BODY-START -->
+<a class="skip-link" href="#main">본문으로 건너뛰기</a>
+<div class="app" id="app" data-view="studio">
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true" focusable="false">
+        <path d="M20 8 L9 29 L31 29 Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2 3" opacity=".55"/>
+        <circle cx="20" cy="8" r="5.5" fill="#6D5EF5"/>
+        <circle cx="9" cy="29" r="5.5" fill="#14B8A6"/>
+        <circle cx="31" cy="29" r="5.5" fill="#FF7A59"/>
+      </svg>
+      <div class="brand-text">
+        <h1 class="brand-name"><span class="brand-word">INSIA</span> <span class="nowrap">에이전트 스튜디오</span></h1>
+        <p class="brand-sub">총괄 · 리서치 · 검수, 세 카피바라가 일하는 모습</p>
+      </div>
+      <span class="mode-badge" id="modeBadge" data-mode="demo" title="데모 재생">DEMO</span>
+    </div>
+
+    <nav class="appnav" id="appnav" aria-label="화면 이동">
+      <a href="#/studio" data-view="studio" aria-current="page">스튜디오</a>
+      <a href="#/library" data-view="library">보관함<span class="nav-count" id="navCountLibrary" hidden></span></a>
+      <a href="#/calendar" data-view="calendar">캘린더</a>
+      <a href="#/brand" data-view="brand">브랜드·자료</a>
+      <a href="#/usage" data-view="usage">사용량</a>
+    </nav>
+
+    <div class="top-actions">
+      <button type="button" class="btn btn--small btn--ghost" id="btnLogout" hidden>로그아웃</button>
+      <button type="button" class="icon-btn" id="btnTheme" aria-label="밝은 테마로 바꾸기" title="테마 바꾸기">
+        <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4.2" fill="currentColor"/><g stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6"/></g></svg>
+        <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z" fill="currentColor"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+  <section class="view view-studio" id="view-studio" data-view="studio" aria-labelledby="studioTitle">
+  <h2 class="sr-only" id="studioTitle" tabindex="-1">스튜디오</h2>
+  <div class="studio-bar">
+    <div class="transport" role="group" aria-label="재생 제어">
+      <button type="button" class="icon-btn" id="btnRestart" aria-label="처음부터 다시 재생" title="처음부터">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 12a8 8 0 1 0 2.4-5.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M4 3.5V8h4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button type="button" class="icon-btn icon-btn--play" id="btnPlay" aria-label="일시정지" title="재생/일시정지">
+        <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor"/><rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor"/></svg>
+        <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7 4.5v15l12-7.5z" fill="currentColor"/></svg>
+      </button>
+      <div class="speed" role="group" aria-label="재생 속도">
+        <button type="button" aria-pressed="false" data-speed="1">1×</button>
+        <button type="button" aria-pressed="true" data-speed="2">2×</button>
+        <button type="button" aria-pressed="false" data-speed="4">4×</button>
+      </div>
+      <div class="scrub">
+        <label class="sr-only" for="scrubber">재생 위치</label>
+        <input type="range" id="scrubber" min="0" max="1000" step="1" value="0">
+        <output class="scrub-time" id="timeLabel" for="scrubber">00:00 / 00:00</output>
+      </div>
+    </div>
+    <div class="studio-actions">
+      <button type="button" class="btn" id="btnRuns" hidden>실행 기록</button>
+      <button type="button" class="btn btn--primary" id="btnNewRun" hidden>새 실행</button>
+    </div>
+  </div>
+  <div class="job-banner" id="jobBanner" role="status" hidden></div>
+  <div class="job-banner run-bar" id="runBar" role="status" aria-label="지금 무대의 실행" hidden></div>
+
+  <section class="summary" id="summary" aria-label="실행 요약">
+    <div class="summary-brief">
+      <p class="eyebrow"><span id="sourceTag" class="source-tag">불러오는 중</span></p>
+      <p class="summary-topic" id="summaryTopic">기록을 불러오는 중이에요</p>
+      <p class="summary-meta" id="summaryMeta"></p>
+    </div>
+    <div class="summary-live" id="summaryLive" hidden>
+      <p class="summary-live-text">서버에 연결됐어요. 브리프를 넣으면 실제 에이전트가 작업을 시작해요.</p>
+      <button type="button" class="btn btn--primary" id="btnOpenBrief">브리프 입력</button>
+    </div>
+    <div class="summary-progress" id="summaryProgress"></div>
+    <div class="summary-results" id="summaryResults" hidden></div>
+  </section>
+
+  <div class="layout">
+    <section class="col-stage" id="stage" aria-label="에이전트 무대" tabindex="-1">
+      <div class="monitor" id="monitor">
+        <div class="monitor-hud">
+          <div class="hud-left">
+            <span class="hud-rec" id="hudRec" data-state="paused"><span class="hud-dot" aria-hidden="true"></span><span id="hudRecText">대기</span></span>
+            <span class="hud-clock" id="hudClock">00:00</span>
+          </div>
+          <ol class="phase" id="phase" aria-label="진행 단계">
+            <li data-phase="plan">기획</li>
+            <li data-phase="research">리서치</li>
+            <li data-phase="draft">작성</li>
+            <li data-phase="review">검수</li>
+            <li data-phase="done">완료</li>
+          </ol>
+        </div>
+        <div class="stage-field" id="stageField">
+          <!-- agents are rendered by app.js -->
+        </div>
+        <div class="rail" id="rail" aria-label="채널 산출물">
+          <!-- channel cards are rendered by app.js -->
+        </div>
+        <svg class="wires" id="wires" aria-hidden="true" focusable="false"></svg>
+        <svg class="packets" id="packets" aria-hidden="true" focusable="false"></svg>
+        <p class="credit" id="credit"></p>
+      </div>
+      <p class="sr-only" id="srStatus" aria-live="polite"></p>
+    </section>
+
+    <aside class="col-left" aria-label="계획과 리서치">
+      <div class="col-scroll">
+      <details class="panel plan-panel" id="planPanel" open>
+        <summary class="panel-head">
+          <h2 class="panel-title">작업 계획</h2>
+          <span class="panel-count" id="planCount">대기</span>
+        </summary>
+        <div class="panel-body" id="planBody">
+          <p class="empty">총괄 에이전트가 브리프를 읽고 계획을 세우면 여기에 정리돼요.</p>
+        </div>
+      </details>
+
+      <section class="panel research-panel" id="researchPanel" aria-labelledby="researchTitle">
+        <div class="panel-head">
+          <h2 class="panel-title" id="researchTitle">리서치 보드</h2>
+          <span class="panel-count" id="researchState">대기</span>
+        </div>
+        <div class="panel-body" id="researchBody">
+          <p class="empty">리서치 에이전트가 찾은 출처와 근거가 여기에 쌓여요.</p>
+        </div>
+      </section>
+      </div>
+    </aside>
+
+    <aside class="col-right" aria-label="작업 로그">
+      <section class="panel timeline-panel" aria-labelledby="timelineTitle">
+        <div class="panel-head">
+          <h2 class="panel-title" id="timelineTitle">작업 로그</h2>
+          <div class="seg" role="group" aria-label="로그 보기" data-role="log-filter">
+            <button type="button" aria-pressed="true" data-filter="all">전체</button>
+            <button type="button" aria-pressed="false" data-filter="key">핵심만</button>
+          </div>
+        </div>
+        <ol class="log" id="timeline" aria-live="polite" aria-relevant="additions"></ol>
+      </section>
+    </aside>
+  </div>
+  </section>
+
+  <section class="view" id="view-library" data-view="library" aria-labelledby="libraryTitle" hidden></section>
+  <section class="view" id="view-calendar" data-view="calendar" aria-labelledby="calendarTitle" hidden></section>
+  <section class="view" id="view-brand" data-view="brand" aria-labelledby="brandTitle" hidden></section>
+  <section class="view" id="view-usage" data-view="usage" aria-labelledby="usageTitle" hidden></section>
+  <section class="view" id="view-login" data-view="login" aria-labelledby="loginTitle" hidden></section>
+  </main>
+</div>
+<p class="toast" id="toast" role="status" aria-live="polite"></p>
+
+<dialog class="drawer" id="drawer" aria-labelledby="drawerTitle">
+  <div class="drawer-inner">
+    <header class="drawer-head">
+      <img class="drawer-icon" id="drawerIcon" alt="">
+      <div class="drawer-heading">
+        <p class="eyebrow" id="drawerEyebrow"></p>
+        <h2 class="drawer-title" id="drawerTitle">채널</h2>
+      </div>
+      <div class="drawer-score" id="drawerScore"></div>
+      <button type="button" class="icon-btn" id="drawerClose" aria-label="닫기">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+    <div class="tabs" role="tablist" aria-label="채널 상세">
+      <button type="button" role="tab" id="tab-content" aria-controls="pane-content" aria-selected="true">결과물</button>
+      <button type="button" role="tab" id="tab-review" aria-controls="pane-review" aria-selected="false" tabindex="-1">검수</button>
+      <button type="button" role="tab" id="tab-history" aria-controls="pane-history" aria-selected="false" tabindex="-1">라운드 이력</button>
+    </div>
+    <div class="drawer-body">
+      <section class="pane" id="pane-content" role="tabpanel" aria-labelledby="tab-content"></section>
+      <section class="pane" id="pane-review" role="tabpanel" aria-labelledby="tab-review" hidden></section>
+      <section class="pane" id="pane-history" role="tabpanel" aria-labelledby="tab-history" hidden></section>
+    </div>
+  </div>
+</dialog>
+
+<dialog class="sheet" id="briefDialog" aria-labelledby="briefTitle">
+  <form class="brief-form" id="briefForm" method="dialog" novalidate>
+    <header class="sheet-head">
+      <div>
+        <p class="eyebrow">LIVE 실행</p>
+        <h2 id="briefTitle">브리프 작성</h2>
+      </div>
+      <button type="button" class="icon-btn" id="briefClose" aria-label="닫기">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+    <div class="form-grid">
+      <label class="field field--wide" for="f-topic"><span>주제</span>
+        <input id="f-topic" name="topic" type="text" required autocomplete="off"></label>
+      <label class="field field--wide" for="f-goal"><span>목적</span>
+        <input id="f-goal" name="goal" type="text" autocomplete="off"></label>
+      <label class="field field--wide" for="f-audience"><span>대상 독자</span>
+        <input id="f-audience" name="audience" type="text" autocomplete="off"></label>
+      <fieldset class="field field--wide checks">
+        <legend>채널</legend>
+        <label for="f-ch-bizplan"><input id="f-ch-bizplan" type="checkbox" name="channels" value="bizplan" checked> 사업계획서</label>
+        <label for="f-ch-naver_blog"><input id="f-ch-naver_blog" type="checkbox" name="channels" value="naver_blog" checked> 네이버 블로그</label>
+        <label for="f-ch-linkedin"><input id="f-ch-linkedin" type="checkbox" name="channels" value="linkedin" checked> 링크드인</label>
+        <label for="f-ch-instagram"><input id="f-ch-instagram" type="checkbox" name="channels" value="instagram" checked> 인스타그램</label>
+      </fieldset>
+      <label class="field field--wide" for="f-keywords"><span>키워드 <small>쉼표로 구분, 첫 번째가 메인 키워드</small></span>
+        <input id="f-keywords" name="keywords" type="text" autocomplete="off"></label>
+      <label class="field field--wide" for="f-tone"><span>톤</span>
+        <input id="f-tone" name="tone" type="text" autocomplete="off"></label>
+      <label class="field field--wide" for="f-notes"><span>메모</span>
+        <textarea id="f-notes" name="notes" rows="3"></textarea></label>
+      <label class="field" for="f-mode"><span>실행 모드</span>
+        <select id="f-mode" name="mode">
+          <option value="">서버 기본값</option>
+          <option value="live">실제 API</option>
+          <option value="mock">모의 실행</option>
+        </select></label>
+      <label class="field" for="f-speed"><span>모의 실행 배속 <small>클수록 빨라요 · 0 = 대기 없음</small></span>
+        <input id="f-speed" name="speed" type="number" min="0" max="20" step="0.5" value="4"></label>
+      <label class="field" for="f-rounds"><span>최대 수정 횟수</span>
+        <input id="f-rounds" name="max_rounds" type="number" min="0" max="4" step="1" value="2"></label>
+      <label class="field" for="f-pass"><span>통과 점수</span>
+        <input id="f-pass" name="pass_score" type="number" min="50" max="100" step="1" value="80"></label>
+    </div>
+    <p class="brief-note" id="briefProfileNote" hidden>회사 프로필이 아직 다 채워지지 않았어요. <a href="#/brand" id="briefProfileLink">브랜드·자료</a>에서 회사·고객·팀·톤을 적어 두면 모든 초안이 같은 사실과 브랜드 규칙을 따라요.</p>
+    <p class="form-error" id="briefError" role="alert" hidden></p>
+    <footer class="sheet-foot">
+      <button type="button" class="btn" id="briefCancel">취소</button>
+      <button type="submit" class="btn btn--primary" id="briefSubmit">실행 시작</button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog class="sheet sheet--model" id="modelDialog" aria-labelledby="modelTitle">
+  <header class="sheet-head">
+    <div>
+      <p class="eyebrow">3D 모델</p>
+      <h2 id="modelTitle">3D로 보기</h2>
+    </div>
+    <button type="button" class="icon-btn" id="modelClose" aria-label="닫기">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+  </header>
+  <div class="model-host" id="modelHost"></div>
+  <p class="model-hint">드래그해서 돌려 보고, 스크롤하거나 두 손가락으로 확대할 수 있어요.</p>
+</dialog>
+<!-- BUILD:BODY-END -->
+<script src="app.js"></script>
+<script src="js/core.js"></script>
+<script src="js/publish.js"></script>
+<script src="js/library.js"></script>
+<script src="js/calendar.js"></script>
+<script src="js/brand.js"></script>
+<script src="js/usage.js"></script>
+<script src="js/runs.js"></script>
+<script src="js/shell.js"></script>
+</body>
+</html>

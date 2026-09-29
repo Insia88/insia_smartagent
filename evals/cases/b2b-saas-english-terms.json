@@ -1,0 +1,117 @@
+{
+  "id": "b2b-saas-english-terms",
+  "title": "B2B SaaS · 영어 용어 섞인 주제 — 링크드인 본문 링크 금지",
+  "description": "MES, OEE, ERP 같은 영어 용어가 섞인 B2B SaaS 주제예요. 네이버 블로그 제목에 메인 키워드(MES)를 넣고, 링크드인은 프로필의 데모 신청 링크를 본문에 붙이지 않고 첫 댓글로 돌려야 해요(링크 규칙). mock 템플릿은 프로필 CTA를 본문에 그대로 붙여서 링크 검사는 live에서만 필수로 봐요.",
+  "source": "synthetic",
+  "tags": [
+    "linkedin",
+    "naver_blog",
+    "b2b-saas",
+    "english-terms",
+    "profile"
+  ],
+  "brief": {
+    "topic": "중소 제조사를 위한 MES SaaS 'FactoryOS' — ERP 연동과 OEE 대시보드",
+    "goal": "공장장·생산관리 담당자에게 도입 검토 계기 만들기",
+    "audience": "직원 50~300명 규모 제조사의 생산관리 팀장",
+    "channels": [
+      "linkedin",
+      "naver_blog"
+    ],
+    "tone": "실무자끼리 이야기하듯 담백하게, 용어는 처음에 한 번 풀어서",
+    "keywords": [
+      "MES",
+      "스마트팩토리",
+      "OEE"
+    ],
+    "notes": "데모 신청 페이지 링크를 꼭 넣어 주세요.",
+    "language": "ko"
+  },
+  "profile": {
+    "company_name": "팩토리오에스",
+    "service_name": "FactoryOS",
+    "one_liner": "엑셀로 관리하던 생산 실적을 태블릿 입력과 OEE 대시보드로 바꾸는 클라우드 MES",
+    "industry": "제조 SaaS",
+    "target_customers": "중소·중견 제조사 생산관리팀",
+    "differentiators": [
+      "ERP 양방향 연동",
+      "설비 없이 태블릿으로 시작"
+    ],
+    "cta": "데모 신청: https://factoryos.example.com/demo",
+    "contact": "hello@factoryos.example.com",
+    "linkedin_url": "https://www.linkedin.com/company/factoryos-example"
+  },
+  "must": [
+    {
+      "type": "checks_pass",
+      "channels": [
+        "linkedin"
+      ],
+      "checks": [
+        "no_link"
+      ],
+      "modes": [
+        "live"
+      ],
+      "note": "링크는 본문이 아니라 첫 댓글로 (채널 가이드)"
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "linkedin"
+      ],
+      "checks": [
+        "hook_length",
+        "hashtags"
+      ]
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "naver_blog"
+      ],
+      "checks": [
+        "title_length",
+        "title_keyword",
+        "headings",
+        "images",
+        "tags"
+      ]
+    },
+    {
+      "type": "contains",
+      "channels": [
+        "naver_blog"
+      ],
+      "values": [
+        "MES"
+      ],
+      "note": "영어 메인 키워드를 한글로 바꾸지 않아요"
+    },
+    {
+      "type": "max_unsupported_numbers",
+      "value": 0,
+      "note": "생산성 향상률 같은 수치를 지어내지 않아요"
+    }
+  ],
+  "should": [
+    {
+      "type": "all_checks_pass"
+    },
+    {
+      "type": "min_citation_coverage",
+      "value": 0.6
+    },
+    {
+      "type": "min_score",
+      "value": 80
+    },
+    {
+      "type": "reviewer_passed"
+    },
+    {
+      "type": "max_rounds",
+      "value": 1
+    }
+  ]
+}

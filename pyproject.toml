@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "insia-smartagent"
+dynamic = ["version"]
+description = "총괄·리서치·검수 AI 에이전트가 사업계획서와 네이버 블로그·링크드인·인스타그램 콘텐츠를 만드는 파이프라인"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "INSIA" }]
+keywords = ["claude", "anthropic", "agents", "content", "korean"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Natural Language :: Korean",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "anthropic>=1.0",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+export = ["python-docx>=1.1"]
+render = ["playwright>=1.40"]
+docs = ["pypdf>=4.0", "python-docx>=1.1", "PyYAML>=6.0"]  # insia docs add (pdf/docx), profile import (yaml)
+
+[project.scripts]
+insia = "insia_agents.cli:main"
+
+[tool.hatch.version]
+path = "src/insia_agents/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/insia_agents"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/insia_agents", "tests", "docs", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

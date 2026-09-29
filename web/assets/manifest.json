@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "credit": "3D 캐릭터·아이콘·모션: Higgsfield (gpt_image_2_5 이미지, seedance_2_5 모션, image_to_3d 메시)",
+  "agents": {
+    "orchestrator": {
+      "name": "총괄 에이전트",
+      "en": "Orchestrator",
+      "nickname": "유자 디렉터",
+      "color": "#6D5EF5",
+      "image": "agents/orchestrator.webp",
+      "cutout": "agents/orchestrator-cutout.webp",
+      "video": "agents/orchestrator-loop.mp4",
+      "model": "models/orchestrator.glb"
+    },
+    "researcher": {
+      "name": "리서치 에이전트",
+      "en": "Researcher",
+      "nickname": "돋보기 탐험가",
+      "color": "#14B8A6",
+      "image": "agents/researcher.webp",
+      "cutout": "agents/researcher-cutout.webp",
+      "video": "agents/researcher-loop.mp4",
+      "model": "models/researcher.glb"
+    },
+    "reviewer": {
+      "name": "검수 에이전트",
+      "en": "Reviewer",
+      "nickname": "꼼꼼 검수관",
+      "color": "#FF7A59",
+      "image": "agents/reviewer.webp",
+      "cutout": "agents/reviewer-cutout.webp",
+      "video": "agents/reviewer-loop.mp4",
+      "model": "models/reviewer.glb"
+    }
+  },
+  "hero": {
+    "image": "hero/team.webp",
+    "video": "hero/team-loop.mp4",
+    "studio": "hero/studio.webp"
+  },
+  "channels": {
+    "bizplan": {
+      "name": "사업계획서",
+      "icon": "channels/bizplan.webp",
+      "color": "#3B5BDB"
+    },
+    "naver_blog": {
+      "name": "네이버 블로그",
+      "icon": "channels/naver_blog.webp",
+      "color": "#03C75A"
+    },
+    "linkedin": {
+      "name": "링크드인",
+      "icon": "channels/linkedin.webp",
+      "color": "#0A66C2"
+    },
+    "instagram": {
+      "name": "인스타그램",
+      "icon": "channels/instagram.webp",
+      "color": "#E1306C"
+    }
+  }
+}

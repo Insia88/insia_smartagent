@@ -1,0 +1,151 @@
+{
+  "id": "sample-insia-all",
+  "title": "샘플 브리프 — 네 채널 원 소스 멀티 유즈",
+  "description": "저장소의 샘플 브리프(examples/sample-run) 그대로예요. mock에서는 실제로 돌린 녹화 실행을 채점해서, 결정적 검사가 진짜 출력에서 어떻게 나오는지 보여 줘요. 네 채널 형식, SNS의 근거 없는 수치 0개, 사업계획서 팀 자리표시, 과장 표현 금지를 봐요.",
+  "source": "sample-run",
+  "tags": [
+    "sample",
+    "all-channels",
+    "no-profile"
+  ],
+  "brief": {
+    "topic": "1인 창업자·소상공인을 위한 AI 콘텐츠 에이전트 서비스 'INSIA 스마트에이전트'",
+    "goal": "예비창업패키지 등 정부 창업지원사업 신청용 사업계획서 초안 작성과 서비스 런칭 홍보 콘텐츠(네이버 블로그·링크드인·인스타그램) 제작",
+    "audience": "콘텐츠 마케팅을 혼자 해야 하는 1인 창업자, 소상공인, 초기 스타트업 대표",
+    "channels": [
+      "bizplan",
+      "naver_blog",
+      "linkedin",
+      "instagram"
+    ],
+    "tone": "신뢰감 있고 친근한 전문가 톤. 과장·확정적 표현 금지, 수치는 반드시 출처와 기준 시점 표기",
+    "keywords": [
+      "AI 마케팅 자동화",
+      "1인 창업",
+      "사업계획서",
+      "SNS 운영",
+      "AI 에이전트"
+    ],
+    "notes": "리서치·총괄·검수 3개 AI 에이전트가 협업해 사업계획서와 채널별 콘텐츠를 만들고 사람이 최종 승인하는 구조. 팀 정보는 [대표자 성명] 같은 자리표시로 남길 것. 가격은 월 구독형(예: 베이직/프로) 가정으로 제안하되 가정임을 명시.",
+    "language": "ko"
+  },
+  "must": [
+    {
+      "type": "checks_pass",
+      "channels": [
+        "bizplan"
+      ],
+      "checks": [
+        "length",
+        "psst_문제인식",
+        "psst_실현가능성",
+        "psst_성장전략",
+        "psst_팀구성"
+      ],
+      "note": "예비창업패키지 평가지표 4개 섹션과 분량"
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "naver_blog"
+      ],
+      "checks": [
+        "title_length",
+        "title_keyword",
+        "headings",
+        "images",
+        "tags"
+      ]
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "linkedin"
+      ],
+      "checks": [
+        "hook_length",
+        "hashtags",
+        "no_link"
+      ]
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "instagram"
+      ],
+      "checks": [
+        "slides",
+        "caption_length",
+        "hook_length",
+        "hashtags"
+      ]
+    },
+    {
+      "type": "max_unsupported_numbers",
+      "channels": [
+        "naver_blog",
+        "linkedin",
+        "instagram"
+      ],
+      "value": 0,
+      "note": "SNS 글의 수치는 모두 리서치 팩에 있어야 해요"
+    },
+    {
+      "type": "min_placeholders",
+      "channels": [
+        "bizplan"
+      ],
+      "value": 1,
+      "note": "팀 정보는 [대표자 성명] 같은 자리표시로 (브리프 요청)"
+    },
+    {
+      "type": "not_contains",
+      "values": [
+        "업계 최초",
+        "국내 최초",
+        "업계 유일"
+      ],
+      "note": "브리프 톤: 과장·확정 표현 금지"
+    }
+  ],
+  "should": [
+    {
+      "type": "max_unsupported_numbers",
+      "channels": [
+        "bizplan"
+      ],
+      "value": 3,
+      "note": "사업비 단가 같은 값은 '가정' 표시가 필요해요"
+    },
+    {
+      "type": "all_checks_pass"
+    },
+    {
+      "type": "min_citation_coverage",
+      "value": 0.6
+    },
+    {
+      "type": "min_score",
+      "value": 80
+    },
+    {
+      "type": "reviewer_passed"
+    },
+    {
+      "type": "max_rounds",
+      "value": 1
+    },
+    {
+      "type": "max_critical_issues",
+      "value": 0
+    },
+    {
+      "type": "max_cost_usd",
+      "value": 25,
+      "modes": [
+        "live"
+      ],
+      "note": "네 채널 한 번에 이 정도를 넘으면 원인을 봐요"
+    }
+  ]
+}

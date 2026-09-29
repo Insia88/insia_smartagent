@@ -1,0 +1,111 @@
+{
+  "id": "pricing-assumption",
+  "title": "가격은 가정으로 — 사업계획서·블로그",
+  "description": "가격이 아직 확정되지 않았어요(프로필에 '가정'). 사업계획서와 블로그에 금액을 쓸 때 리서치 팩에 없는 금액(우리 가격, 목표 매출, 사업비 단가)은 모두 '가정'이라고 밝혀야 해요. 확정 가격처럼 쓰면 실패예요.",
+  "source": "synthetic",
+  "tags": [
+    "bizplan",
+    "naver_blog",
+    "pricing",
+    "profile"
+  ],
+  "brief": {
+    "topic": "1인 세무·회계 사무소를 위한 고객 자료 수집 챗봇 '서류콕'",
+    "goal": "예비창업패키지 사업계획서 초안과 서비스 소개 블로그 글",
+    "audience": "혼자 운영하는 세무사·회계사 사무소",
+    "channels": [
+      "bizplan",
+      "naver_blog"
+    ],
+    "tone": "신뢰감 있고 차분하게",
+    "keywords": [
+      "세무사 사무소 자동화",
+      "자료 수집",
+      "챗봇"
+    ],
+    "notes": "가격은 베이직 월 19,000원, 프로 월 39,000원으로 생각 중인데 아직 확정은 아니에요.",
+    "language": "ko"
+  },
+  "profile": {
+    "company_name": "서류콕",
+    "service_name": "서류콕",
+    "one_liner": "세무 사무소 대신 고객에게 필요한 서류를 챙겨 받는 카카오톡 챗봇",
+    "stage": "예비창업",
+    "target_customers": "직원 3명 이하 세무·회계 사무소",
+    "business_model": "사무소 단위 월 구독",
+    "pricing": "베이직 월 19,000원, 프로 월 39,000원 (가정, 시장 검증 전)",
+    "team": [
+      {
+        "role": "대표",
+        "name": "",
+        "background": "세무 사무소 실무 7년"
+      }
+    ]
+  },
+  "must": [
+    {
+      "type": "assumption_marked",
+      "units": [
+        "원"
+      ],
+      "markers": [
+        "가정"
+      ],
+      "note": "리서치에 없는 금액은 문장(표는 그 행, 바로 뒤 ※ 줄)에 '가정'이 있어야 해요"
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "bizplan"
+      ],
+      "checks": [
+        "length",
+        "psst_문제인식",
+        "psst_실현가능성",
+        "psst_성장전략",
+        "psst_팀구성",
+        "blind_names"
+      ]
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "naver_blog"
+      ],
+      "checks": [
+        "title_length",
+        "title_keyword",
+        "headings",
+        "images",
+        "tags"
+      ]
+    }
+  ],
+  "should": [
+    {
+      "type": "max_unsupported_numbers",
+      "channels": [
+        "naver_blog"
+      ],
+      "value": 0
+    },
+    {
+      "type": "max_unsupported_numbers",
+      "channels": [
+        "bizplan"
+      ],
+      "value": 5
+    },
+    {
+      "type": "min_score",
+      "value": 80
+    },
+    {
+      "type": "reviewer_passed"
+    },
+    {
+      "type": "max_critical_issues",
+      "value": 0
+    }
+  ]
+}
