@@ -7,7 +7,8 @@ Commands (grouped the way the weekly routine uses them)::
     library       items list|show|approve|schedule|publish|archive|restore|export · review · revise
     runs          run · resume · runs list|show|export · usage
     Claude Code   import-run <folder> · check <draft.json>
-    server        serve · healthcheck · sample-brief
+    server        serve · healthcheck · sample-brief · backup
+    API 게시      publish status|setup|connect|disconnect|preview|send|attempts|resolve|refresh
 
 Every workspace command uses ``Settings.home`` (env ``INSIA_HOME`` or
 ``--home``). ``--json`` prints machine-readable JSON only (for scripts and the
@@ -17,8 +18,12 @@ Exit codes: 0 = ok (``run-due`` with nothing due included), 1 = the operation
 failed (not found, approval blocked, run error, failed format check),
 2 = usage error (bad option or input file), 130 = interrupted (Ctrl+C).
 
-Nothing here publishes anywhere: ``items publish`` only records that a human
-posted the item (and where).
+Nothing publishes by itself: ``items publish`` only records that a human
+posted the item (and where). ``publish send`` posts one approved LinkedIn /
+Instagram item through the API only on a terminal, after the person typed the
+random confirm code shown with the exact preview (no ``--yes``, no schedule;
+``run-due``/``plan-week``/``calendar`` never publish). Only the ``cmd_publish_*``
+/ ``_publish_*`` functions import ``insia_agents.publishers``.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ import threading
 import traceback
 import typing
 import unicodedata
+import urllib.parse
 from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -969,6 +975,9 @@ def cmd_items_approve(args: argparse.Namespace) -> int:
         score = f"{item.approved_score}점" if item.approved_score is not None else "검수 전"
         print(f"  강제 승인으로 기록했어요: 검수를 통과하지 않은 v{item.approved_version}({score})을 사람이 직접 확인하고 승인했어요.")
     print(f"다음: insia items export {item_id}  →  직접 게시  →  insia items publish {item_id} --url <게시 주소>")
+    if item.channel in ("linkedin", "instagram"):
+        print("  또는 대시보드의 ‘API로 게시’ (터미널에서는 insia publish send "
+              f"{item_id}{' --ai-label yes|no' if item.channel == 'instagram' else ''})")
     return 0
 
 
@@ -980,7 +989,8 @@ def cmd_items_schedule(args: argparse.Namespace) -> int:
         item = ws.set_item_status(item_id, "scheduled", scheduled_at=day)
     print(f"게시 예정으로 표시했어요: {item.scheduled_at}({_weekday(item.scheduled_at[:10])}) · "
           f"{channel_label(item.channel)} · {item.title}")
-    print("INSIA는 자동으로 게시하지 않아요. 그날 직접 올린 뒤 'insia items publish'로 표시해 주세요.")
+    print("INSIA는 예정일에 자동으로 게시하지 않아요. 그날 직접 올리거나 대시보드의 ‘API로 게시’를 눌러 주세요. "
+          "직접 올렸다면 'insia items publish'로 표시해 주세요.")
     return 0
 
 
@@ -1747,6 +1757,738 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# publish (LinkedIn / Instagram API publishing — only after a person confirms, one post at a time)
+# ---------------------------------------------------------------------------
+# Only the cmd_publish_* / _publish_* functions below import insia_agents.publishers (AST guard:
+# tests/test_no_autopublish_surface.py). ``send`` runs only on a terminal and asks for a random code that
+# exists nowhere but on that terminal; there is no --yes and no scheduling option anywhere.
+
+PUBLISH_NOT_TTY_MESSAGE = ("insia publish send는 사람이 터미널에서 직접 확인할 때만 돌아요. 예약·스크립트·cron에서는 쓸 수 없어요 "
+                           "(LinkedIn API 약관이 자동 게시를 금지해요).")
+PUBLISH_RESOLVE_NOT_TTY_MESSAGE = ("insia publish resolve --published/--not-published는 사람이 터미널에서 직접 확인할 때만 돌아요. "
+                                   "(--check는 스크립트에서도 돼요)")
+PUBLISH_STATE_LABELS = {"disabled": "꺼짐", "not_configured": "설정 안 함", "not_connected": "연결 안 됨",
+                        "connected": "연결됨", "expiring": "곧 만료", "needs_reconnect": "다시 연결 필요",
+                        "unavailable": "지금 쓸 수 없음"}
+PUBLISH_ATTEMPT_LABELS = {"sending": "게시 중", "published": "게시됨", "failed": "실패", "unknown": "확인 필요",
+                          "abandoned": "안 올라감(정리)"}
+PUBLISH_STEP_LABELS = {"check": "연결 확인", "polling": "인스타그램이 이미지를 처리하는 중", "carousel": "캐러셀 만들기",
+                       "write": "게시 요청 보내는 중", "permalink": "게시물 주소 받는 중"}
+PUBLISH_CALLBACK_TIMEOUT = 600.0  # the one-time LinkedIn callback listener waits 10 minutes (the state's lifetime)
+
+
+def _publish_redact(text: str) -> str:
+    """Text for the terminal with registered secret values and secret-looking parameters masked."""
+    from .publishers.redact import redact
+
+    return redact(str(text))
+
+
+def _publish_errors(func: Any) -> Any:
+    """Publishing errors → a Korean line (secrets masked) and the error's exit code (1 failed, 2 wrong use)."""
+    import functools
+
+    @functools.wraps(func)
+    def wrapper(args: argparse.Namespace) -> int:
+        from .db import WorkspaceError
+        from .publishers import PublishError
+
+        try:
+            return func(args)
+        except PublishError as exc:
+            print(f"오류: {_publish_redact(str(exc))}", file=sys.stderr)
+            return int(exc.exit_code)
+        except (UsageError, CommandError):
+            raise
+        except WorkspaceError as exc:
+            print(f"오류: {_publish_redact(str(exc))}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - no traceback (it could carry a token), a masked message instead
+            print(f"오류: 예상하지 못한 문제가 생겼어요 — {type(exc).__name__}: {_publish_redact(str(exc))}", file=sys.stderr)
+            if os.environ.get("INSIA_DEBUG"):
+                print(_publish_redact(traceback.format_exc()), file=sys.stderr)
+            return 1
+
+    return wrapper
+
+
+def _env_port() -> int | None:
+    """``INSIA_PORT`` when it is a usable port number (the port the container's server and healthcheck use)."""
+    raw = (os.environ.get("INSIA_PORT") or "").strip()
+    return int(raw) if raw.isdigit() and 0 < int(raw) < 65536 else None
+
+
+def _publish_server_values() -> dict[str, Any]:
+    """The server's own publishing values, read from the environment exactly as ``server.make_server`` reads it
+    (``server.env_public_hosts``, ``server.env_flag``) plus ``INSIA_PORT``: the public hosts and the proxy flag
+    decide the default LinkedIn redirect URI and the Instagram media mode, so a CLI command must see the same ones
+    as a server started from that environment. An invalid ``INSIA_PUBLIC_HOSTS`` stops the command, as it stops
+    the server."""
+    from . import server as server_module
+
+    try:
+        hosts = server_module.env_public_hosts()
+    except ValueError as exc:  # ServerConfigError: the server would not start with this value either
+        raise CommandError(f"INSIA_PUBLIC_HOSTS 환경 변수를 확인해 주세요. {exc}") from None
+    values: dict[str, Any] = {"public_hosts": hosts, "trust_proxy": server_module.env_flag("INSIA_TRUST_PROXY")}
+    port = _env_port()
+    if port is not None:
+        values["server_port"] = port
+    return values
+
+
+def _publish_service(settings: Settings, ws: "Workspace", **kwargs: Any) -> Any:
+    """The command's ``PublishService`` (environment + workspace). Tests replace this function.
+
+    The server's own values (``_publish_server_values``) come from the same environment the server reads, so the
+    CLI derives the same default LinkedIn redirect URI and media mode as a server started from that environment
+    (e.g. ``docker compose exec insia insia publish connect linkedin --paste``)."""
+    from .publishers import PublishService
+
+    for key, value in _publish_server_values().items():
+        kwargs.setdefault(key, value)
+    return PublishService.from_env(ws, **kwargs)
+
+
+def _publish_requester() -> str:
+    """``cli:<user>@<host>`` for the attempt record."""
+    import getpass
+    import socket
+
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 - no login name (containers)
+        user = "user"
+    host = socket.gethostname() or "localhost"
+    return re.sub(r"\s+", "_", f"cli:{user}@{host}")[:200]
+
+
+def _publish_is_tty() -> bool:
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+@contextmanager
+def _publish_session(args: argparse.Namespace, *, recover: bool = True) -> Iterator[tuple[Settings, "Workspace", Any]]:
+    """Workspace + service for one ``publish`` command: refuses when publishing is off (exit 1) and first closes
+    attempts a dead process left ``sending`` (the server does this every minute; the CLI at each command)."""
+    settings = _settings_from_args(args)
+    with open_workspace(settings) as ws:
+        service = _publish_service(settings, ws)
+        try:
+            if not service.settings.enabled:
+                raise CommandError(service.settings.disabled_reason or "API 게시가 꺼져 있어요 (INSIA_PUBLISH=0).")
+            if recover:
+                recovered = service.recover()
+                if recovered:
+                    _warn(f"주인이 사라진 게시 시도 {len(recovered)}개를 정리했어요 (insia publish attempts로 확인).")
+            yield settings, ws, service
+        finally:
+            try:
+                service.shutdown(timeout=5.0)
+            except Exception:  # noqa: BLE001 - closing must not hide the command's own result
+                pass
+
+
+def _publish_label(platform: str) -> str:
+    from .publishers import platform_label
+
+    return platform_label(platform)
+
+
+def _publish_options(args: argparse.Namespace, detail: ContentItemDetail) -> tuple[str, dict[str, Any]]:
+    """``(platform, options)`` for ``preview`` / ``send``. Instagram needs ``--ai-label yes|no`` (no default,
+    DESIGN.md 14.2); ``--visibility`` is LinkedIn only. Wrong combinations are usage errors (exit 2)."""
+    from .publishers import channel_platform, parse_preview_options
+
+    platform = args.platform or channel_platform(detail.item.channel)
+    if platform is None:
+        raise CommandError(f"{channel_label(detail.item.channel)}은(는) API로 게시하지 않아요. 'insia items export'로 "
+                           "파일을 받아 직접 올린 뒤 'insia items publish'로 표시해 주세요.")
+    if platform == "instagram":
+        if args.visibility:
+            raise UsageError("--visibility는 LinkedIn에서만 써요.")
+        if args.ai_label is None:
+            raise UsageError("인스타그램은 'AI 정보' 라벨을 붙일지 게시마다 꼭 골라야 해요: --ai-label yes (붙여요) 또는 "
+                             "--ai-label no (붙이지 않아요)")
+        raw: dict[str, Any] = {"is_ai_generated": args.ai_label == "yes"}
+    else:
+        if args.ai_label is not None:
+            raise UsageError("--ai-label은 인스타그램에서만 써요.")
+        raw = {"visibility": args.visibility} if args.visibility else {}
+    return platform, parse_preview_options(platform, raw).to_json()
+
+
+def _publish_print_preview(result: Any) -> None:
+    """The preview as the person must see it before confirming (DESIGN.md 8-3)."""
+    from .publishers.base import VISIBILITY_LABELS
+
+    label = _publish_label(result.platform)
+    account, item, content = result.account or {}, result.item or {}, result.content or {}
+    options = content.get("options") or {}
+    print(f"{label}에 게시하기 전에 확인해 주세요")
+    who = account.get("name") or account.get("id_hint") or "(이름을 받지 못했어요)"
+    line = f"  계정: {who}" + (f" ({account['kind']})" if account.get("kind") else "")
+    if result.platform == "linkedin":
+        line += f"   공개 범위: {VISIBILITY_LABELS.get(options.get('visibility', 'PUBLIC'), options.get('visibility', ''))}"
+    elif "is_ai_generated" in options:
+        line += "   AI 정보 라벨: " + ("붙여요" if options["is_ai_generated"] else "붙이지 않아요")
+    print(line)
+    score = item.get("approved_score")
+    verdict = "강제 승인(검수 미통과)" if item.get("approval_forced") else "승인"
+    print(f"  콘텐츠: v{item.get('version', '?')} · {item.get('title', '')} · {verdict}"
+          + (f" · 검수 {score}점" if score is not None else ""))
+    chars, limit = content.get("chars"), content.get("limit")
+    size = f" ({chars:,} / {limit:,}자)" if isinstance(chars, int) and isinstance(limit, int) else ""
+    print(f"---------- {'캡션' if result.platform == 'instagram' else '게시될 글'}{size} ----------")
+    print(content.get("text", ""))
+    print("---------- 끝 ----------")
+    if result.slides:
+        print(f"슬라이드 {len(result.slides)}장 (보낼 JPEG 그대로)")
+        for slide in result.slides:
+            alt = str(slide.get("alt") or "(대체텍스트 없음)")
+            kb = f"{int(slide.get('bytes') or 0) / 1024:,.0f}KB"
+            print(f"  {slide.get('n')}. {slide.get('width')}×{slide.get('height')} · {kb} · {_fit(alt, 60)}")
+    for title, issues in (("고칠 부분", result.errors), ("확인할 부분", result.warnings)):
+        if issues:
+            print(title)
+            for issue in issues:
+                print(f"  - {issue.message}")
+    if result.notices:
+        print("알아 두세요")
+        for notice in result.notices:
+            print(f"  - {notice.get('message', '')}")
+    if result.first_comment_link:
+        print(f"첫 댓글로 달 링크(게시한 뒤 직접): {result.first_comment_link}")
+
+
+def _publish_step_printer(platform: str) -> Any:
+    def on_step(step: str) -> None:
+        text = str(step or "")
+        match = re.match(r"^children (\d+)/(\d+)$", text)
+        shown = f"이미지 등록 {match.group(1)}/{match.group(2)}" if match else PUBLISH_STEP_LABELS.get(text, text)
+        print(f"  · {shown}", flush=True)
+
+    return on_step
+
+
+def _publish_print_outcome(attempt: Any, label: str, *, first_comment_link: str = "") -> int:
+    """Print a finished attempt; the exit code (0 published, 1 failed or unknown)."""
+    if attempt.status == "published":
+        if attempt.permalink:
+            print(f"게시했어요: {attempt.permalink}")
+            if attempt.platform == "linkedin":
+                print("  (링크가 열리지 않으면 LinkedIn 내 활동에서 확인해 주세요)")
+        else:
+            print("게시했어요. 게시물 주소를 받지 못했어요. 게시물 주소를 알면 대시보드의 게시 기록에서 넣어 주세요(선택).")
+        problem = (attempt.state or {}).get("item_update_error")
+        if problem:
+            print(f"  {problem}")
+        if first_comment_link:
+            print(f"  이제 첫 댓글로 링크를 달아 주세요: {first_comment_link}")
+        return 0
+    if attempt.status == "unknown":
+        print(f"게시됐는지 확인하지 못했어요: {attempt.error}", file=sys.stderr)
+        extra = f" · 인스타그램에서 다시 확인: insia publish resolve {attempt.id} --check" if attempt.platform == "instagram" else ""
+        print(f"  {label}에서 확인한 뒤 정리해 주세요: insia publish resolve {attempt.id} --published [--url 주소] 또는 "
+              f"--not-published{extra}", file=sys.stderr)
+        return 1
+    if attempt.status == "failed":
+        reason = attempt.error or "이유를 받지 못했어요."
+        tail = "" if "올라가지 않았" in reason or "올리지 않았" in reason else " 아무것도 올라가지 않았어요."
+        print(f"게시하지 못했어요: {reason}{tail}", file=sys.stderr)
+        return 1
+    print(f"게시 기록 {attempt.id}: {PUBLISH_ATTEMPT_LABELS.get(attempt.status, attempt.status)} "
+          "(insia publish attempts로 확인해 주세요)", file=sys.stderr)
+    return 1
+
+
+@_publish_errors
+def cmd_publish_status(args: argparse.Namespace) -> int:
+    with _publish_session(args) as (_settings, _ws, service):
+        data = service.status(check=args.check)
+    if args.json:
+        _print_json(data)
+        return 0
+    print("API 게시: " + ("켜짐" if data.get("enabled") else "꺼짐")
+          + (" · 가짜 게시 모드(테스트용): 실제로 올라가지 않아요" if data.get("fake") else ""))
+    if not data.get("configured"):
+        print("  아직 설정하지 않았어요. 시작하려면: insia publish setup linkedin (자세한 안내: docs/operations.md)")
+    for platform, block in (data.get("platforms") or {}).items():
+        state = PUBLISH_STATE_LABELS.get(block.get("state", ""), block.get("state", ""))
+        print(f"- {block.get('label') or _publish_label(platform)}: {state}"
+              + (f" · {block['reason']}" if block.get("reason") else ""))
+        account = block.get("account") or {}
+        who = account.get("name") or account.get("username") or account.get("id_hint")
+        if who:
+            print(f"    계정: {who}" + (f" ({account['kind']})" if account.get("kind") else ""))
+        token = block.get("token") or {}
+        if token.get("expires_at"):
+            days = token.get("days_left")
+            print(f"    만료: {_kst(token['expires_at'], '%Y-%m-%d')}"
+                  + (f" ({days}일 남음)" if isinstance(days, int) else "")
+                  + (" · 추정" if token.get("estimated") else ""))
+    media = data.get("media") or {}
+    instagram = (data.get("platforms") or {}).get("instagram") or {}
+    if instagram and instagram.get("state") != "disabled" and (media.get("url") or media.get("reason")):
+        mode = {"listener": "이미지 전용 포트", "main": "대시보드 포트"}.get(str(media.get("mode")), str(media.get("mode")))
+        print("- 이미지 공개 주소: " + (f"{media.get('url')} ({mode})" if media.get("valid")
+                                     else (media.get("reason") or "없음")))
+    return 0
+
+
+@_publish_errors
+def cmd_publish_setup(args: argparse.Namespace) -> int:
+    with _publish_session(args) as (_settings, _ws, service):
+        block = service.platform_status("linkedin")
+        app = block.get("app") or {}
+        if app.get("source") == "env":
+            print("LinkedIn 앱 정보는 환경 변수에서 설정됨이에요 (INSIA_LINKEDIN_CLIENT_ID 등). 여기서는 바꿀 수 없어요.")
+            return 0
+        print("LinkedIn 개발자 앱(https://www.linkedin.com/developers/apps)의 Auth 탭에서 값을 복사해 넣어 주세요.")
+        print("비워 두면 저장된 값을 그대로 둬요.")
+        try:
+            client_id = input("Client ID" + (" [저장됨]" if app.get("client_id_set") else "") + ": ").strip()
+            import getpass
+
+            secret = getpass.getpass("Primary Client Secret (화면에 보이지 않아요)"
+                                     + (" [저장됨]" if app.get("client_secret_set") else "") + ": ").strip()
+            suggested = app.get("redirect_uri") or ""
+            # empty keeps what applies now (the stored value, or the default derived from the server's address)
+            redirect = input(f"Redirect URI [{suggested}]: ").strip()
+        except EOFError:
+            raise CommandError("입력이 끝나 저장하지 않았어요.") from None
+        block = service.save_linkedin_app(client_id=client_id or None, client_secret=secret or None,
+                                          redirect_uri=redirect or None)
+    app = block.get("app") or {}
+    print("저장했어요. LinkedIn 개발자 앱 Auth 탭의 Authorized redirect URLs에 이 주소를 그대로 넣어 주세요:")
+    print(f"  {app.get('redirect_uri', '')}")
+    print("다음: insia publish connect linkedin (대시보드가 켜져 있으면 브랜드·자료 → API 게시 연결에서도 돼요)")
+    return 0
+
+
+def _publish_connect_linkedin(args: argparse.Namespace, service: Any) -> dict[str, Any]:
+    """``connect linkedin``: ``--paste`` (print the authorize URL, read the pasted address-bar URL) or the one-time
+    callback listener (``publishers.oauth.OneShotCallbackListener``: the redirect URI's port on 127.0.0.1 and ::1,
+    loopback ``Host`` only, only the state this command just got). Either way ``linkedin_complete`` checks the
+    state (issued here, once, 10 minutes) and exchanges the code."""
+    import hmac
+    import webbrowser
+
+    from .publishers import LINKEDIN_CALLBACK_PATH
+    from .publishers.oauth import OneShotCallbackListener
+
+    start = service.linkedin_connect(request_origin="")
+    if args.paste:
+        print("1) 아래 주소를 브라우저에서 열어 LinkedIn에 로그인하고 동의해 주세요.")
+        print(f"   {start.authorize_url}")
+        print("2) 동의하면 브라우저가 다른 주소로 이동해요. '연결할 수 없음'이 떠도 괜찮아요.")
+        print("   그 탭의 주소창 주소 전체를 복사해 아래에 붙여 넣어 주세요 (10분 안에).")
+        try:
+            pasted = input("주소: ").strip()
+        except EOFError:
+            raise CommandError("입력이 끝나 연결하지 않았어요.") from None
+        if not pasted:
+            raise CommandError("붙여 넣은 주소가 없어 연결하지 않았어요.")
+        return service.linkedin_complete(pasted)
+    redirect = urllib.parse.urlsplit(start.redirect_uri)
+    if (redirect.hostname or "").lower() not in ("localhost", "127.0.0.1", "::1"):
+        raise CommandError(f"Redirect URI({start.redirect_uri})가 이 컴퓨터(localhost)가 아니라서 여기서 바로 받을 수 없어요. "
+                           "--paste로 연결하거나 대시보드의 브랜드·자료 → API 게시 연결에서 연결해 주세요.")
+    port = args.port or redirect.port or 80
+    # only the browser coming back from *this* authorization ends the wait (another local request cannot)
+    expected = (urllib.parse.parse_qs(urllib.parse.urlsplit(start.authorize_url).query).get("state") or [""])[0]
+
+    def state_ok(state: str) -> bool:
+        return bool(expected) and hmac.compare_digest(state.encode("utf-8"), expected.encode("utf-8"))
+
+    listener = OneShotCallbackListener(port, path=redirect.path or LINKEDIN_CALLBACK_PATH, state_ok=state_ok)
+    try:
+        listener.start()
+    except OSError:
+        listener.close()
+        raise CommandError(f"포트 {port}를 이미 쓰고 있어요. 대시보드 서버가 켜져 있다면 브랜드·자료 → API 게시 연결에서 "
+                           "연결해 주세요. 서버 없이 하려면 --paste를 쓰세요.") from None
+    try:
+        print("브라우저에서 LinkedIn에 로그인하고 동의해 주세요 (10분 안에, 그만두려면 Ctrl+C):")
+        print(f"  {start.authorize_url}")
+        if not args.no_browser:
+            try:
+                webbrowser.open(start.authorize_url)
+            except Exception:  # noqa: BLE001 - the address is printed above
+                pass
+        result = listener.wait(PUBLISH_CALLBACK_TIMEOUT)
+    finally:
+        listener.close()
+    if not result:
+        raise CommandError("10분이 지나 연결 요청이 끝났어요. 다시 실행해 주세요.")
+    return service.linkedin_complete(urllib.parse.urlencode({key: value for key, value in result.items() if value}))
+
+
+@_publish_errors
+def cmd_publish_connect(args: argparse.Namespace) -> int:
+    linkedin_only = [flag for flag, on in (("--paste", args.paste), ("--no-browser", args.no_browser),
+                                           ("--port", args.port is not None)) if on]
+    if args.platform == "instagram" and linkedin_only:
+        raise UsageError(f"{', '.join(linkedin_only)}은(는) LinkedIn 연결에서만 써요.")
+    if args.platform == "linkedin" and args.token_stdin:
+        raise UsageError("--token-stdin은 인스타그램 연결에서만 써요.")
+    with _publish_session(args) as (_settings, _ws, service):
+        if args.platform == "linkedin":
+            block = _publish_connect_linkedin(args, service)
+        else:
+            if args.token_stdin:
+                token = sys.stdin.read().strip()
+            else:
+                import getpass
+
+                print("Meta 개발자 앱의 Instagram → API setup with Instagram login → Generate token으로 만든 토큰을 붙여 넣어 주세요.")
+                try:
+                    token = getpass.getpass("인스타그램 토큰 (화면에 보이지 않아요): ").strip()
+                except EOFError:
+                    token = ""
+            if not token:
+                raise UsageError("토큰이 비어 있어요. 아무것도 저장하지 않았어요.")
+            block = service.save_instagram_token(token)
+            token = ""
+    account = block.get("account") or {}
+    who = account.get("name") or account.get("username") or account.get("id_hint") or ""
+    print(f"{_publish_label(args.platform)} 계정을 연결했어요" + (f": {who}" if who else "."))
+    expires = (block.get("token") or {}).get("expires_at")
+    if expires:
+        print(f"  연결 만료: {_kst(expires, '%Y-%m-%d')}" + (" (추정)" if (block.get("token") or {}).get("estimated") else ""))
+    if block.get("reason"):
+        print(f"  {block['reason']}")
+    return 0
+
+
+@_publish_errors
+def cmd_publish_disconnect(args: argparse.Namespace) -> int:
+    with _publish_session(args) as (_settings, _ws, service):
+        block = service.disconnect(args.platform, forget_app=args.forget_app)
+    print(f"INSIA에서 {_publish_label(args.platform)} 토큰을 지웠어요." + (" 앱 정보도 지웠어요." if args.forget_app else ""))
+    if block.get("revoke_hint"):
+        print(f"  {block['revoke_hint']}")
+    return 0
+
+
+@_publish_errors
+def cmd_publish_preview(args: argparse.Namespace) -> int:
+    """Show exactly what would be sent. Never issues a confirm code (only ``send`` does, on its own terminal)."""
+    with _publish_session(args) as (_settings, ws, service):
+        item_id = _item_id(ws, args.item_id)
+        platform, options = _publish_options(args, _require_item(ws, item_id))
+        result = service.preview(item_id, platform=platform, options=options, via="cli",
+                                 requested_by=_publish_requester())
+    if args.json:
+        _print_json(result.to_json())
+    else:
+        _publish_print_preview(result)
+        print("게시하려면 터미널에서: insia publish send " + item_id
+              + (f" --ai-label {args.ai_label}" if args.ai_label else "")
+              + (f" --visibility {args.visibility}" if args.visibility else ""))
+    return 0 if result.can_publish else 1
+
+
+class _PublishSendProgress:
+    """How far one ``publish send`` got, so that a Ctrl+C at any moment is reported truthfully (DESIGN.md 1-7)."""
+
+    def __init__(self) -> None:
+        self.label = ""
+        self.started = False          # service.send was called: from here on something may have been sent
+        self.looked_up = False        # ``attempt`` is what the service recorded (None: it never created one)
+        self.attempt: Any = None
+        self.exit_code: int | None = None  # the outcome is on the terminal already
+
+
+@_publish_errors
+def cmd_publish_send(args: argparse.Namespace) -> int:
+    """Preview → the person types the random code shown only here → exactly that preview is sent (DESIGN.md 8-2).
+
+    Only on a terminal (exit 2 otherwise, before anything is opened); no ``--yes``; a wrong code is exit 2 and
+    nothing is sent. Ctrl+C is exit 1 (0 when the post is already up), and what we say follows how far the command
+    got (``_PublishSendProgress``): before ``service.send`` nothing was sent; during it the service closes the
+    attempt (``failed`` before the write step, ``unknown`` after) and we read which; after it — a second Ctrl+C
+    while the attempt is read back, one while the outcome prints or while the service and workspace close — the
+    known outcome stands and "nothing was sent" is never said."""
+    from .publishers import HumanConfirmation
+    from .publishers.base import normalize_confirm_code
+
+    if not _publish_is_tty():
+        print(f"오류: {PUBLISH_NOT_TTY_MESSAGE}", file=sys.stderr)
+        return 2
+    progress = _PublishSendProgress()
+    try:
+        with _publish_session(args) as (_settings, ws, service):
+            item_id = _item_id(ws, args.item_id)
+            platform, options = _publish_options(args, _require_item(ws, item_id))
+            label = _publish_label(platform)
+            requester = _publish_requester()
+            preview = service.preview(item_id, platform=platform, options=options, via="cli", requested_by=requester,
+                                      issue_confirm_code=True)
+            _publish_print_preview(preview)
+            if not preview.can_publish:
+                print("고칠 부분이 있어 게시하지 않았어요. 편집해서 다시 승인한 뒤 실행해 주세요.", file=sys.stderr)
+                return 1
+            code = preview.confirm_code or ""
+            if not code:
+                raise CommandError("확인 코드를 만들지 못했어요. 아무것도 올리지 않았어요.")
+            try:
+                typed = input(f"게시하려면 확인 코드 {code}를 입력하세요 (그만두려면 Enter): ")
+            except EOFError:
+                typed = ""
+            if not typed.strip():
+                print("그만뒀어요. 아무것도 올리지 않았어요.", file=sys.stderr)
+                return 1
+            if normalize_confirm_code(typed) != normalize_confirm_code(code):
+                print("오류: 확인 코드가 맞지 않아요. 아무것도 올리지 않았어요. 다시 하려면 명령을 새로 실행해 주세요.",
+                      file=sys.stderr)
+                return 2
+            confirmation = HumanConfirmation(via="cli", requested_by=requester, preview_id=preview.preview_id,
+                                             preview_hash=preview.preview_hash, confirm_code=typed.strip())
+            before = {a.id for a in service.list_attempts(item_id=item_id, limit=200)}
+            print(f"{label}에 올리는 중이에요…", flush=True)
+            progress.label, progress.started = label, True
+            try:
+                attempt = service.send(confirmation, item_id=item_id, platform=platform, background=False,
+                                       on_step=_publish_step_printer(platform))
+            except KeyboardInterrupt:  # the service closed its attempt: read it while the workspace is open
+                progress.attempt, progress.looked_up = _publish_new_attempt(service, item_id, platform, before)
+                progress.exit_code = _publish_report_interrupted(progress.attempt, label, looked_up=progress.looked_up)
+                return progress.exit_code
+            progress.attempt, progress.looked_up = attempt, True
+            progress.exit_code = _publish_print_outcome(attempt, label, first_comment_link=preview.first_comment_link)
+            return progress.exit_code
+    except KeyboardInterrupt:
+        return _publish_send_interrupted(progress)
+
+
+def _publish_send_interrupted(progress: _PublishSendProgress) -> int:
+    """A Ctrl+C that reached the outside of ``cmd_publish_send``: before the send, during the preview, rendering or
+    the code prompt (nothing was sent), or after the send was started (never "nothing was sent" then)."""
+    if not progress.started:
+        print("\n중단했어요. 게시 요청을 보내기 전이라 아무것도 올리지 않았어요.", file=sys.stderr)
+        return 1
+    if progress.exit_code is not None:  # while the service or the workspace closed: the printed outcome stands
+        print("\n중단했어요. 게시 결과는 위에 적은 그대로예요.", file=sys.stderr)
+        return progress.exit_code
+    return _publish_report_interrupted(progress.attempt, progress.label, looked_up=progress.looked_up)
+
+
+def _publish_new_attempt(service: Any, item_id: str, platform: str, before: set[str]) -> tuple[Any, bool]:
+    """``(attempt, looked_up)``: the attempt this ``send`` created (``None`` when the service never created one),
+    and whether the lookup worked (the workspace may be closing: then we do not guess)."""
+    try:
+        new = [a for a in service.list_attempts(item_id=item_id, limit=200)
+               if a.platform == platform and a.id not in before]
+    except Exception:  # noqa: BLE001 - reported as "could not check", never as "nothing was sent"
+        return None, False
+    return (new[0] if new else None), True
+
+
+def _publish_report_interrupted(attempt: Any, label: str, *, looked_up: bool) -> int:
+    """Ctrl+C after ``service.send`` was called: say what the service recorded. Exit 0 only when the post is up."""
+    if not looked_up:
+        print("\n중단했어요. 게시하는 도중에 멈춰서 올라갔는지 확인하지 못했어요. insia publish attempts로 결과를 확인해 주세요.",
+              file=sys.stderr)
+        return 1
+    if attempt is None or (attempt.status == "failed" and attempt.error_code == "interrupted"):
+        print("\n중단했어요. 게시 요청을 보내기 전이라 아무것도 올리지 않았어요.", file=sys.stderr)
+    elif attempt.status == "published":  # the platform had already confirmed: the post is up
+        print(f"\n중단했지만 이미 게시됐어요: {attempt.permalink or '(게시물 주소를 받지 못했어요)'}")
+        return 0
+    elif attempt.status == "unknown":
+        print(f"\n중단했어요. 게시 요청을 보낸 뒤라 올라갔을 수도 있어요. {label}에서 확인한 뒤 정리해 주세요: "
+              f"insia publish resolve {attempt.id} --published [--url 주소] 또는 --not-published", file=sys.stderr)
+    elif attempt.status == "failed":
+        reason = attempt.error or "이유를 받지 못했어요."
+        tail = "" if "올라가지 않았" in reason or "올리지 않았" in reason else " 아무것도 올라가지 않았어요."
+        print(f"\n중단했어요. 게시하지 못했어요: {reason}{tail}", file=sys.stderr)
+    elif attempt.status == "sending":
+        print(f"\n중단했어요. 게시 기록 {attempt.id}이(가) 아직 '게시 중'이라 올라갔는지 확인하지 못했어요. "
+              "insia publish attempts로 확인해 주세요 (다음 publish 명령이 주인 없는 기록을 정리해요).", file=sys.stderr)
+    else:
+        print(f"\n중단했어요. 게시 기록 {attempt.id}의 상태: {PUBLISH_ATTEMPT_LABELS.get(attempt.status, attempt.status)} "
+              "(insia publish attempts로 확인해 주세요)", file=sys.stderr)
+    return 1
+
+
+def _publish_attempt_id(service: Any, text: str) -> str:
+    return _match_id(text, [a.id for a in service.list_attempts(limit=1000)], "게시 기록", "insia publish attempts")
+
+
+@_publish_errors
+def cmd_publish_attempts(args: argparse.Namespace) -> int:
+    with _publish_session(args) as (_settings, ws, service):
+        item_id = _item_id(ws, args.item_id) if args.item_id else None
+        rows = [service.attempt_json(a) for a in service.list_attempts(item_id=item_id, limit=args.limit)]
+    if args.json:
+        _print_json({"attempts": rows})
+        return 0
+    if not rows:
+        print("게시 기록이 없어요.")
+        return 0
+    table = [[r.get("id", ""), _kst(r.get("created_at")), _publish_label(r.get("platform", "")),
+              PUBLISH_ATTEMPT_LABELS.get(r.get("status", ""), r.get("status", "")), r.get("item_id", ""),
+              r.get("permalink") or r.get("error") or r.get("step") or ""] for r in rows]
+    print_table(["id", "시각", "플랫폼", "상태", "콘텐츠", "주소·오류"], table, max_widths=[30, 11, 10, 14, 40, 60])
+    return 0
+
+
+@_publish_errors
+def cmd_publish_resolve(args: argparse.Namespace) -> int:
+    """Close an ``unknown`` attempt after checking the platform by hand (TTY + y/N), or re-check Instagram."""
+    from .publishers import HumanConfirmation
+
+    if args.url and not args.published:
+        raise UsageError("--url은 --published와 함께만 써요.")
+    if not args.check and not _publish_is_tty():
+        print(f"오류: {PUBLISH_RESOLVE_NOT_TTY_MESSAGE}", file=sys.stderr)
+        return 2
+    with _publish_session(args) as (_settings, _ws, service):
+        attempt_id = _publish_attempt_id(service, args.attempt_id)
+        if args.check:
+            attempt = service.check_attempt(attempt_id)
+            print(f"다시 확인했어요: {PUBLISH_ATTEMPT_LABELS.get(attempt.status, attempt.status)}"
+                  + (f" · {attempt.permalink}" if attempt.permalink else "")
+                  + (f" · {attempt.error}" if attempt.error and attempt.status != "published" else ""))
+            return 0
+        attempt = service.get_attempt(attempt_id)
+        label = _publish_label(attempt.platform)
+        outcome = "published" if args.published else "not_published"
+        print(f"게시 기록 {attempt.id}: {label} · 콘텐츠 {attempt.item_id} v{attempt.version} · "
+              f"{PUBLISH_ATTEMPT_LABELS.get(attempt.status, attempt.status)}")
+        if outcome == "not_published":
+            print(f"{label} 피드에서 먼저 확인했나요? 올라갔는데 '안 올라갔어요'로 정리하면 같은 글이 두 번 올라갈 수 있어요.")
+        question = "올라갔어요" if outcome == "published" else "안 올라갔어요"
+        try:
+            answer = input(f"'{question}'로 정리할까요? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes", "예", "네", "ㅇ"):
+            print("정리하지 않았어요.")
+            return 1
+        confirmation = HumanConfirmation(via="cli", requested_by=_publish_requester(), preview_id=attempt.id,
+                                         preview_hash="")
+        attempt, item = service.resolve(confirmation, outcome, url=(args.url or "").strip())
+    if attempt.status == "published":
+        print("'올라갔어요'로 정리했어요. 콘텐츠를 게시 완료로 표시했어요" + (f": {attempt.permalink}" if attempt.permalink else "."))
+    else:
+        print("'안 올라갔어요'로 정리했어요. 다시 게시하려면 새로 미리보기부터 해 주세요.")
+    return 0
+
+
+@_publish_errors
+def cmd_publish_refresh(args: argparse.Namespace) -> int:
+    """Refresh due Instagram tokens only — never publishes (cron: ``0 9 * * 1 insia publish refresh``)."""
+    with _publish_session(args) as (_settings, _ws, service):
+        result = service.refresh_tokens()
+    if args.json:
+        _print_json(result)
+        return 0
+    if not result:
+        print("갱신할 토큰이 없어요.")
+    for platform, info in result.items():
+        state = "갱신했어요" if info.get("refreshed") else "갱신하지 않았어요"
+        print(f"- {_publish_label(platform)}: {state}" + (f" · {info['message']}" if info.get("message") else "")
+              + (f" · 만료 {_kst(info['expires_at'], '%Y-%m-%d')}" if info.get("expires_at") else ""))
+    return 0
+
+
+PUBLISH_DOCTOR_LABELS = (  # doctor_report ids → the doctor's labels (most specific first)
+    (".media", "API 게시 · 이미지 공개 주소"), (".render", "API 게시 · 카드 렌더링"), ("credentials.", "API 게시 · 토큰 폴더"),
+    ("linkedin.", "API 게시 · LinkedIn"), ("instagram.", "API 게시 · 인스타그램"))
+
+
+def _publish_doctor_checks(settings: Settings, ws: "Workspace") -> list[dict[str, str]]:
+    """``insia doctor`` lines for API publishing (DESIGN.md 8-4) — set / not set only, never a value."""
+    try:
+        service = _publish_service(settings, ws)
+        try:
+            report = service.doctor_report()
+        finally:
+            service.shutdown(timeout=1.0)
+    except Exception as exc:  # noqa: BLE001 - doctor reports, never crashes
+        return [{"level": "warn", "label": "API 게시", "message": f"점검하지 못했어요: {_publish_redact(_error_text(exc))}"}]
+    out = []
+    for entry in report:
+        check_id = str(entry.get("id", ""))
+        label = next((text for key, text in PUBLISH_DOCTOR_LABELS
+                      if (check_id.endswith(key) if key.startswith(".") else check_id.startswith(key))), "API 게시")
+        level = entry.get("level") if entry.get("level") in ("ok", "info", "warn", "error") else "info"
+        out.append({"level": str(level), "label": label, "message": _publish_redact(str(entry.get("message", "")))})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# backup
+# ---------------------------------------------------------------------------
+
+BACKUP_SKIPPED = ("credentials", "publish", "logs", "exports")  # tokens, public/staged images, logs, regenerable files
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    """A safe copy of the workspace: an online SQLite copy of insia.db (the server may keep running) + uploads/ +
+    prices.json. ``credentials/`` (API publishing tokens), ``publish/``, ``logs/`` and ``exports/`` stay out."""
+    import sqlite3
+
+    from .db import DB_NAME
+
+    settings = _settings_from_args(args)
+    home = _home(settings)
+    source = home / DB_NAME
+    if not source.is_file():
+        raise CommandError(f"백업할 워크스페이스 DB가 없어요: {source}")
+    out = Path(args.out).expanduser().resolve()
+    credentials_env = (os.environ.get("INSIA_CREDENTIALS_DIR") or "").strip()
+    no_go = [home / name for name in ("credentials", "publish", "uploads", "logs")]
+    if credentials_env:
+        no_go.append(Path(credentials_env).expanduser().resolve())
+    if out == home or any(out == p or out.is_relative_to(p) for p in no_go):
+        raise UsageError(f"백업 폴더로 {out}은(는) 쓸 수 없어요. 워크스페이스 밖이나 새 폴더(예: backups/날짜)를 정해 주세요.")
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise CommandError(f"백업 폴더가 비어 있지 않아요: {out}. 새 폴더 이름을 정해 주세요.")
+    out.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = out / DB_NAME
+    src = sqlite3.connect(str(source), timeout=30)
+    try:
+        dst = sqlite3.connect(str(target))
+        try:
+            src.backup(dst)
+            dst.execute("PRAGMA journal_mode=DELETE")  # one self-contained file
+            check = dst.execute("PRAGMA quick_check").fetchone()[0]
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    copied = [DB_NAME]
+    uploads = home / "uploads"
+    if uploads.is_dir():
+        shutil.copytree(uploads, out / "uploads", symlinks=True)
+        copied.append("uploads/")
+    prices = home / "prices.json"
+    if prices.is_file():
+        shutil.copy2(prices, out / "prices.json")
+        copied.append("prices.json")
+    skipped = [f"{name}/" for name in BACKUP_SKIPPED if (home / name).exists()]
+    size = sum(p.stat().st_size for p in out.rglob("*") if p.is_file() and not p.is_symlink())
+    ok = check == "ok"
+    if args.json:
+        _print_json({"out": str(out), "copied": copied, "skipped": skipped, "bytes": size, "db_check": check, "ok": ok})
+        return 0 if ok else 1
+    print(f"백업했어요: {out} ({size / 1024:,.0f}KB)")
+    print(f"  넣은 것: {', '.join(copied)} (DB 점검: {'정상' if ok else check})")
+    if skipped:
+        print(f"  뺀 것: {', '.join(skipped)} — API 게시 토큰(credentials/)은 백업하지 않아요.")
+    print("  복원: 워크스페이스 폴더에 이 파일들을 넣은 뒤, API 게시를 쓴다면 브랜드·자료 → API 게시 연결에서 다시 연결해 주세요.")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
 # serve / healthcheck / doctor / sample-brief
 # ---------------------------------------------------------------------------
 
@@ -1789,8 +2531,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         parameters = {}  # type: ignore[assignment]
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
         parameters = {**parameters, "token": None, "public_hosts": None, "trust_proxy": None, "quiet": None}  # type: ignore[dict-item]
-    wanted = {"token": token, "public_hosts": public_hosts, "trust_proxy": bool(args.trust_proxy)}
-    unsupported = [name for name, value in wanted.items() if value and name not in parameters]
+    wanted = {"token": token, "public_hosts": public_hosts, "trust_proxy": bool(args.trust_proxy),
+              "media_port": args.media_port, "media_base_url": args.media_base_url}
+    unsupported = [name for name, value in wanted.items() if value not in (None, False, "", ()) and name not in parameters]
     if unsupported:
         # TODO(server group): make_server(settings, host, port, web_dir, *, token=None, public_hosts=(),
         # trust_proxy=False, quiet=False) is not available in this server.py yet.
@@ -1820,6 +2563,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if hosts:
         print(f"  허용한 도메인: {', '.join(sorted(hosts))}")
     print(f"  실행 1번 예산 상한: {_usd(settings.max_cost_usd) if settings.max_cost_usd else '없음'}")
+    publish_line = getattr(server_module, "publish_summary", lambda srv: "")(server)
+    if publish_line:  # nothing at all when API publishing was never set up
+        print(f"  {publish_line}")
     interrupted = getattr(getattr(server, "manager", None), "interrupted_on_start", 0) or 0
     if interrupted:
         print(f"  지난번에 끝나지 못한 실행 {interrupted}개를 '중단됨'으로 정리했어요. 'insia runs list'로 보고 "
@@ -1853,8 +2599,7 @@ def cmd_healthcheck(args: argparse.Namespace) -> int:
 
     port = args.port
     if port is None:
-        raw = (os.environ.get("INSIA_PORT") or "").strip()
-        port = int(raw) if raw.isdigit() else 8765
+        port = _env_port() or 8765
     url = args.url or _health_url(args.host, port)
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     token = (os.environ.get("INSIA_ACCESS_TOKEN") or "").strip()
@@ -1900,6 +2645,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             filled, total, missing = _profile_fill(ws.get_profile())
             version = ws.schema_version
             due = ws.due_slots(settings.today)
+            publish_checks = _publish_doctor_checks(settings, ws)
         add("ok", "워크스페이스", f"{_home(settings)} (DB 버전 {version}, 콘텐츠 {len(items)}개, 자료 {len(docs)}개)")
         if filled == 0:
             add("warn", "회사 프로필", "비어 있어요 → insia profile edit-template 으로 채우면 글이 회사에 맞춰져요")
@@ -1908,6 +2654,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             add("ok", "회사 프로필", f"채운 항목 {filled}/{total}")
         add("info", "오늘 만들 초안", f"{len(due)}개 (insia run-due)" if due else "없어요")
+        checks.extend(publish_checks)
     except Exception as exc:  # noqa: BLE001 - doctor reports, never crashes
         failed = True
         add("error", "워크스페이스", f"{_home(settings)}를 열 수 없어요: {_error_text(exc)}")
@@ -1968,8 +2715,13 @@ MAIN_EPILOG = """\
   insia items list                       보관함 → insia review / revise / items approve
   insia items export <id>                붙여넣기용 파일 → 직접 게시 → insia items publish <id> --url …
 
+API 게시 (선택: LinkedIn·인스타그램, 내 개발자 앱 필요)
+  insia publish status                   연결·준비 상태
+  insia publish send <id>                미리보기 확인 → 확인 코드 입력 → 한 건 게시 (터미널에서만)
+  insia backup --out <폴더>              토큰을 뺀 안전한 백업
+
 자세한 안내: docs/operations.md · 종료 코드: 0 성공, 1 작업 실패, 2 잘못된 사용법
-INSIA는 어떤 채널에도 자동으로 게시하지 않아요."""
+INSIA는 어떤 채널에도 자동으로 게시하지 않아요. API 게시도 사람이 확인하고 누를 때 한 건씩만 해요."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2245,7 +2997,68 @@ def build_parser() -> argparse.ArgumentParser:
     srv.add_argument("--max-cost-usd", dest="max_cost_usd", type=_type_usd, metavar="USD", help="실행 1번의 예산 상한")
     srv.add_argument("--out", help="결과 파일 폴더 (기본 outputs)")
     srv.add_argument("--verbose", action="store_true", help="요청 로그를 출력해요")
+    srv.add_argument("--media-port", dest="media_port", type=int, metavar="PORT",
+                     help="인스타그램 API 게시용 이미지 전용 포트 (기본 INSIA_MEDIA_PORT). /pub/m/ 이미지만 보여 주고 "
+                          "대시보드는 그대로 이 컴퓨터에만 둬요")
+    srv.add_argument("--media-base-url", dest="media_base_url", metavar="URL",
+                     help="그 포트를 바깥에서 여는 https 주소 (예: https://media.example.com, 기본 INSIA_MEDIA_BASE_URL)")
     srv.set_defaults(func=cmd_serve)
+
+    # -- API publishing ---------------------------------------------------------------------
+    publish = sub.add_parser(
+        "publish", help="LinkedIn·인스타그램 API 게시 (사람이 확인하고 누를 때만, 한 건씩)",
+        description="승인한 LinkedIn·인스타그램 콘텐츠를 내 개발자 앱으로 한 건씩 올려요. 예약·자동 게시는 없어요: send는 "
+                    "터미널에서 미리보기를 보고 그때 나온 확인 코드를 직접 입력할 때만 돌아요. 설정 안내: docs/operations.md")
+    pub_sub = publish.add_subparsers(dest="publish_command", metavar="<동작>", title="동작", required=True,
+                                     help="자세한 도움말: <동작> -h")
+    platform_help = "플랫폼 (보통 생략: 콘텐츠 채널로 정해져요)"
+    p = pub_sub.add_parser("status", parents=[ws, js], help="연결·준비 상태 (토큰 값은 보여 주지 않아요)")
+    p.add_argument("--check", action="store_true", help="토큰이 살아 있는지 플랫폼에 실제로 확인해요")
+    p.set_defaults(func=cmd_publish_status)
+    p = pub_sub.add_parser("setup", parents=[ws], help="LinkedIn 앱 정보(Client ID·Secret·Redirect URI)를 저장해요")
+    p.add_argument("platform", choices=["linkedin"], help="linkedin")
+    p.set_defaults(func=cmd_publish_setup)
+    p = pub_sub.add_parser("connect", parents=[ws], help="계정 연결 (LinkedIn 로그인·동의, 인스타그램 토큰 붙여넣기)")
+    p.add_argument("platform", choices=["linkedin", "instagram"], help="linkedin 또는 instagram")
+    p.add_argument("--paste", action="store_true", help="LinkedIn: 동의한 뒤 이동한 주소를 붙여 넣어 연결해요 (서버·Docker·원격용)")
+    p.add_argument("--no-browser", action="store_true", help="LinkedIn: 브라우저를 자동으로 열지 않아요")
+    p.add_argument("--port", type=int, help="LinkedIn: 콜백을 받을 포트 (기본: Redirect URI의 포트)")
+    p.add_argument("--token-stdin", action="store_true", help="인스타그램: 토큰을 표준 입력에서 읽어요 (Docker·스크립트용)")
+    p.set_defaults(func=cmd_publish_connect)
+    p = pub_sub.add_parser("disconnect", parents=[ws], help="연결 해제 (INSIA에 저장한 토큰을 지워요)")
+    p.add_argument("platform", choices=["linkedin", "instagram"], help="linkedin 또는 instagram")
+    p.add_argument("--forget-app", action="store_true", help="앱 정보(Client ID·Secret)도 지워요")
+    p.set_defaults(func=cmd_publish_disconnect)
+    for name, parents, help_text in (
+            ("preview", [ws, js], "올라갈 내용을 미리 봐요 (게시하지 않아요)"),
+            ("send", [ws], "미리보기를 확인하고 확인 코드를 입력하면 한 건 게시해요 (터미널에서만)")):
+        p = pub_sub.add_parser(name, parents=parents, help=help_text)
+        p.add_argument("item_id", help="콘텐츠 id (insia items list; 겹치지 않는 일부만 적어도 돼요)")
+        p.add_argument("--platform", choices=["linkedin", "instagram"], help=platform_help)
+        p.add_argument("--visibility", choices=["PUBLIC", "CONNECTIONS"], help="LinkedIn 공개 범위 (기본 PUBLIC = 전체 공개)")
+        p.add_argument("--ai-label", dest="ai_label", choices=["yes", "no"],
+                       help="인스타그램에서 꼭 골라요: 'AI 정보' 라벨을 붙일지 (yes = 붙여요, no = 붙이지 않아요)")
+        p.set_defaults(func=cmd_publish_preview if name == "preview" else cmd_publish_send)
+    p = pub_sub.add_parser("attempts", parents=[ws, js], help="게시 기록 (최근 순)")
+    p.add_argument("item_id", nargs="?", help="이 콘텐츠의 기록만")
+    p.add_argument("--limit", type=_type_positive, default=50, help="최대 개수 (기본 50)")
+    p.set_defaults(func=cmd_publish_attempts)
+    p = pub_sub.add_parser("resolve", parents=[ws], help="게시됐는지 모르는 기록을 정리해요 (플랫폼에서 직접 확인한 뒤)")
+    p.add_argument("attempt_id", help="게시 기록 id (insia publish attempts)")
+    how = p.add_mutually_exclusive_group(required=True)
+    how.add_argument("--published", action="store_true", help="올라갔어요")
+    how.add_argument("--not-published", dest="not_published", action="store_true", help="안 올라갔어요")
+    how.add_argument("--check", action="store_true", help="인스타그램에서 다시 확인해요 (읽기만, 게시하지 않아요)")
+    p.add_argument("--url", help="--published일 때 게시물 주소 (선택)")
+    p.set_defaults(func=cmd_publish_resolve)
+    p = pub_sub.add_parser("refresh", parents=[ws, js], help="인스타그램 토큰만 갱신해요 (게시하지 않아요, cron용)")
+    p.set_defaults(func=cmd_publish_refresh)
+
+    backup = sub.add_parser("backup", parents=[ws, js], help="안전한 백업 (API 게시 토큰·로그는 빼요)",
+                            description="insia.db를 서버를 끄지 않고 안전하게 복사하고(uploads/, prices.json 포함) credentials/·"
+                                        "publish/·logs/·exports/는 빼요. 복원한 뒤 API 게시는 다시 연결하면 돼요.")
+    backup.add_argument("--out", required=True, help="백업을 넣을 새 폴더 (예: backups/2026-09-28)")
+    backup.set_defaults(func=cmd_backup)
 
     health = sub.add_parser("healthcheck", help="서버가 살아 있는지 확인해요 (Docker HEALTHCHECK용)")
     health.add_argument("--host", default="127.0.0.1",

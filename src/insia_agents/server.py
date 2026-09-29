@@ -25,6 +25,8 @@ Routes (JSON unless noted; errors are ``{"error": "<Korean>", "status": N}``)::
     GET    /api/calendar?from=&to=          POST /api/calendar/plan {theme, start, end|days, counts, weekend_channels?, replace?}
     POST   /api/calendar/<slot>             POST /api/calendar/<slot>/generate
     GET    /api/usage?since=&until=
+    /api/publish/** · /api/items/<id>/publish/** · GET /oauth/linkedin/callback · GET /pub/m/…
+                                            human-confirmed API publishing (server_publish.py, DESIGN.md 6)
 
 Security model (unchanged from the local-only version, plus an access token):
 
@@ -46,6 +48,13 @@ Security model (unchanged from the local-only version, plus an access token):
   reserved before the comparison (``LoginLimiter.attempt``), so parallel
   guesses cannot exceed the limit. Static dashboard files stay public (the
   dashboard shows a login form when ``/api/health`` is 401).
+- API publishing (``server_publish.py``) adds two paths outside ``/api`` that
+  need no access token: the LinkedIn OAuth callback (state + a SameSite=Lax
+  cookie, always a fixed 303) and, only when the media host is a
+  ``--public-host`` without a media port, ``/pub/m/<32 hex>/<NN>.jpg``. The
+  publish and resolve routes additionally require a human request
+  (``Sec-Fetch-Site: same-origin`` or a same-origin ``Origin``; the cookie, never
+  a Bearer token). Access-log lines never hold an OAuth code or state.
 - Malformed or abandoned requests never produce a 500 or a traceback: a
   stalled body is a 408, over-long static paths a 404, a client that hangs
   up a debug log line.
@@ -87,8 +96,9 @@ from . import actions
 from .backends import create_backend
 from .backends.base import BackendError, RunContext
 from .config import MIN_SPEED, Settings, has_credentials, load_sample_brief, resolve_mode
-from .db import (RECOVERY_WATCH_SECONDS, RUN_STATUSES, STALE_AFTER_SECONDS, ApprovalBlockedError, InvalidTransitionError,
-                 NotFoundError, Workspace, WorkspaceError, pipeline_item_id, profile_is_empty)
+from .db import (RECOVERY_WATCH_SECONDS, RUN_STATUSES, STALE_AFTER_SECONDS, ApprovalBlockedError, AttemptTakenOverError,
+                 InvalidTransitionError, ItemLockedError, NotFoundError, Workspace, WorkspaceError, pipeline_item_id,
+                 profile_is_empty)
 from .events import TERMINAL_TYPES, EventBus, SimClock
 from .exporters import (CHANNEL_FORMATS, ExportError, ExportFile, MissingDependencyError, capabilities, export_item,
                         export_run_zip, format_label, formats_for)
@@ -97,6 +107,10 @@ from .pipeline import (RESUMABLE_KINDS, BudgetExceeded, PipelineError, RunCancel
                        build_context, continue_numbering, failure_status, load_resume_state, new_run_id, prepare_run,
                        run_pipeline, resume_run)
 from .planner import PlanningError, date_span, plan_week, weekend_channel_set
+# The one server-side module that imports the publishing package (AST guard: tests/test_no_autopublish_surface.py).
+from .server_publish import (MEDIA_404_PER_MINUTE, MEDIA_PREFIX, OAUTH_BAD_STATE_PER_MINUTE, OAUTH_PREFIX,
+                             PREVIEW_PER_MINUTE, PUBLISH_PER_MINUTE, PUBLISH_ROUTES, PublishHandlerMixin,
+                             build_publish_service, redact_log_line)
 
 log = logging.getLogger(__name__)
 
@@ -358,6 +372,13 @@ def normalize_public_hosts(hosts: Sequence[str] | str | None) -> tuple[str, ...]
         if name not in out:
             out.append(name)
     return tuple(out)
+
+
+def env_public_hosts() -> tuple[str, ...]:
+    """Env ``INSIA_PUBLIC_HOSTS`` (comma-separated) through ``normalize_public_hosts`` (``ServerConfigError`` for an
+    invalid entry). ``make_server`` and the ``insia publish`` commands read it with this one function, so both derive
+    the same LinkedIn redirect URI and Instagram media mode."""
+    return normalize_public_hosts([h for h in (os.environ.get("INSIA_PUBLIC_HOSTS") or "").split(",") if h.strip()])
 
 
 def check_token(token: str | None) -> str | None:
@@ -719,6 +740,8 @@ class RunManager:
         self._closing = False
         self._editing: dict[str, int] = {}  # item id → human edits being saved right now
         self._editing_runs: dict[str, int] = {}  # the same edits by the run that produced the item
+        self._publishing: dict[str, int] = {}  # item id → confirmed API publishes being started right now
+        self._publishing_runs: dict[str, int] = {}  # the same starts by the run that produced the item
         self._lock = threading.Lock()
         self.interrupted_on_start = self.workspace.mark_interrupted() if recover else 0
         if self.interrupted_on_start:
@@ -854,6 +877,54 @@ class RunManager:
         the items it produces (``it_<run_id>_<channel>``) — call with ``_lock`` held."""
         return self._active.get(run_id) if run_id else None
 
+    def agent_on_item(self, item_id: str, run_id: str = "") -> RunRecord | None:
+        """The agent work in this process that still writes ``item_id``: a review/revise job on it, or the
+        item's own pipeline/slot run ``run_id`` (new or resumed). ``None`` when there is none."""
+        with self._lock:
+            return self._item_job(item_id) or self._run_writer(run_id)
+
+    def _check_not_publishing(self, item_id: str) -> None:
+        """Refuse agent work and human edits on an item with a live API publish attempt (``sending`` or
+        ``unknown``, DESIGN.md 6-4) or one being started right now — call with ``_lock`` held.
+
+        Raises ``db.ItemLockedError`` (409 ``item_locked``), the same error the workspace's own write guard
+        raises, so an expensive AI job never starts only to fail at its first write.
+        """
+        if not item_id:
+            return
+        if self._publishing.get(item_id):
+            raise ItemLockedError(attempt_id="", status="sending")
+        attempt = self.workspace.active_publish_attempt(item_id)
+        if attempt is not None:
+            raise ItemLockedError(attempt_id=attempt.id, platform=attempt.platform, status=attempt.status)
+
+    @contextmanager
+    def publishing(self, item_id: str, run_id: str = "") -> Iterator[None]:
+        """Hold while a confirmed API publish of ``item_id`` starts (``POST /api/items/<id>/publish``).
+
+        Refuses (409 ``agent_job``) while an agent in this process still writes the item — a review/revise job
+        on it or its own pipeline/slot run — or a human edit of it is being saved. Meanwhile a new job on the
+        item, a resume of its run and a human edit are refused the same way (``_check_conflicts``,
+        ``human_edit``); after the start, the attempt row itself (``sending``) keeps refusing them.
+        """
+        with self._lock:
+            agent = self._item_job(item_id) or self._run_writer(run_id)
+            if agent is not None:
+                raise RequestError(409, f"에이전트가 이 콘텐츠를 작업하는 중이에요 (실행 {agent.run_id}). 끝난 뒤 새 버전을 "
+                                        "확인하고 다시 승인해 주세요.",
+                                   extra={"code": "agent_job", "run_id": agent.run_id, "item_id": item_id})
+            if self._editing.get(item_id):
+                raise RequestError(409, "이 콘텐츠를 직접 수정한 내용을 저장하는 중이에요. 저장된 버전을 확인하고 다시 승인해 주세요.",
+                                   extra={"code": "editing", "item_id": item_id})
+            _count(self._publishing, item_id, +1)
+            _count(self._publishing_runs, run_id, +1)
+        try:
+            yield
+        finally:
+            with self._lock:
+                _count(self._publishing, item_id, -1)
+                _count(self._publishing_runs, run_id, -1)
+
     def _check_conflicts(self, record: RunRecord) -> None:
         if record.run_id in self._active:
             raise RequestError(409, "이 실행은 이미 진행 중이에요. 실시간 화면에서 진행 상황을 볼 수 있어요.")
@@ -876,6 +947,14 @@ class RunManager:
                                    extra={"run_id": other.run_id, "item_id": other.item_id})
         if self._editing_runs.get(record.run_id):
             raise RequestError(409, "이 실행의 콘텐츠를 직접 수정한 내용을 저장하는 중이에요. 잠시 후 다시 시도해 주세요.")
+        # API publishing freezes an item's versions: no job on it, no resume of the run that writes it (DESIGN.md 6-4)
+        if record.item_id and record.kind in ITEM_JOB_KINDS:
+            self._check_not_publishing(record.item_id)
+        if record.options.get("resumed"):
+            if self._publishing_runs.get(record.run_id):
+                raise ItemLockedError(status="sending")
+            for channel in (record.brief.channels if record.brief is not None else []):
+                self._check_not_publishing(pipeline_item_id(record.run_id, channel))
         for other in self._active.values():
             if record.slot_id and other.slot_id == record.slot_id:
                 raise RequestError(409, f"이 슬롯은 이미 초안을 만드는 중이에요 (실행 {other.run_id}).",
@@ -909,6 +988,7 @@ class RunManager:
                 raise RequestError(409, f"에이전트가 아직 이 콘텐츠를 쓰고 검수하는 중이에요 (실행 {writer.run_id}). "
                                         "실행이 끝나면 최신 버전을 확인한 뒤 다시 저장해 주세요.",
                                    extra={"run_id": writer.run_id, "job": writer.kind, "item_id": item_id})
+            self._check_not_publishing(item_id)  # 409 item_locked while it is being published / awaits resolving
             _count(self._editing, item_id, +1)
             _count(self._editing_runs, run_id, +1)
         try:
@@ -1571,6 +1651,7 @@ class InsiaServer(ThreadingHTTPServer):
         self.address_family = address_family_for(host)
         # Set before binding: a failed bind (port in use) calls server_close(), which needs it.
         self.manager = manager
+        self.publish: Any = None  # the process's PublishService (make_server sets it after binding)
         super().__init__((host, address[1]), InsiaHandler)
         self.web_root = web_root.resolve() if web_root is not None and web_root.is_dir() else None
         self.heartbeat = heartbeat
@@ -1579,6 +1660,11 @@ class InsiaServer(ThreadingHTTPServer):
         self.public_hosts = frozenset(public_hosts)
         self.trust_proxy = bool(trust_proxy)
         self.limiter = LoginLimiter()
+        # API publishing: separate windows, so none of them can lock anyone out of the dashboard login
+        self.oauth_limiter = LoginLimiter(OAUTH_BAD_STATE_PER_MINUTE, 60.0)  # bad/expired OAuth states
+        self.preview_limiter = LoginLimiter(PREVIEW_PER_MINUTE, 60.0)  # every preview request counts
+        self.publish_limiter = LoginLimiter(PUBLISH_PER_MINUTE, 60.0)  # every publish request counts
+        self.media_limiter = LoginLimiter(MEDIA_404_PER_MINUTE, 60.0)  # 404s of the main port's /pub/ (config B)
         self._session = (hmac.new(token.encode("utf-8"), SESSION_CONTEXT, hashlib.sha256).hexdigest()
                          if token else None)
 
@@ -1654,6 +1740,12 @@ class InsiaServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         super().server_close()
+        publish, self.publish = self.publish, None
+        if publish is not None:  # before the manager closes the shared workspace
+            try:
+                publish.shutdown(timeout=min(5.0, self.shutdown_timeout))  # background jobs, media listener, worker
+            except Exception:  # noqa: BLE001
+                log.exception("API 게시 정리 중 오류")
         try:
             self.manager.shutdown(timeout=self.shutdown_timeout)
         except Exception:  # noqa: BLE001
@@ -1702,18 +1794,30 @@ ROUTES: tuple[Route, ...] = (
     _route("POST", rf"/api/calendar/{ID_SEGMENT}/generate", "generate_slot"),
     _route("POST", rf"/api/calendar/{ID_SEGMENT}", "update_slot"),
     _route("GET", r"/api/usage", "usage"),
-)
+) + tuple(_route(method, pattern.replace("<id>", ID_SEGMENT), handler, auth=auth)
+          for method, pattern, handler, auth in PUBLISH_ROUTES)  # server_publish.py
 
 
-class InsiaHandler(BaseHTTPRequestHandler):
+class InsiaHandler(PublishHandlerMixin, BaseHTTPRequestHandler):
     server: InsiaServer
     server_version = f"INSIA/{__version__}"
     timeout = 120  # seconds a client may stay silent while sending a request
 
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        """Access log line: ``/oauth/`` requests without their query (the OAuth code and state), public media
+        names cut short, known secret values masked (``server_publish``)."""
+        if isinstance(code, HTTPStatus):
+            code = code.value
+        self.log_message('"%s" %s %s', self._publish_log_requestline(str(getattr(self, "requestline", "") or "")),
+                         str(code), str(size))
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        if not self.server.quiet:
-            # the request line holds the path, which a client can make 64 KB long
-            super().log_message(format, *(_clip(a, MAX_LOGGED_PATH * 2) if isinstance(a, str) else a for a in args))
+        if self.server.quiet:
+            return
+        # the request line holds the path, which a client can make 64 KB long
+        message = format % tuple(_clip(a, MAX_LOGGED_PATH * 2) if isinstance(a, str) else a for a in args)
+        message = redact_log_line(message)  # OAuth codes/states, tokens, whole media names never reach the log
+        sys.stderr.write(f"{self.address_string()} - - [{self.log_date_time_string()}] {message}\n")
 
     def _logged_path(self) -> str:
         return _clip(str(getattr(self, "path", "") or "").split("?", 1)[0], MAX_LOGGED_PATH)
@@ -1957,6 +2061,9 @@ class InsiaHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         try:
             path, query = self._path()
+            if path.startswith((OAUTH_PREFIX, MEDIA_PREFIX)):  # the LinkedIn callback, public media: never static files
+                self._dispatch_publish_public(method, path, query)
+                return
             if not (path == "/api" or path.startswith("/api/")):
                 if method not in ("GET", "HEAD"):
                     raise RequestError(405, "허용되지 않는 요청이에요", headers={"Allow": "GET, HEAD"})
@@ -2009,7 +2116,19 @@ class InsiaHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _map_error(exc: Exception) -> RequestError | None:
-        """Library exceptions → HTTP errors (Korean messages pass through)."""
+        """Library exceptions → HTTP errors (Korean messages pass through).
+
+        Publishing errors come first (their own status, ``code`` and ``extra()``), then ``ItemLockedError`` —
+        an ``InvalidTransitionError`` that must keep its ``item_locked`` code and attempt id — then the rest.
+        """
+        mapped = PublishHandlerMixin._map_publish_error(exc)
+        if mapped is not None:
+            return mapped
+        if isinstance(exc, ItemLockedError):
+            return RequestError(409, str(exc), extra={"code": "item_locked", "attempt_id": exc.attempt_id,
+                                                      "platform": exc.platform, "attempt_status": exc.status})
+        if isinstance(exc, AttemptTakenOverError):
+            return RequestError(409, str(exc), extra={"code": exc.code, "attempt_id": exc.attempt_id})
         if isinstance(exc, ApprovalBlockedError):
             return RequestError(409, str(exc), extra={
                 "blocked": True, "can_force": True, "item_id": exc.item_id, "version": exc.version, "score": exc.score,
@@ -2069,6 +2188,7 @@ class InsiaHandler(BaseHTTPRequestHandler):
     def _h_health(self, *, query: dict[str, list[str]]) -> None:
         data = self.server.manager.health()
         data["token_required"] = self.server.token_required
+        data["publish"] = self._publish_health()  # {"enabled", "configured", "fake", "linkedin", "instagram"}
         self._send_json(200, data)
 
     def _h_sample_brief(self, *, query: dict[str, list[str]]) -> None:
@@ -2270,6 +2390,7 @@ class InsiaHandler(BaseHTTPRequestHandler):
             raise RequestError(404, f"콘텐츠 {item_id}를 찾을 수 없어요")
         payload = detail.model_dump(mode="json")
         payload["exports"] = self._exports_for(item_id, detail.item.channel)
+        payload["publish"] = self._publish_item_block(detail.item)  # null: draw no API publishing UI
         self._send_json(200, payload)
 
     def _h_edit_item(self, item_id: str, *, query: dict[str, list[str]]) -> None:
@@ -2601,8 +2722,16 @@ def _ipv6_unavailable(exc: BaseException) -> bool:
 def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, web_dir: str | Path | None = None,
                 heartbeat: float = 15.0, quiet: bool = True, *, token: str | None = None,
                 public_hosts: Sequence[str] | str = (), trust_proxy: bool = False, workspace: Workspace | None = None,
-                max_live: int | None = None, max_mock: int | None = None) -> InsiaServer:
+                max_live: int | None = None, max_mock: int | None = None, media_port: int | None = None,
+                media_base_url: str | None = None, publish_service: Any = None) -> InsiaServer:
     """Build the server (not started: call ``serve_forever``).
+
+    API publishing (``server_publish.build_publish_service``, sharing the ``RunManager``'s workspace):
+    ``media_port`` / ``media_base_url`` are ``serve --media-port`` / ``--media-base-url`` (default env
+    ``INSIA_MEDIA_PORT`` / ``INSIA_MEDIA_BASE_URL``). With a media port the media-only listener (``/pub/m/…``,
+    nothing else) opens on the same ``host``; if it cannot, the server still starts and Instagram reads
+    ``unavailable``. Ownerless publish attempts are recovered at start. ``publish_service`` replaces the
+    service (tests).
 
     ``token`` defaults to env ``INSIA_ACCESS_TOKEN``; empty ``public_hosts`` to
     env ``INSIA_PUBLIC_HOSTS`` (comma-separated) and ``trust_proxy=False`` to env
@@ -2617,11 +2746,9 @@ def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, w
     cannot be bound.
     """
     token = check_token(token if token is not None and str(token).strip() else os.environ.get("INSIA_ACCESS_TOKEN"))
-    if not public_hosts:
-        public_hosts = [h for h in (os.environ.get("INSIA_PUBLIC_HOSTS") or "").split(",") if h.strip()]
     if not trust_proxy:
         trust_proxy = env_flag("INSIA_TRUST_PROXY")
-    hosts = normalize_public_hosts(public_hosts)
+    hosts = normalize_public_hosts(public_hosts) if public_hosts else env_public_hosts()
     if not is_loopback_bind(host) and token is None:
         raise ServerConfigError(
             f"{host or '모든 네트워크 주소'}에서 서버를 열려면 접근 토큰이 필요해요. INSIA_ACCESS_TOKEN 환경 변수나 --token으로 "
@@ -2638,8 +2765,8 @@ def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, w
     except WorkspaceError as exc:
         raise ServerConfigError(str(exc)) from None
     try:
-        return InsiaServer((host, port), manager, web_root, heartbeat=heartbeat, quiet=quiet, token=token,
-                           public_hosts=hosts, trust_proxy=trust_proxy)
+        server = InsiaServer((host, port), manager, web_root, heartbeat=heartbeat, quiet=quiet, token=token,
+                             public_hosts=hosts, trust_proxy=trust_proxy)
     except BaseException as exc:
         manager.shutdown(timeout=0)
         if address_family_for(host) == socket.AF_INET6 and _ipv6_unavailable(exc):
@@ -2647,6 +2774,36 @@ def make_server(settings: Settings, host: str = "127.0.0.1", port: int = 8765, w
                 f"이 컴퓨터에서는 IPv6 주소({host})로 서버를 열 수 없어요 ({getattr(exc, 'strerror', None) or exc}). "
                 "--host 127.0.0.1(이 컴퓨터에서만) 또는 --host 0.0.0.0(다른 기기에서도, 접근 토큰 필요)을 써 주세요.") from None
         raise
+    try:
+        service = publish_service if publish_service is not None else build_publish_service(
+            settings, manager.workspace, public_hosts=hosts, server_port=int(server.server_address[1]),
+            media_port=media_port, media_base_url=media_base_url, trust_proxy=trust_proxy)
+    except BaseException:
+        server.server_close()
+        raise
+    server.publish = service
+    start_publishing(service, host)
+    return server
+
+
+def start_publishing(service: Any, host: str) -> None:
+    """Start the publishing side of a new server: warnings about the environment, recovery of attempts a dead
+    process left ``sending`` (then every minute in the workspace's recovery loop), the 6-hour maintenance thread
+    (file cleanup, Instagram token refresh — never a post) and, with a media port, the media-only listener.
+    Nothing here may stop the server from starting: a failure is logged and publishing stays as it is."""
+    for warning in getattr(service.settings, "warnings", ()) or ():
+        log.warning("API 게시 설정: %s", warning)
+    if not service.settings.enabled:
+        return
+    steps: list[tuple[str, Callable[[], Any]]] = [("멈춘 게시 시도 정리", service.recover),
+                                                  ("정리·토큰 갱신 작업 시작", service.start_background)]
+    if service.settings.media_port is not None:
+        steps.append(("미디어 전용 포트 열기", lambda: service.start_media_listener(host)))
+    for label, step in steps:
+        try:
+            step()
+        except Exception:  # noqa: BLE001 - publishing never keeps the dashboard from starting
+            log.warning("API 게시: %s에 실패했어요", label, exc_info=True)
 
 
 @contextmanager
@@ -2699,12 +2856,24 @@ def stop_serving(server: InsiaServer | Any, echo: Callable[[str], None] = print)
     server.server_close()
 
 
+def publish_summary(server: InsiaServer | Any) -> str:
+    """The ``serve`` line about API publishing ("API 게시: LinkedIn 연결됨 · …"), ``""`` when it is not configured."""
+    service = getattr(server, "publish", None)
+    if service is None:
+        return ""
+    try:
+        return service.summary_line() or ""
+    except Exception:  # noqa: BLE001
+        log.warning("API 게시 상태를 확인하지 못했어요", exc_info=True)
+        return ""
+
+
 def serve(settings: Settings, host: str = "127.0.0.1", port: int = 8765, web_dir: str | Path | None = None,
           quiet: bool = True, *, token: str | None = None, public_hosts: Sequence[str] | str = (),
-          trust_proxy: bool = False) -> None:
+          trust_proxy: bool = False, media_port: int | None = None, media_base_url: str | None = None) -> None:
     """Run the server until Ctrl+C or SIGTERM (raises ``ServerConfigError`` / ``OSError`` like ``make_server``)."""
     server = make_server(settings, host, port, web_dir, quiet=quiet, token=token, public_hosts=public_hosts,
-                         trust_proxy=trust_proxy)
+                         trust_proxy=trust_proxy, media_port=media_port, media_base_url=media_base_url)
     health = server.manager.health()
     print(f"INSIA 에이전트 스튜디오: {server.url}")
     print(f"기본 모드: {health['mode']} · 모델: {health['model']} · 대시보드 폴더: {server.web_root or '(없음)'}")
@@ -2716,6 +2885,9 @@ def serve(settings: Settings, host: str = "127.0.0.1", port: int = 8765, web_dir
     if server.manager.interrupted_on_start:
         print(f"지난번에 끝나지 못한 실행 {server.manager.interrupted_on_start}개를 '중단됨'으로 정리했어요. "
               "대시보드나 'insia resume <run_id>'로 이어서 실행할 수 있어요.")
+    line = publish_summary(server)
+    if line:
+        print(line)
     print("종료하려면 Ctrl+C를 누르세요.", flush=True)
     with sigterm_as_interrupt():
         try:

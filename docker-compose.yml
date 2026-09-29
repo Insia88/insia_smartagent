@@ -8,6 +8,18 @@
 # 3) docker compose up -d --build  →  http://127.0.0.1:8765 에서 토큰으로 로그인
 #
 # 매일 아침 초안 만들기(호스트의 cron): docker compose exec -T insia insia run-due --limit 3
+#   (run-due는 초안만 만들고 절대 게시하지 않아요)
+# 백업: docker compose exec insia insia backup --out /data/backups/<날짜>  (API 게시 토큰이 든 credentials/는 빠져요.
+#   /data/credentials는 uid 10001 소유 0700이라 호스트에서 workspace를 통째로 복사하면 권한 오류가 나요)
+#
+# API 게시(선택, LinkedIn·인스타그램): 사람이 대시보드에서 미리보기를 확인하고 누를 때만 한 건씩 올려요.
+#   설정 순서는 docs/operations.md "12. API 게시". 토큰은 /data/credentials/(0600)에만 저장돼요.
+#   LinkedIn: 대시보드 브랜드·자료 → API 게시 연결에서 앱 정보를 넣거나 .env에 INSIA_LINKEDIN_CLIENT_ID·
+#     INSIA_LINKEDIN_CLIENT_SECRET·INSIA_LINKEDIN_REDIRECT_URI를 적어요(환경 변수로 정하면 대시보드에서 바꿀 수 없어요).
+#   인스타그램(시험 중, 기본 꺼짐): .env에 INSIA_PUBLISH_INSTAGRAM=1, 카드 이미지를 그리려면 INSIA_WITH_RENDER=1로 다시 빌드,
+#     이미지만 공개할 https 주소(INSIA_MEDIA_BASE_URL)와 미디어 포트(INSIA_MEDIA_PORT=8766) + 아래 ports의 8766 줄 주석 해제.
+#     대시보드(8765)는 계속 127.0.0.1에만 두고, 터널·프록시는 8766의 /pub/m/ 경로만 연결해요.
+#   끄기: INSIA_PUBLISH=0 (게시 기능 전체를 숨겨요)
 services:
   insia:
     build:
@@ -28,11 +40,24 @@ services:
       INSIA_MODEL: "${INSIA_MODEL:-}"  # 비우면 기본 모델
       INSIA_PUBLIC_HOSTS: "${INSIA_PUBLIC_HOSTS:-}"  # HTTPS 리버스 프록시 뒤에서 쓸 도메인 (예: insia.example.com)
       INSIA_TRUST_PROXY: "${INSIA_TRUST_PROXY:-0}"  # 프록시가 HTTPS를 처리하면 1 (로그인 쿠키에 Secure)
+      # API 게시 (선택 — 비워 두면 지금과 똑같이 동작해요. docs/operations.md "12. API 게시")
+      INSIA_PUBLISH: "${INSIA_PUBLISH:-}"  # 0 = API 게시 기능 전체 끄기
+      INSIA_LINKEDIN_CLIENT_ID: "${INSIA_LINKEDIN_CLIENT_ID:-}"  # 내 LinkedIn 개발자 앱 (대시보드에서 넣어도 돼요)
+      INSIA_LINKEDIN_CLIENT_SECRET: "${INSIA_LINKEDIN_CLIENT_SECRET:-}"
+      INSIA_LINKEDIN_REDIRECT_URI: "${INSIA_LINKEDIN_REDIRECT_URI:-}"  # 비우면 http://localhost:8765/oauth/linkedin/callback
+      INSIA_LINKEDIN_VERSION: "${INSIA_LINKEDIN_VERSION:-}"  # 비우면 INSIA 기본 버전
+      INSIA_PUBLISH_INSTAGRAM: "${INSIA_PUBLISH_INSTAGRAM:-}"  # 1 = 인스타그램 API 게시 켜기 (시험 중, INSIA_WITH_RENDER=1 필요)
+      INSIA_IG_API_VERSION: "${INSIA_IG_API_VERSION:-}"  # 비우면 v25.0
+      INSIA_MEDIA_BASE_URL: "${INSIA_MEDIA_BASE_URL:-}"  # 인스타그램이 이미지를 가져갈 https 주소 (예: https://media.example.com)
+      INSIA_MEDIA_PORT: "${INSIA_MEDIA_PORT:-}"  # 이미지 전용 포트 (예: 8766, /pub/m/ 이미지 말고는 모두 404)
     volumes:
-      - ./workspace:/data  # 워크스페이스: 이 폴더를 통째로 백업하면 돼요
+      - ./workspace:/data  # 워크스페이스. 백업은 insia backup으로 (credentials/는 빼고 복사해요)
     ports:
       # 기본은 이 컴퓨터에서만 접속할 수 있어요 (127.0.0.1).
       # 인터넷에 열 때는 이 줄을 그대로 두고, 같은 서버의 HTTPS 리버스 프록시(Caddy·nginx 등)가
       # 127.0.0.1:8765로 전달하게 한 뒤 .env에 INSIA_PUBLIC_HOSTS=도메인, INSIA_TRUST_PROXY=1을 적어요.
       # "8765:8765"처럼 모든 주소에 직접 여는 것은 권하지 않아요 (토큰이 HTTPS 없이 오가요).
       - "127.0.0.1:8765:8765"
+      # 인스타그램 API 게시용 이미지 전용 포트 (INSIA_MEDIA_PORT=8766일 때만 주석 해제). 이 포트도 127.0.0.1에만 열고,
+      # 같은 서버의 Caddy·cloudflared가 https://미디어도메인/pub/m/* 만 127.0.0.1:8766으로 전달하게 해요.
+      # - "127.0.0.1:8766:8766"

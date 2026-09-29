@@ -102,6 +102,10 @@ class BudgetExceeded(PipelineError):
         self.stopped = list(stopped)
 
 
+# A channel whose item has a live API publish attempt (db.ItemLockedError) is not stored (DESIGN.md 5-4).
+STORE_SKIPPED_MESSAGE = "이 콘텐츠를 API로 게시하는 중이라 이번 결과를 보관함에 넣지 않았어요. 실행 기록에는 남아요."
+
+
 def new_run_id(now: datetime | None = None) -> str:
     now = now or datetime.now(timezone.utc)
     return f"{now:%Y%m%d-%H%M%S}-{secrets.token_hex(2)}"
@@ -504,20 +508,53 @@ class _Recorder:
     kept in the history only (``Workspace.add_run_version``), the channel is
     listed in ``superseded`` (saved in the run's progress as
     ``superseded_channels`` and reported in ``run.completed``) and ``notify`` gets a Korean warning once per channel.
+
+    An item that is being published through the API (a ``sending``/``unknown`` attempt, ``db.ItemLockedError``)
+    is never written: that channel's rounds and result stay in the run's own record only, ``on_skip`` reports it
+    once (the ``channel.store_skipped`` event) and the other channels go on (DESIGN.md 5-4). This module never
+    imports the publishing package.
     """
 
     def __init__(self, workspace: "Workspace | None", run_id: str, brief: Brief, *, progress: dict[str, Any] | None = None,
                  version_ids: dict[tuple[str, int], str] | None = None,
-                 notify: Callable[[str, str], None] | None = None) -> None:
+                 notify: Callable[[str, str], None] | None = None,
+                 on_skip: Callable[[str, dict[str, Any]], None] | None = None) -> None:
         self.workspace = workspace
         self.run_id = run_id
         self.brief = brief
         self.progress: dict[str, Any] = {"channels": {}, "followups": {}, "questions": [], **(progress or {})}
+        self.progress.pop("store_skipped", None)  # a resumed run tries to store again (the lock may be gone)
         self.version_ids: dict[tuple[str, int], str] = dict(version_ids or {})
         self.lease: "RunLease | None" = None  # set once the run is claimed: no more writes after a takeover
         self.notify = notify  # (channel, message): a warning for the run's event stream
+        self.on_skip = on_skip  # (channel, info): the channel's item is locked by an API publish attempt
         self._warned: set[str] = set()
         self._lock = threading.RLock()
+
+    @property
+    def store_skipped(self) -> dict[str, dict[str, Any]]:
+        """Channels whose item was locked by an API publish attempt, so nothing of theirs was stored: ``{channel: info}``."""
+        with self._lock:
+            return {ch: dict(info) for ch, info in (self.progress.get("store_skipped") or {}).items()}
+
+    def _skipped(self, channel: str) -> bool:
+        with self._lock:
+            return channel in (self.progress.get("store_skipped") or {})
+
+    def _locked(self, channel: str, exc: Exception) -> None:
+        """Remember (and report once) that ``channel``'s item is locked by a live API publish attempt."""
+        info = {"item_id": self.item_id(channel), "attempt_id": getattr(exc, "attempt_id", ""),
+                "platform": getattr(exc, "platform", ""), "status": getattr(exc, "status", ""),
+                "message": STORE_SKIPPED_MESSAGE}
+        with self._lock:
+            known = self.progress.setdefault("store_skipped", {})
+            first = channel not in known
+            known[channel] = info
+        if first and self.on_skip is not None:
+            try:
+                self.on_skip(channel, dict(info))
+            except Exception:  # noqa: BLE001 - a notice must never stop the run
+                log.debug("store_skipped notice failed", exc_info=True)
 
     @property
     def superseded(self) -> dict[str, dict[str, Any]]:
@@ -590,13 +627,19 @@ class _Recorder:
             self.workspace.update_run(self.run_id, research=pack, progress=self.progress)
 
     def draft(self, draft: Draft) -> None:
-        if self.workspace is None:
+        if self.workspace is None or self._skipped(draft.channel):
             return
+        from .db import ItemLockedError
+
         item_id = self.item_id(draft.channel)
         with self._lock:
             self._guard()
             self.workspace.ensure_item(item_id, draft.channel, draft.title, run_id=self.run_id, brief=self.brief)
-            stored = self.workspace.add_run_version(item_id, draft, run_id=self.run_id)
+            try:
+                stored = self.workspace.add_run_version(item_id, draft, run_id=self.run_id)
+            except ItemLockedError as exc:
+                self._locked(draft.channel, exc)
+                return
             self.version_ids[(draft.channel, draft.round)] = stored.version.id
         if stored.restored is not None:  # a person's edit or decision stays current; this round is history only
             self._mark_superseded(draft.channel, {"version": stored.version.version,
@@ -605,15 +648,22 @@ class _Recorder:
                                                   "reason": stored.reason}, draft.round)
 
     def review(self, draft: Draft, review: Review) -> None:
-        if self.workspace is None:
+        if self.workspace is None or self._skipped(draft.channel):
             return
+        from .db import ItemLockedError
+
         with self._lock:
             version_id = self.version_ids.get((draft.channel, draft.round))
             if version_id is None:  # drafted before recording started (should not happen): store it now
                 self.draft(draft)
+                if self._skipped(draft.channel):
+                    return
                 version_id = self.version_ids[(draft.channel, draft.round)]
             self._guard()
-            self.workspace.attach_review(version_id, review, run_id=self.run_id)
+            try:
+                self.workspace.attach_review(version_id, review, run_id=self.run_id)
+            except ItemLockedError as exc:
+                self._locked(draft.channel, exc)
 
     def followup_done(self, channel: str, round: int, store: researcher.ResearchStore) -> None:
         if self.workspace is None:
@@ -627,12 +677,19 @@ class _Recorder:
     def channel_completed(self, result: ChannelResult) -> None:
         if self.workspace is None:
             return
+        from .db import ItemLockedError
+
         with self._lock:
             self._guard()
-            self.workspace.upsert_item_from_result(self.run_id, result, self.brief)
-            moved = self.workspace.run_item_superseded(self.run_id, result.channel)
-            if moved is not None:  # e.g. a person edited the item after the last round: the final draft is history only
-                self._mark_superseded(result.channel, moved)
+            if not self._skipped(result.channel):
+                try:
+                    self.workspace.upsert_item_from_result(self.run_id, result, self.brief)
+                except ItemLockedError as exc:
+                    self._locked(result.channel, exc)
+            if not self._skipped(result.channel):
+                moved = self.workspace.run_item_superseded(self.run_id, result.channel)
+                if moved is not None:  # e.g. a person edited the item after the last round: the final draft is history only
+                    self._mark_superseded(result.channel, moved)
             self.progress["channels"][result.channel] = "completed"
             self._save_progress()
 
@@ -797,10 +854,16 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
                            initial=workspace.run_cost(run_id) if workspace is not None else 0.0)
         ctx = AgentContext(bus=bus, backend=backend, settings=settings, brief=brief, simulated=simulated, context=context,
                            checkpoint=make_checkpoint(runner, meter, lost), wait=make_wait(runner, bus))
+        def store_skipped(channel: str, info: dict[str, Any]) -> None:
+            label = channel_label(channel)
+            bus.emit("channel.store_skipped", "orchestrator", {"channel": channel, **info})
+            ctx.log(f"{label}: {info.get('message') or STORE_SKIPPED_MESSAGE}", "warn", "orchestrator")
+
         recorder = _Recorder(workspace, run_id, brief,
                              progress=resume_state.progress if resume_state else None,
                              version_ids=resume_state.version_ids if resume_state else None,
-                             notify=lambda channel, message: ctx.log(message, "warn", "orchestrator"))
+                             notify=lambda channel, message: ctx.log(message, "warn", "orchestrator"),
+                             on_skip=store_skipped)
         if hasattr(backend, "on_notice"):
             backend.on_notice = lambda agent, level, message: bus.emit("log", agent, {"level": level, "message": message})  # type: ignore[attr-defined]
         restore_hooks = install_backend_hooks(backend, context, meter)
@@ -949,6 +1012,11 @@ def run_pipeline(brief: Brief, backend: Backend, bus: EventBus, settings: Settin
                 completed["superseded"] = True  # same flags as an item job's run.completed
                 completed["superseded_by_human_edit"] = any(i.get("superseded_by_human_edit") for i in superseded.values())
                 completed["superseded_channels"] = superseded
+            skipped = recorder.store_skipped
+            if skipped:  # items being published through the API: these channels' results are in the run record only
+                completed["store_skipped"] = sorted(skipped)
+                completed["warnings"] = [f"{channel_label(ch)}: {info.get('message') or STORE_SKIPPED_MESSAGE}"
+                                         for ch, info in skipped.items()]
         if meter.spent:
             completed["cost_usd"] = round(meter.spent, 6)
         if lost():  # taken over at the very end: the new owner finishes and records the run

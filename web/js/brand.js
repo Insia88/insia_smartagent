@@ -4,6 +4,11 @@
  * blind-review note), a completeness meter, and the documents list: upload .txt/.md
  * read in the browser (UTF-8, falling back to EUC-KR), paste text, preview, delete.
  * PDF/DOCX are not parsed here; the user is pointed to `insia docs add`.
+ *
+ * The "API 게시 연결" card (#/brand/connections, drawn by publish.js) is the only place where API publishing is
+ * set up. `#/brand/connections/linkedin/<result>` is where the LinkedIn OAuth callback sends the browser back
+ * (the router passes "connections/linkedin/<result>" as the param; publish.js shows the sentence and replaces
+ * the address with #/brand/connections).
  */
 (function () {
   'use strict';
@@ -70,7 +75,9 @@
     docsError: null,
     docMsgs: [],
     confirmDelete: '',
-    previewDoc: ''
+    previewDoc: '',
+    connParam: '',        // the route param for the API 게시 연결 card, consumed by the next render
+    connNav: false        // the next render follows a navigation: reload the publishing status
   };
 
   function show(container, param, ctx) {
@@ -86,7 +93,9 @@
       if (ctx && ctx.focus) ui.focusHeading(document.getElementById('brandTitle'));
       return;
     }
-    render(ctx && ctx.focus);
+    B.connParam = param || '';
+    B.connNav = true;
+    render(ctx && ctx.focus && !/^connections/.test(B.connParam));
     if (!B.profile) loadProfile();
     loadDocs();
   }
@@ -168,11 +177,20 @@
       el('div', { class: 'brand-layout' }, [
         el('div', { class: 'brand-meter', id: 'brandMeter' }),
         el('div', { class: 'brand-form' }, formCol),
-        el('section', { class: 'brand-docs card', id: 'brandDocs', 'aria-labelledby': 'docsTitle' })
+        el('section', { class: 'brand-docs card', id: 'brandDocs', 'aria-labelledby': 'docsTitle' }),
+        // filled by publish.js only when the server has API publishing turned on (INSIA_PUBLISH=0 → stays hidden)
+        el('section', { class: 'brand-conn card', id: 'brandConn', 'aria-labelledby': 'pubConnTitle', hidden: true })
       ])
     ]);
     refreshMeta();
     renderDocs();
+    var conn = document.getElementById('brandConn');
+    if (conn && I.publish && I.publish.connectionsCard) {
+      var param = B.connParam, nav = B.connNav;
+      B.connParam = '';
+      B.connNav = false;
+      I.publish.connectionsCard(conn, { param: param, focus: !!param, reload: nav });
+    }
     if (focus) ui.focusHeading(document.getElementById('brandTitle'));
   }
 

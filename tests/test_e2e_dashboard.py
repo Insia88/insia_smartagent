@@ -4,7 +4,11 @@ Covers the weekly journey a founder runs: 브랜드·자료 (profile + documents
 보관함 (blind check, review panel, edit, 재검수, 수정 요청, approval gate, schedule, publish) →
 exports → 캘린더 (plan, generate, move, skip) → 사용량 → restart (replay + resume an interrupted
 run) → token login/logout → phone width → agent results vs. a person's edit (kept in history or not),
-an edit refused (409) while a job runs and restored afterwards, the bizplan blind preview.
+an edit refused (409) while a job runs and restored afterwards, the bizplan blind preview, and API publishing
+(publish.js): a workspace that never set it up renders the 보관함 detail exactly as before; the same server with
+the fake-transport service (``INSIA_PUBLISH_FAKE=1``, temporary workspace) walks LinkedIn connect → approve →
+confirm dialog → publish → "게시 완료 · API"; the Instagram button and 'AI 정보' choice (no default, locked while
+the cards render) and the failed result's retry, driven in the page.
 
 Needs Playwright and a Chromium build. The browser comes from ``INSIA_CHROMIUM``, else
 ``/opt/pw-browsers/chromium`` when it exists, else Playwright's own download. Without them the
@@ -20,6 +24,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import replace
@@ -41,6 +46,8 @@ from insia_agents.config import Settings, today_kst  # noqa: E402
 from insia_agents.db import Workspace  # noqa: E402
 from insia_agents.exporters import capabilities  # noqa: E402
 from insia_agents.models import Draft  # noqa: E402
+from insia_agents.publishers.service import PublishService  # noqa: E402
+from insia_agents.publishers.settings import PublishSettings  # noqa: E402
 from insia_agents.server import make_server  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -283,6 +290,9 @@ def test_01_profile_and_documents(e2e, page, tmp_path):
     shot(e2e, page, "01_documents")
     docs = srv.api("/api/documents")["documents"]
     assert [(d["id"], d["kind"], d["title"]) for d in docs] == [("u1", "markdown", "회사 소개서")]
+    # API 게시 연결 (publish.js): the only place publishing is set up, optional while nothing is (test_19 drives it)
+    page.wait_for_selector('#brandConn:not([hidden]) .pub-platform[data-platform="linkedin"]')
+    assert page.inner_text("#brandConn .docs-head") == "API 게시 연결\n선택 기능"
     no_js_errors(page)
     e2e["done"].add("profile")
 
@@ -440,6 +450,7 @@ def test_06_approval_gate_schedule_publish(e2e, page):
     assert page.locator(".detail-head .forced-pill").count() == 0  # a passed review: a normal approval
     day = (date.fromisoformat(today_kst()) + timedelta(days=3)).isoformat()
     page.click('[data-key="act-schedule"]')
+    assert page.inner_text(".action-panel .panel-hint") == "INSIA는 예정일에 자동으로 게시하지 않아요. 날짜는 알림용이에요."  # DESIGN 10-2
     page.fill("#schedDate", day)
     page.click(".action-panel .btn--primary")
     page.wait_for_selector('.detail-head .status-pill[data-status="scheduled"]')
@@ -813,3 +824,361 @@ def test_16_blind_preview_of_school_and_employer_names_is_never_shown_as_passed(
         no_js_errors(page)
     finally:
         srv.api("/api/profile", before, method="PUT")
+
+
+# ---------------------------------------------------------------------------
+# API publishing (web/js/publish.js). The dashboard package's tests have a 1-second budget together (DESIGN.md
+# 12-3 #10, 14.5), so they stay on the 보관함 screen of this page (no reload, no second server or browser) and
+# click through the DOM (the same handlers, without Playwright's ~80 ms of actionability waits per click).
+#   17: a workspace that never set publishing up renders the 보관함 detail exactly as without publish.js.
+#   18: the same server gets the fake-transport service (in-memory LinkedIn, nothing leaves the machine):
+#       connected → approved item → confirm dialog → one send → "게시 완료 · API".
+#   19: publish.js on its own, with the dashboard's request layer answered in place: the connection card (as an
+#       unconfigured workspace sees it, then the address-paste connection), the Instagram button and 'AI 정보'
+#       choice, the failed result's "다시 확인하고 게시".
+# ---------------------------------------------------------------------------
+
+_PUBLISH_DOM = """() => ({
+  card: document.querySelector('.actions-card').outerHTML,
+  head: document.querySelector('.detail-head').outerHTML,
+  buttons: [...document.querySelectorAll('.actions-card .action-row button')].map(b => b.textContent),
+  extra: document.querySelectorAll('.btn--api, .pub-section, #pubDialog, [data-key^="api-"], [data-via="api"]').length
+})"""
+_ATTEMPT_GET = "**/api/publish/attempts/*"
+_LI_POST = ("혼자 창업하면 마케팅은 늘 '이번 주만 넘기고'가 돼요.\n\n"
+            "그래서 조사와 검수부터 에이전트에게 맡기고, 저는 마지막 확인만 해요.\n\n"
+            "여러분은 어떤 일을 먼저 덜어 내고 싶나요?")
+
+
+def goto_hash(page, route: str) -> None:
+    """Change the route inside the loaded dashboard (no reload) and return once the router has handled it: a new
+    item's detail then shows its loading state, so later waits never match the previous screen."""
+    changed = page.evaluate("""h => new Promise(done => {
+      if (location.hash === h) { done(false); return; }  // no hashchange, nothing would be drawn again
+      window.addEventListener('hashchange', () => done(true), { once: true });
+      location.hash = h;
+    })""", route)
+    assert changed, f"이미 {route} 화면이에요"
+
+
+def press(page, selector: str) -> None:
+    """``element.click()`` once the element is shown and enabled (the handlers a mouse click runs; a disabled
+    control ignores both). Waits at most 2 s, frame by frame, like Playwright's own checks but without their
+    ~80 ms per click."""
+    state = page.evaluate("""([s, ms]) => new Promise(done => {
+      const start = performance.now();
+      const attempt = () => {
+        const e = document.querySelector(s);
+        const why = !e ? 'missing' : !e.getClientRects().length ? 'hidden' : e.disabled ? 'disabled' : '';
+        if (!why) { e.click(); done('ok'); }
+        else if (performance.now() - start > ms) done(why);
+        else requestAnimationFrame(attempt);
+      };
+      attempt();
+    })""", [selector, 2000])
+    assert state == "ok", f"{selector}: {state}"
+
+
+def wait_for(page, selector: str) -> None:
+    """Returns on the DOM change that adds ``selector`` (``wait_for_selector`` polls once per animation frame)."""
+    found = page.evaluate("""([s, ms]) => new Promise(done => {
+      if (document.querySelector(s)) { done(true); return; }
+      const seen = new MutationObserver(() => {
+        if (document.querySelector(s)) { seen.disconnect(); clearTimeout(timer); done(true); }
+      });
+      const timer = setTimeout(() => { seen.disconnect(); done(false); }, ms);
+      seen.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+    })""", [selector, TIMEOUT_MS])
+    assert found, f"{selector}: 나타나지 않았어요"
+
+
+def wait_route(page, held: list, timeout_ms: int = 10_000):
+    """The first request a ``page.route`` handler kept (Playwright hands routes over only inside its own calls)."""
+    waited = 0
+    while not held:
+        assert waited < timeout_ms, "요청이 오지 않았어요"
+        page.wait_for_timeout(5)
+        waited += 5
+    return held[0]
+
+
+def test_17_unconfigured_workspace_shows_no_publishing_ui_in_the_library(e2e, page):
+    need(e2e, "approval")
+    srv = e2e["server"]
+    item_id = e2e["linkedin"]  # approved (forced) in test_06, never published
+    detail = srv.api(f"/api/items/{item_id}")
+    assert detail["item"]["status"] == "approved" and detail.get("publish") is None  # configured=false → publish: null
+    assert srv.api("/api/publish")["configured"] is False
+    goto_hash(page, "#/library/" + item_id)
+    wait_for(page, '[data-key="act-publish"]')
+    # the same detail drawn again with publish.js unplugged is the dashboard as it was before API publishing
+    with_hooks, without_hooks = page.evaluate("""([id, grab]) => {
+      const I = window.INSIA, hooks = I.publish, dom = new Function('return (' + grab + ')()');
+      const withHooks = dom();
+      I.publish = undefined;
+      try { I.ws.go('library', id, { focus: false }); return [withHooks, dom()]; } finally { I.publish = hooks; }  // same route: drawn again
+    }""", [item_id, _PUBLISH_DOM])
+    assert with_hooks == without_hooks
+    assert with_hooks["buttons"] == ["게시 완료 표시", "게시 예정일 정하기", "재검수", "수정 요청", "보관"]  # 게시 완료 표시 stays first
+    assert with_hooks["extra"] == 0
+    shot(e2e, page, "17_unconfigured_detail")
+    no_js_errors(page)
+    e2e["done"].add("publish_unconfigured")
+
+
+def test_18_fake_publish_connect_confirm_and_publish_once(e2e, page):
+    need(e2e, "publish_unconfigured")
+    srv = e2e["server"]
+    server = srv.srv
+    workspace = server.manager.workspace
+    env = {"INSIA_PUBLISH_FAKE": "1", "INSIA_PUBLISH_FAKE_ALLOW": str(workspace.home),  # allowed wherever the temp dir is
+           "INSIA_CREDENTIALS_DIR": str(e2e["root"] / "publish-credentials")}
+    settings = PublishSettings.from_env(env, workspace.home, server_port=server.server_address[1])
+    assert settings.enabled and settings.fake, settings.disabled_reason  # a refused fake mode fails; it never skips
+    service = PublishService(settings, workspace)  # what `INSIA_PUBLISH_FAKE=1 insia serve` builds, on this workspace
+    unconfigured, server.publish = server.publish, service
+    posts: list[str] = []
+
+    def record(request) -> None:
+        if request.method == "POST" and re.search(r"/publish(/preview)?$", request.url):
+            posts.append(request.url.rsplit("/", 1)[-1])  # "publish" | "preview"
+
+    polls: list = []
+    page.on("request", record)
+    try:
+        li_id = e2e["linkedin"]
+        li_draft = srv.api(f"/api/items/{li_id}")["versions"][-1]["draft"]
+        srv.api(f"/api/items/{li_id}/draft", {"title": li_draft["title"], "content": _LI_POST, "hashtags": li_draft["hashtags"]},
+                method="PUT")  # the recorded draft keeps [대표 경험: …] placeholders, which block publishing
+        srv.api(f"/api/items/{li_id}/status", {"status": "approved", "force": True, "note": "그래도 승인 · E2E"})
+
+        # connected the way the card does it (test_19 drives the card itself): app info, then the pasted address
+        srv.api("/api/publish/linkedin/app", {"client_id": "e2e-client-id", "client_secret": "e2e-client-secret"}, method="PUT")
+        start = srv.api("/api/publish/linkedin/connect", {})
+        assert start["mode"] == "paste"  # the redirect URI is on localhost, this request on 127.0.0.1
+        state = urllib.parse.parse_qs(urllib.parse.urlsplit(start["authorize_url"]).query)["state"][0]
+        connected = srv.api("/api/publish/linkedin/complete", {"url": f"{start['redirect_uri']}?code=e2e-code&state={state}"})
+        assert connected["state"] == "connected"
+
+        # LinkedIn: confirm dialog → one send → "게시 완료 · API"
+        page.evaluate("id => INSIA.ws.go('library', id, { focus: false })", li_id)  # test_17 left it on screen: draw it again
+        wait_for(page, '[data-key="act-api-publish"]:not([disabled])')
+        buttons = page.eval_on_selector_all(".actions-card .action-row button", "bs => bs.map(b => b.textContent)")
+        assert buttons[0] == "게시 완료 표시" and buttons[-1] == "LinkedIn에 API로 게시"  # added at the end, nothing moves
+        press(page, '[data-key="act-api-publish"]')
+        wait_for(page, "#pubDialog[open] .pub-text")
+        dialog = page.evaluate("""() => ({ focus: document.activeElement.id, send: document.getElementById('pubSend').disabled,
+                                           notices: document.querySelector('#pubDialog .pub-notices').textContent })""")
+        assert dialog["focus"] == "pubTitle" and dialog["send"] is True  # nothing can be sent before the checkbox
+        assert "예약·반복 게시를 하지 않아요" in dialog["notices"] and "게시 완료 표시" in dialog["notices"]
+        shot(e2e, page, "18_linkedin_dialog")
+        page.route(_ATTEMPT_GET, lambda route: polls.append(route) if not polls else route.continue_())
+        press(page, "#pubConfirm")
+        # two clicks in a row: the first turns the button off at once, so only one request goes out
+        page.eval_on_selector("#pubSend", "b => { b.click(); b.click(); }")
+        wait_for(page, '[data-key="api-progress"]')  # the first poll is held: still sending
+        sending = page.evaluate("""() => ({ button: document.querySelector('[data-key="act-api-publish"]').textContent,
+                                            locked: ['edit', 'act-publish', 'act-review', 'act-archive'].map(k => document.querySelector('[data-key="' + k + '"]').disabled) })""")
+        assert sending == {"button": "게시 중…", "locked": [True, True, True, True]}  # nothing changes the item meanwhile
+        wait_route(page, polls).continue_()
+        wait_for(page, '.detail-head .status-pill[data-via="api"]')
+        published = page.evaluate("""() => ({ pill: document.querySelector('.detail-head .status-pill').textContent,
+                                              logos: document.querySelectorAll('.actions-card img, .actions-card svg[data-brand]').length })""")
+        assert "게시 완료 · API" in published["pill"] and published["logos"] == 0  # plain names, no platform logos
+        assert posts == ["preview", "publish"], posts
+        done = srv.api(f"/api/items/{li_id}")
+        assert done["item"]["status"] == "published" and done["item"]["published_via"] == "fake"
+        shot(e2e, page, "18_linkedin_published")
+        no_js_errors(page)
+    finally:
+        page.remove_listener("request", record)
+        for route in polls[:1]:  # a failed wait must not leave the page's poll hanging
+            try:
+                route.continue_()
+            except Exception:  # noqa: BLE001 - already continued
+                pass
+        page.unroute(_ATTEMPT_GET)
+        server.publish = unconfigured
+        try:  # later tests see an unconfigured workspace again
+            service.disconnect("linkedin", forget_app=True)
+        except Exception:  # noqa: BLE001 - an unsettled attempt keeps its connection; nothing else to undo
+            pass
+        service.shutdown(timeout=2.0)
+
+
+# publish.js driven with its request layer (INSIA.ws.get/post) answered in place, on this loaded page. Returns what
+# it saw; the assertions are in Python.
+_PUBLISH_STATES = r"""async () => {
+  const I = window.INSIA, ws = I.ws, pub = I.publish, real = { get: ws.get, post: ws.post };
+  const calls = [], out = {}, reply = {};
+  let status = null;  // null: GET /api/publish goes to the real server
+  const settle = () => new Promise(r => setTimeout(r, 0));
+  const until = async (fn, what) => {
+    const t0 = performance.now();
+    while (!fn()) { if (performance.now() - t0 > 5000) throw new Error('기다렸지만 없어요: ' + what); await new Promise(r => setTimeout(r, 2)); }
+  };
+  const q = s => document.querySelector(s);
+  ws.get = function (path) {
+    if (path === '/api/publish' && status) return Promise.resolve(status);
+    return real.get.apply(ws, arguments);
+  };
+  ws.post = function (path, body) {
+    const m = /\/(publish\/preview|publish|linkedin\/connect|linkedin\/complete)$/.exec(path);
+    if (!m || !reply[m[1]]) return real.post.apply(ws, arguments);
+    calls.push([m[1], body]);
+    return reply[m[1]](body);
+  };
+  const li = { state: 'connected', app: { client_id_set: true, client_secret_set: true, source: 'workspace', redirect_uri: 'http://localhost:8765/oauth/linkedin/callback' },
+               account: { name: 'E2E', kind: 'LinkedIn 개인 프로필', id_hint: '…ab12' }, token: { days_left: 59 } };
+  const statusWith = (linkedin, instagram) => ({ enabled: true, configured: true, fake: false, media: {}, platforms: { linkedin: linkedin, instagram: instagram } });
+  const ctxFor = (id, platform, block) => {
+    const ctx = {
+      item: { id: id, status: 'approved', channel: platform }, busy: false, editing: false, job: false, panel: '', refreshed: 0,
+      detail: { publish: Object.assign({ platform: platform, state: 'connected', available: true, reason: '', blocked_by: '',
+                                         blockers: [], active_attempt: null, last_attempt: null }, block) },
+      getPanel: () => ctx.panel, setPanel: k => { ctx.panel = k; }, rerender: () => {},
+      refresh: () => { ctx.refreshed++; return Promise.resolve(); }, edit: () => {}
+    };
+    return ctx;
+  };
+  const setStatus = async ig => {  // the next button() call loads it (once), as on the 보관함 screen
+    status = statusWith(li, ig);
+    pub.invalidate();
+    pub.button(ctxFor('c-probe', 'instagram', {}));
+    await settle(); await settle();
+  };
+  const shown = b => b ? { text: b.textContent, disabled: b.disabled } : null;
+  const preview = (platform, extra) => Object.assign({
+    preview_id: 'pv-' + platform, preview_hash: 'sha256:' + '0'.repeat(64), expires_at: new Date(Date.now() + 1800e3).toISOString(),
+    platform: platform, item: { id: 'c-' + platform, version: 2, title: '상태 확인' }, account: { name: 'E2E' },
+    content: { text: '미리보기 글이에요.', chars: 9, limit: platform === 'instagram' ? 2200 : 3000, hashtags: ['#1인창업'] },
+    slides: [], errors: [], warnings: [], notices: [], quota: null, first_comment_link: '', request_preview: [], can_publish: true
+  }, extra || {});
+  const box = document.createElement('section');
+  box.className = 'brand-conn card';
+  try {
+    // the connection card as a workspace that never set publishing up sees it (the server's own status)
+    document.body.appendChild(box);
+    pub.invalidate();
+    pub.connectionsCard(box, { reload: true });
+    await until(() => box.querySelector('.pub-platform[data-platform="linkedin"]') && box.querySelector('.docs-head .fold-meta'), 'card');
+    out.card = { meta: box.querySelector('.docs-head .fold-meta').textContent, fake: !!box.querySelector('.pub-fake'),
+                 logos: box.querySelectorAll('img, svg[data-brand]').length, consent: box.textContent.includes('권한 있는 서비스'),
+                 editRedirect: !!box.querySelector('[data-key="conn-edit-redirect"]'), suggest: !!box.querySelector('[data-key="conn-suggest-redirect"]'),
+                 connect: !!box.querySelector('[data-key="conn-li-connect"]') };
+    // the address-paste connection once the app info is saved (LinkedIn's side made up here)
+    status = statusWith(Object.assign({}, li, { state: 'not_connected', account: null, token: null }), { state: 'disabled' });
+    reply['linkedin/connect'] = () => Promise.resolve({ mode: 'paste', authorize_url: 'https://www.linkedin.com/oauth/v2/authorization?response_type=code&state=st-e2e',
+      redirect_uri: 'http://localhost:8765/oauth/linkedin/callback', open_url: 'http://localhost:8765/#/brand/connections', expires_in: 600 });
+    reply['linkedin/complete'] = () => { status = statusWith(li, { state: 'disabled' }); return Promise.resolve(li); };
+    pub.connectionsCard(box, { reload: true });
+    await until(() => box.querySelector('[data-key="conn-li-connect"]'), 'connect button');
+    box.querySelector('[data-key="conn-li-connect"]').click();
+    await until(() => box.querySelector('#connLiPaste'), 'paste box');
+    out.paste = { open: box.querySelector('[data-key="conn-open-origin"]').getAttribute('href'), focus: document.activeElement.dataset.key };
+    const pasted = 'http://localhost:8765/oauth/linkedin/callback?code=c-e2e&state=st-e2e';
+    const area = box.querySelector('#connLiPaste');
+    area.value = pasted;
+    area.dispatchEvent(new Event('input'));
+    box.querySelector('[data-key="conn-paste-done"]').click();
+    await until(() => box.querySelector('.pub-platform[data-platform="linkedin"] .pub-badge[data-kind="ok"]'), 'connected badge');
+    out.paste.sent = calls.map(c => [c[0], c[1]]);
+    out.paste.said = box.textContent.includes('LinkedIn 계정을 연결했어요');
+    out.paste.disconnect = !!box.querySelector('[data-key="conn-disc-linkedin"]');
+    box.remove();
+    calls.length = 0;
+
+    // the Instagram button: only once a token was pasted (an account is known), even while LinkedIn is set up
+    await setStatus({ state: 'not_connected', account: null, token: null, requirements: {} });
+    out.igNotConnected = shown(pub.button(ctxFor('c-ig', 'instagram', { state: 'not_connected', available: false })));
+    out.igNotConfigured = shown(pub.button(ctxFor('c-ig', 'instagram', { state: 'not_configured', available: false })));
+    out.igUnavailableNoAccount = shown(pub.button(ctxFor('c-ig', 'instagram', { state: 'unavailable', available: false, blockers: ['render_unavailable'] })));
+    await setStatus({ state: 'unavailable', account: { id_hint: '…0001', username: '@insia' }, token: null, requirements: { render: false } });
+    out.igUnavailableAccount = shown(pub.button(ctxFor('c-ig', 'instagram', { state: 'unavailable', available: false, blockers: ['render_unavailable'] })));
+    await setStatus({ state: 'connected', account: { id_hint: '…0001', username: '@insia' }, token: { days_left: 50 }, requirements: {} });
+    out.igConnected = shown(pub.button(ctxFor('c-ig', 'instagram', {})));
+
+    // the 'AI 정보' pair: nothing chosen, no preview, nothing to send; a choice renders the cards and locks the pair
+    let render = null;
+    reply['publish/preview'] = () => new Promise(resolve => { render = resolve; });
+    pub.button(ctxFor('c-ig', 'instagram', {})).click();
+    const radios = () => [...document.querySelectorAll('input[name=pubAi]')].map(r => ({ checked: r.checked, disabled: r.disabled }));
+    out.igOpen = { open: q('#pubDialog').open, radios: radios(), wait: !!q('#pubDialog .pub-wait'), confirm: q('#pubConfirm').disabled,
+                   send: q('#pubSend').disabled, calls: calls.length };
+    q('#pubAi-no').click();
+    q('#pubAi-yes').click();  // switching mid-render: the radio is off, so this does nothing
+    out.igRendering = { loading: !!q('#pubDialog .pub-loading'), radios: radios(), calls: calls.map(c => c[1].options) };
+    render(preview('instagram', { slides: [1, 2, 3].map(n => ({ n: n, url: '', alt: n === 1 ? '카드 한 장에 담긴 내용을 소리 내어 읽어 주듯 적은 대체텍스트예요. '.repeat(12) : '슬라이드 ' + n })) }));
+    await settle();
+    const clamp = () => getComputedStyle(q('#pubDialog .pub-alt')).webkitLineClamp;
+    out.igPreview = { radios: radios(), slides: document.querySelectorAll('#pubDialog .pub-slide').length, clamp: clamp(),
+                      meta: q('#pubDialog .pub-content-head .fold-meta').textContent, confirm: q('#pubConfirm').disabled, send: q('#pubSend').disabled };
+    q('#pubDialog .pub-slide-btn').click();
+    out.igPreview.zoomedClamp = clamp();
+    q('#pubDialog').close();  // its close event comes later, after the next dialog is already open: it must not end that one
+
+    // a failed send: the result card's "다시 확인하고 게시" opens a fresh preview and sends nothing by itself
+    calls.length = 0;
+    reply['publish/preview'] = () => Promise.resolve(preview('linkedin'));
+    reply['publish'] = () => Promise.resolve({ attempt: { id: 'pa-c-failed', platform: 'linkedin', status: 'failed',
+      error: 'LinkedIn이 게시를 거절했어요(403). 개발자 앱에 Share on LinkedIn 제품이 있는지 확인해 주세요.' } });
+    const liCtx = ctxFor('c-li', 'linkedin', {});
+    pub.button(liCtx).click();
+    await settle();
+    q('#pubConfirm').click();
+    q('#pubSend').click();
+    await settle(); await settle();
+    const section = pub.section(liCtx);
+    const retry = section && section.querySelector('[data-key="api-retry"]');
+    out.failed = { dialogOpen: q('#pubDialog').open, refreshed: liCtx.refreshed, text: section ? section.textContent : '',
+                   retry: shown(retry), calls: calls.map(c => c[0]) };
+    calls.length = 0;
+    if (retry) retry.click();
+    await settle();
+    out.retry = { open: q('#pubDialog').open, calls: calls.map(c => c[0]), text: !!q('#pubDialog .pub-text'),
+                  checked: q('#pubConfirm').checked, send: q('#pubSend').disabled };
+  } finally {
+    ws.get = real.get;
+    ws.post = real.post;
+    box.remove();
+    I.views.publish.reset();  // forget every made-up id and status; closes the dialog
+  }
+  return out;
+}"""
+
+
+def test_19_publish_card_instagram_choice_and_retry_after_a_failure(e2e, page):
+    need(e2e, "publish_unconfigured")  # this page on the 보관함 screen; the server is back to "never set up"
+    seen = page.evaluate(_PUBLISH_STATES)
+    # 브랜드·자료 → API 게시 연결 in a workspace that never set it up: optional, no logos, what is stored and how to
+    # revoke it; an http redirect URL is only suggested for localhost, so nothing to "switch to" on 127.0.0.1
+    assert seen["card"] == {"meta": "선택 기능", "fake": False, "logos": 0, "consent": True, "editRedirect": True, "suggest": False,
+                            "connect": False}
+    # the address-paste connection: "open at localhost" offered, the pasted address sent as is, then connected
+    paste = seen["paste"]
+    assert paste["open"] == "http://localhost:8765/#/brand/connections" and paste["focus"] == "conn-li-open"
+    assert paste["sent"] == [["linkedin/connect", {}], ["linkedin/complete", {"url": "http://localhost:8765/oauth/linkedin/callback?code=c-e2e&state=st-e2e"}]]
+    assert paste["said"] is True and paste["disconnect"] is True
+    # Instagram gets a button only for a connected account: never for "not connected" / "no app" (7-2)
+    assert seen["igNotConnected"] is None and seen["igNotConfigured"] is None and seen["igUnavailableNoAccount"] is None
+    assert seen["igUnavailableAccount"] == {"text": "인스타그램에 API로 게시", "disabled": True}
+    assert seen["igConnected"] == {"text": "인스타그램에 API로 게시", "disabled": False}
+    # the 'AI 정보' label has no default: no preview and nothing to send until a person picks (14.2)
+    unchosen = {"checked": False, "disabled": False}
+    assert seen["igOpen"] == {"open": True, "radios": [unchosen, unchosen], "wait": True, "confirm": True, "send": True, "calls": 0}
+    # picking renders the cards; the pair stays locked until they are back (a second render would be refused, 409)
+    assert seen["igRendering"] == {"loading": True, "calls": [{"is_ai_generated": False}],
+                                   "radios": [{"checked": False, "disabled": True}, {"checked": True, "disabled": True}]}
+    preview = seen["igPreview"]
+    assert preview["radios"] == [unchosen, {"checked": True, "disabled": False}]
+    assert preview["slides"] == 3 and preview["clamp"] == "5" and preview["zoomedClamp"] == "none"  # long alt text folds, opens on zoom
+    assert "/ 2,200자" in preview["meta"] and "/ 5개" in preview["meta"]
+    assert preview["confirm"] is False and preview["send"] is True  # the checkbox comes first
+    # a failed send says nothing went out and offers "다시 확인하고 게시", which starts from a fresh preview
+    failed = seen["failed"]
+    assert failed["calls"] == ["publish/preview", "publish"] and failed["dialogOpen"] is False and failed["refreshed"] >= 1
+    assert "게시하지 못했어요" in failed["text"] and "아무것도 올라가지 않았어요" in failed["text"]
+    assert failed["retry"] == {"text": "다시 확인하고 게시", "disabled": False}
+    assert seen["retry"] == {"open": True, "calls": ["publish/preview"], "text": True, "checked": False, "send": True}
+    assert page.evaluate("!document.getElementById('pubDialog') || !document.getElementById('pubDialog').open")
+    no_js_errors(page)

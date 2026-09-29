@@ -40,6 +40,7 @@ FONT_STACK = ('"Pretendard", "Noto Sans KR", "Noto Sans CJK KR", "Apple SD Gothi
               '"맑은 고딕", "NanumGothic", "나눔고딕", "NanumBarunGothic", "WenQuanYi Zen Hei", sans-serif')
 RENDER_TIMEOUT_MS = 45_000  # per browser step
 RENDER_DEADLINE_S = 150  # whole render; a hung browser must never block an export request
+JPEG_QUALITY = 90  # Instagram API publishing (render_images(..., image_type="jpeg"))
 # Without a browser we cannot measure; text longer than this is flagged (the
 # channel guide asks for 25 어절 or fewer per slide).
 LONG_TEXT_WORDS = 80
@@ -558,8 +559,13 @@ class RenderedSlides(list):
     overflow: tuple[int, ...] = ()
 
 
-def _render_sync(page_html: str, count: int, executable: str | None) -> list[bytes]:
+def _render_sync(page_html: str, count: int, executable: str | None, image_type: str = "png",
+                 quality: int | None = None) -> list[bytes]:
     from playwright.sync_api import sync_playwright
+
+    shot: dict[str, object] = {"type": image_type, "timeout": RENDER_TIMEOUT_MS, "animations": "disabled"}
+    if image_type == "jpeg":
+        shot["quality"] = int(quality if quality is not None else JPEG_QUALITY)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(executable_path=executable, headless=True, timeout=RENDER_TIMEOUT_MS)
@@ -568,15 +574,14 @@ def _render_sync(page_html: str, count: int, executable: str | None) -> list[byt
             page.set_content(page_html, wait_until="load", timeout=RENDER_TIMEOUT_MS)
             page.evaluate("() => (document.fonts ? document.fonts.ready.then(() => true) : true)")
             if not page.evaluate(_HANGUL_CHECK_JS):
-                raise RenderUnavailable("이 컴퓨터에 한글 글꼴이 없어 PNG 글자가 깨져요 "
+                raise RenderUnavailable(f"이 컴퓨터에 한글 글꼴이 없어 {'PNG' if image_type == 'png' else '카드 이미지'} 글자가 깨져요 "
                                         "(리눅스·도커라면 fonts-noto-cjk 같은 한글 글꼴을 설치하세요)")
             overflow = page.evaluate("() => (window.__insiaFit ? window.__insiaFit() : [])")
             slides = page.locator("section.slide")
             found = slides.count()
             if found != count:
                 raise RenderUnavailable(f"슬라이드 {count}장 중 {found}장만 그려졌어요")
-            rendered = RenderedSlides(slides.nth(i).screenshot(type="png", timeout=RENDER_TIMEOUT_MS,
-                                                               animations="disabled") for i in range(count))
+            rendered = RenderedSlides(slides.nth(i).screenshot(**shot) for i in range(count))
             if isinstance(overflow, list):
                 rendered.overflow = tuple(int(n) for n in overflow if isinstance(n, (int, float)))
             return rendered
@@ -611,8 +616,23 @@ def render_pngs(page_html: str, count: int) -> list[bytes]:
     Raises ``RenderUnavailable`` (Korean reason) when rendering is disabled,
     Playwright is missing, or the browser cannot start.
     """
+    return render_images(page_html, count, image_type="png")
+
+
+def render_images(page_html: str, count: int, *, image_type: str = "png", quality: int | None = None) -> list[bytes]:
+    """``render_pngs`` with a choice of format: ``"png"`` or ``"jpeg"`` (quality ``JPEG_QUALITY`` = 90 by default).
+
+    Chromium's JPEG screenshots have no alpha channel, are sRGB and baseline, at the same 1080×1350, so
+    Instagram's API publishing needs no imaging library. The result carries ``overflow`` like ``render_pngs``.
+    Same ``RenderUnavailable`` errors; the Instagram API path never falls back to ``slides.html``.
+    """
+    if image_type not in ("png", "jpeg"):
+        raise ValueError(f"image_type must be 'png' or 'jpeg', not {image_type!r}")
+    if quality is not None and not 1 <= int(quality) <= 100:
+        raise ValueError("quality must be between 1 and 100")
     if (os.environ.get("INSIA_RENDER") or "").strip().lower() in {"0", "false", "no", "off"}:
-        raise RenderUnavailable("PNG 렌더링이 꺼져 있어요 (INSIA_RENDER=0)")
+        raise RenderUnavailable("PNG 렌더링이 꺼져 있어요 (INSIA_RENDER=0)" if image_type == "png"
+                                else "카드 이미지 렌더링이 꺼져 있어요 (INSIA_RENDER=0)")
     try:
         from playwright.sync_api import Error as PlaywrightError
     except ImportError as exc:
@@ -626,7 +646,9 @@ def render_pngs(page_html: str, count: int) -> list[bytes]:
         raise RenderUnavailable(f"INSIA_CHROMIUM에 지정한 브라우저를 찾을 수 없어요: {executable}")
 
     try:
-        return _run_with_deadline(_render_sync, page_html, count, executable)
+        if image_type == "png":  # the original call shape (tests replace _render_sync with a 3-argument fake)
+            return _run_with_deadline(_render_sync, page_html, count, executable)
+        return _run_with_deadline(_render_sync, page_html, count, executable, image_type, quality)
     except RenderUnavailable:
         raise
     except PlaywrightError as exc:

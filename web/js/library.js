@@ -7,6 +7,11 @@
  *
  * Live mode talks to /api/items*. Demo/artifact mode builds read-only items from
  * the embedded trace (channel.completed + draft/review events).
+ *
+ * API 게시 (publish.js) only hooks in when the item detail carries a `publish` block (the server sends
+ * `publish: null` until publishing is configured), so an unconfigured workspace renders exactly as before.
+ * Its panel keys are 'api_publish' (the confirm dialog) and 'api_attempts' (게시 기록); 'publish' stays the
+ * "게시 완료 표시" panel.
  */
 (function () {
   'use strict';
@@ -38,7 +43,7 @@
     detailError: null,
     viewVersion: null,    // version number being viewed (null = latest)
     editing: false,
-    panel: '',            // approve | revise | schedule | publish | archive
+    panel: '',            // approve | revise | schedule | publish | archive | api_publish | api_attempts
     panelError: '',
     busy: false,
     saveResult: null,     // {version, checks}
@@ -92,6 +97,46 @@
   }
 
   function isDemo() { return ws.mode !== 'live'; }
+
+  // ------------------------------------------------------------------ API 게시 hooks (web/js/publish.js)
+  function pubHook(name) { var p = I.publish; return !isDemo() && p && typeof p[name] === 'function' ? p[name] : null; }
+  /** "게시 완료 · API" for items published through the API, else the usual status pill. */
+  function statusPill(it) {
+    var h = pubHook('statusPill');
+    return (h && h(it)) || ui.statusPill(it.status);
+  }
+  /** What publish.js needs from this view; every callback checks the detail is still the same item. */
+  function publishCtx(item, latest) {
+    var id = item.id;
+    return {
+      item: item, detail: S.detail, latest: latest, busy: S.busy, editing: S.editing, job: !!S.jobs[id],
+      getPanel: function () { return S.panel; },
+      setPanel: function (k) {
+        if (S.detailId !== id) return;
+        var prev = S.panel;
+        S.panel = k;
+        S.panelError = '';
+        // '' and 'api_publish' (the confirm dialog, no panel body) draw the same card: no full redraw between them
+        if (isShown() && !(noPanelBody(prev) && noPanelBody(k))) renderDetail(false);
+      },
+      rerender: function () { if (S.detailId === id && isShown()) renderDetail(false); },
+      refresh: function () { S.items = null; return S.detailId === id ? refreshDetail(false) : Promise.resolve(); },
+      edit: function () {
+        if (S.detailId !== id || !isShown()) return;
+        S.editing = true;
+        S.panel = '';
+        renderDetail(false);
+        var t = document.getElementById('edTitle');
+        if (t) t.focus();
+      }
+    };
+  }
+  function noPanelBody(key) { return !key || key === 'api_publish'; }
+  /** Korean reason while an API publish of this item is sending or needs a person's check ('' otherwise). */
+  function pubLock(item, latest) {
+    var h = pubHook('lock');
+    return h && S.detail ? h(publishCtx(item, latest)) : '';
+  }
 
   function loadList(force) {
     if (isDemo()) { S.items = demoData().items; return Promise.resolve(S.items); }
@@ -251,7 +296,7 @@
     return el('li', null, el('a', {
       class: 'item-card', href: '#/library/' + encodeURIComponent(it.id), style: '--ch:' + ws.channelColor(it.channel), 'data-status': it.status
     }, [
-      el('span', { class: 'ic-top' }, [ui.channelIcon(it.channel, 'ic-icon'), el('span', { class: 'ic-channel', text: U.chName(it.channel) }), ui.statusPill(it.status)]),
+      el('span', { class: 'ic-top' }, [ui.channelIcon(it.channel, 'ic-icon'), el('span', { class: 'ic-channel', text: U.chName(it.channel) }), statusPill(it)]),
       el('span', { class: 'ic-title', text: it.title || '(제목 없음)' }),
       el('span', { class: 'ic-meta' }, [
         ui.scoreBadge(it.score, it.passed),
@@ -315,7 +360,7 @@
         el('p', { class: 'eyebrow', text: [U.chName(item.channel), 'v' + (item.version || (latest && latest.version) || 1), item.updated_at ? ws.date.dateTime(item.updated_at) + ' 수정' : ''].filter(Boolean).join(' · ') }),
         el('h2', { class: 'view-title detail-title', id: 'libraryTitle', tabindex: '-1', text: item.title || (v && v.draft.title) || '(제목 없음)' })
       ]),
-      el('div', { class: 'detail-state' }, [ui.statusPill(item.status), ui.forcedBadge(item), ui.scoreBadge(item.score, item.passed)])
+      el('div', { class: 'detail-state' }, [statusPill(item), ui.forcedBadge(item), ui.scoreBadge(item.score, item.passed)])
     ]);
 
     var main = el('div', { class: 'detail-main' }, [
@@ -411,8 +456,9 @@
     var status = el('span', { class: 'copy-status', role: 'status' });
     var fallback = el('textarea', { class: 'copy-fallback', rows: '8', readonly: true, 'aria-label': '복사할 텍스트', hidden: true });
     var canEdit = !isDemo() && item.status !== 'archived' && item.status !== 'published' && latestVersion() && v.version === latestVersion().version;
+    var lock = canEdit ? pubLock(item, latestVersion()) : '';  // an API publish is sending / needs a check
     var toolbar = el('div', { class: 'card-toolbar' }, [
-      canEdit ? el('button', { type: 'button', class: 'btn', 'data-key': 'edit', text: '편집', onclick: function () { S.editing = true; S.panel = ''; renderDetail(false); var t = document.getElementById('edTitle'); if (t) t.focus(); } }) : null,
+      canEdit ? el('button', { type: 'button', class: 'btn', 'data-key': 'edit', text: '편집', disabled: lock ? true : null, title: lock || null, onclick: function () { S.editing = true; S.panel = ''; renderDetail(false); var t = document.getElementById('edTitle'); if (t) t.focus(); } }) : null,
       d.content ? el('button', { type: 'button', class: 'btn', 'data-key': 'copy', text: '전체 복사', onclick: function () { copy(); } }) : null,
       status
     ]);
@@ -615,11 +661,13 @@
     var job = S.jobs[item.id];
     var passed = !!(latest && latest.review && latest.review.passed);
     var buttons = [];
+    var pctx = pubHook('button') ? publishCtx(item, latest) : null;
+    var lock = pubLock(item, latest);  // edit · review · archive and status changes wait until the API publish is settled
     function btn(key, label, primary, onclick, disabled) {
       return el('button', {
         type: 'button', class: 'btn' + (primary ? ' btn--primary' : ''), 'data-key': 'act-' + key,
         'aria-expanded': ['approve', 'revise', 'schedule', 'publish', 'archive'].indexOf(key) >= 0 && (key !== 'approve' || !passed) ? String(S.panel === key) : null,
-        disabled: S.busy || S.editing || disabled, text: label, onclick: onclick
+        disabled: S.busy || S.editing || disabled || !!lock, text: label, onclick: onclick
       });
     }
     function toggle(key) { return function () { S.panel = S.panel === key ? '' : key; S.panelError = ''; renderDetail(false); focusPanel(); }; }
@@ -645,6 +693,9 @@
     }
     if (st !== 'archived') buttons.push(btn('archive', '보관', false, toggle('archive')));
     else buttons.push(btn('unarchive', '보관 해제', true, function () { setStatus({ status: 'draft' }, '보관을 해제했어요. 초안으로 돌아갔어요.'); }));
+    // "LinkedIn에 API로 게시" / "인스타그램에 API로 게시" goes at the end: "게시 완료 표시" keeps its place and look
+    var apiButton = pctx ? I.publish.button(pctx) : null;
+    if (apiButton) buttons.push(apiButton);
 
     var stateLine = {
       draft: '사람 검토를 기다리는 초안이에요.',
@@ -657,13 +708,14 @@
 
     return el('section', { class: 'card actions-card', 'aria-labelledby': 'actTitle' }, [
       el('h3', { class: 'card-title', id: 'actTitle', text: '검토와 게시' }),
-      el('p', { class: 'card-sub', text: S.editing ? '편집 중에는 승인·게시·재검수를 할 수 없어요. 먼저 저장하거나 편집을 취소해 주세요.' : stateLine }),
+      el('p', { class: 'card-sub', text: S.editing ? '편집 중에는 승인·게시·재검수를 할 수 없어요. 먼저 저장하거나 편집을 취소해 주세요.' : lock || stateLine }),
       ws.isForcedApproval(item) ? el('p', { class: 'forced-note' }, [
         el('b', { text: '강제 승인 기록 ' }),
         ws.forcedWhy(item) + (item.approved_at ? ' (' + ws.date.dateTime(item.approved_at) + ')' : '') + '. 게시 전에 한 번 더 읽어 주세요.'
       ]) : null,
       item.note ? el('p', { class: 'item-note' }, [el('b', { text: '메모 ' }), item.note]) : null,
       buttons.length ? el('div', { class: 'action-row' }, buttons) : null,
+      pctx ? I.publish.section(pctx) : null,
       S.editing ? null : actionPanel(item, latest, passed)
     ]);
   }
@@ -678,6 +730,10 @@
   function actionPanel(item, latest, passed) {
     var key = S.panel;
     if (!key) return null;
+    if (key.indexOf('api_') === 0) {  // publish.js: 'api_publish' (the dialog, no panel) · 'api_attempts' (게시 기록)
+      var h = pubHook('panel');
+      return h ? h(key, publishCtx(item, latest)) : null;
+    }
     var err = el('p', { class: 'form-error', role: 'alert', hidden: !S.panelError, text: S.panelError });
     var cancel = el('button', { type: 'button', class: 'btn', text: '취소', onclick: function () { var k = S.panel; S.panel = ''; S.panelError = ''; renderDetail(false); var b = S.container.querySelector('[data-key="act-' + k + '"]'); if (b) b.focus(); } });
     var nodes;
@@ -722,7 +778,7 @@
       var inp = el('input', { id: 'schedDate', type: 'date', value: def, min: ws.date.today() });
       nodes = [
         el('label', { class: 'field', for: 'schedDate' }, [el('span', { text: '게시 예정일' }), inp]),
-        el('p', { class: 'panel-hint', text: 'INSIA는 자동으로 게시하지 않아요. 날짜는 캘린더와 목록에서 알림용으로만 써요.' }),
+        el('p', { class: 'panel-hint', text: 'INSIA는 예정일에 자동으로 게시하지 않아요. 날짜는 알림용이에요.' }),
         err,
         el('div', { class: 'form-foot' }, [cancel, el('button', {
           type: 'button', class: 'btn btn--primary', text: '예정일 저장', disabled: S.busy, onclick: function () {

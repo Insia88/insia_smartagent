@@ -37,6 +37,8 @@ ids, ``InvalidTransitionError`` / ``ApprovalBlockedError`` for status changes.
 from __future__ import annotations
 
 import functools
+import hashlib
+import hmac
 import json
 import logging
 import math
@@ -69,6 +71,9 @@ from .models import (
     Plan,
     PlannedSlot,
     Profile,
+    PublishAttempt,
+    PublishConnection,
+    PublishPreview,
     ResearchPack,
     Review,
     UsageRecord,
@@ -127,6 +132,32 @@ STALE_AFTER_SECONDS = 600.0
 ORPHAN_SLOT_SECONDS = 60.0
 # How often a long-running process (the server) checks again for runs whose owner went away (watch_stale_runs).
 RECOVERY_WATCH_SECONDS = 60.0
+
+# API publish attempts (``publish_attempts``): the worker refreshes ``heartbeat_at`` every PUBLISH_HEARTBEAT_SECONDS from
+# its own thread (also while it polls Instagram for minutes); an attempt without a sign of life for
+# PUBLISH_STALE_AFTER_SECONDS (6 missed beats) belongs to a worker that is gone or asleep. Shorter than runs on purpose:
+# a worker that wakes up later finds its owner token cleared and sends nothing.
+PUBLISH_HEARTBEAT_SECONDS = 30.0
+PUBLISH_STALE_AFTER_SECONDS = 180.0
+PUBLISH_PLATFORMS = ("linkedin", "instagram")
+PUBLISH_ATTEMPT_STATUSES = ("sending", "published", "failed", "unknown", "abandoned")
+ACTIVE_PUBLISH_STATUSES = ("sending", "unknown")  # the item's versions and status are frozen while one exists
+# Steps recorded at or after the irreversible call: an interrupted attempt there may have been published.
+PUBLISH_AFTER_WRITE_STEPS = ("write", "permalink")
+PUBLISHED_VIA_VALUES = ("", "linkedin_api", "instagram_api", "fake")
+PUBLISH_CONNECTION_STATUSES = ("connected", "needs_reconnect")
+PUBLISH_PREVIEW_VIA = ("dashboard", "cli")
+# attempt.state never holds a credential (the service only records ids, steps and choices)
+_STATE_FORBIDDEN_KEYS = frozenset({"access_token", "client_secret", "refresh_token", "token", "code"})
+PUBLISH_ITEM_UPDATE_ERROR = "게시는 됐지만 보관함 상태를 바꾸지 못했어요. ‘게시 완료 표시’를 눌러 주세요."
+PUBLISH_LATE_SUCCESS_BLOCKED = ("이 기록을 정리한 뒤에 플랫폼이 게시 성공을 알려 왔어요. 같은 버전의 다른 게시 기록이 있어 "
+                                "상태를 바꾸지 않았어요. 같은 글이 두 번 올라갔는지 확인해 주세요.")
+PUBLISH_LATE_ANSWER = "system:late_answer"
+PUBLISH_INTERRUPTED_FAILED = "게시 도중 프로그램이 멈춰서 아무것도 올리지 않았어요. 다시 확인하고 게시해 주세요."
+PUBLISH_INTERRUPTED_UNKNOWN = {
+    "linkedin": "게시 도중 프로그램이 멈춰서 LinkedIn에 올라갔는지 확인하지 못했어요. LinkedIn 내 활동에서 확인한 뒤 알려 주세요.",
+    "instagram": "게시 도중 프로그램이 멈춰서 인스타그램에 올라갔는지 확인하지 못했어요. ‘인스타그램에서 다시 확인’을 눌러 주세요.",
+}
 
 
 def interrupted_message(kind: str) -> str:
@@ -233,6 +264,23 @@ class AttemptTakenOverError(WorkspaceError):
 
     def extra(self) -> dict[str, str]:
         return {"attempt_id": self.attempt_id}
+
+
+class PublishStateError(WorkspaceError):
+    """A publish preview / attempt precondition failed inside the workspace transaction.
+
+    ``reason`` is machine-readable and ``info`` carries the details (``blocked_by``, ``attempt_id``, ``permalink``).
+    The publishing service turns it into its own error types (the workspace never imports the publishing package):
+
+    ``preview_missing`` · ``preview_used`` · ``preview_expired`` · ``preview_via`` (made on the other surface) ·
+    ``hash_mismatch`` · ``not_publishable`` (``blocked_by``) · ``already_published`` (``attempt_id``, ``permalink``) ·
+    ``not_connected`` · ``account_changed`` · ``attempt_state`` (the attempt is not in a state that allows this).
+    """
+
+    def __init__(self, message: str, *, reason: str, **info: Any) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.info = info
 
 
 # Why a run's new version was kept in the history instead of becoming the item's current one (``RunVersion.reason``).
@@ -403,6 +451,76 @@ MIGRATIONS: list[str] = [
     ALTER TABLE items ADD COLUMN approved_score INTEGER;
     ALTER TABLE items ADD COLUMN approved_at TEXT NOT NULL DEFAULT '';
     CREATE INDEX IF NOT EXISTS slots_run ON slots (run_id);
+    """,
+    # 3 — API publishing (LinkedIn/Instagram): connection metadata (no secrets), confirmed previews,
+    #     publish attempts (one live attempt per item version and platform, owned by one worker at a time);
+    #     items remember how they were published
+    """
+    CREATE TABLE IF NOT EXISTS publish_connections (
+        platform TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL DEFAULT '',
+        account_name TEXT NOT NULL DEFAULT '',
+        scopes TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'connected',
+        status_reason TEXT NOT NULL DEFAULT '',
+        token_expires_at TEXT NOT NULL DEFAULT '',
+        expires_estimated INTEGER NOT NULL DEFAULT 0,
+        token_issued_at TEXT NOT NULL DEFAULT '',
+        token_refreshed_at TEXT NOT NULL DEFAULT '',
+        api_version TEXT NOT NULL DEFAULT '',
+        connected_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS publish_previews (
+        id TEXT PRIMARY KEY,
+        item_id TEXT NOT NULL REFERENCES items (id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        platform TEXT NOT NULL,
+        account_id TEXT NOT NULL DEFAULT '',
+        payload TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        created_via TEXT NOT NULL DEFAULT 'dashboard',
+        confirm_code_hash TEXT NOT NULL DEFAULT '',
+        requested_by TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS publish_previews_item ON publish_previews (item_id, created_at);
+    CREATE TABLE IF NOT EXISTS publish_attempts (
+        id TEXT PRIMARY KEY,
+        item_id TEXT NOT NULL REFERENCES items (id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        platform TEXT NOT NULL,
+        preview_id TEXT NOT NULL DEFAULT '',
+        payload_hash TEXT NOT NULL,
+        account_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        step TEXT NOT NULL DEFAULT '',
+        external_id TEXT NOT NULL DEFAULT '',
+        permalink TEXT NOT NULL DEFAULT '',
+        media_token TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL DEFAULT '{}',
+        error_code TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT '',
+        requested_by TEXT NOT NULL DEFAULT '',
+        resolved_by TEXT NOT NULL DEFAULT '',
+        owner_pid INTEGER NOT NULL DEFAULT 0,
+        owner_host TEXT NOT NULL DEFAULT '',
+        owner_boot TEXT NOT NULL DEFAULT '',
+        owner_token TEXT NOT NULL DEFAULT '',
+        heartbeat_at TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS publish_attempts_item ON publish_attempts (item_id, created_at);
+    CREATE INDEX IF NOT EXISTS publish_attempts_status ON publish_attempts (status, updated_at);
+    CREATE INDEX IF NOT EXISTS publish_attempts_media ON publish_attempts (media_token) WHERE media_token <> '';
+    CREATE UNIQUE INDEX IF NOT EXISTS publish_attempts_live
+        ON publish_attempts (item_id, version, platform) WHERE status IN ('sending', 'published', 'unknown');
+    ALTER TABLE items ADD COLUMN published_via TEXT NOT NULL DEFAULT '';
+    ALTER TABLE items ADD COLUMN published_external_id TEXT NOT NULL DEFAULT '';
     """,
 ]
 
@@ -666,6 +784,12 @@ def pid_alive(pid: int) -> bool:
 _LEASES_LOCK = threading.Lock()
 _LEASES: dict[tuple[str, str], "RunLease"] = {}
 
+# Publish attempts this process's workers hold right now: (database key, attempt id) -> owner token. A registered
+# worker is alive by definition (rule 1 of ``_attempt_owner_alive``); ``begin_publish_attempt`` registers it in the
+# same step that creates the row, the finish methods and ``release_publish_worker`` forget it.
+_PUBLISH_WORKERS_LOCK = threading.Lock()
+_PUBLISH_WORKERS: dict[tuple[str, str], str] = {}
+
 
 class RunLease:
     """This process's claim on a running run: its owner token plus a heartbeat thread.
@@ -765,6 +889,9 @@ class Workspace:
         self._closed = False
         self._watcher: threading.Thread | None = None  # background recovery (watch_stale_runs)
         self._watch_stop = threading.Event()
+        # Called with the ids of publish attempts the background recovery closed (the publishing service sets it to
+        # clean up their public media); never needed for correctness.
+        self.publish_recovery_hook: Any = None
         try:
             with _LOCK:
                 self._conn.execute("PRAGMA busy_timeout = 30000")
@@ -1303,9 +1430,30 @@ class Workspace:
                 return
             except Exception:  # noqa: BLE001 - e.g. the database stayed locked: try again next round
                 log.warning("멈춘 실행을 확인하지 못했어요", exc_info=True)
-                continue
+                taken = []
             if taken:
                 log.warning("실행하던 프로세스가 멈춘 실행 %d개를 '중단됨'으로 정리했어요: %s", len(taken), ", ".join(taken))
+            self._publish_recovery_tick()
+
+    def _publish_recovery_tick(self) -> list[str]:
+        """The watcher's publish part: close ``sending`` attempts whose worker is gone (``recover_publish_attempts``)
+        and hand their ids to ``publish_recovery_hook`` (the publishing service deletes their public images)."""
+        try:
+            closed = self.recover_publish_attempts()
+        except WorkspaceError:  # closed
+            return []
+        except Exception:  # noqa: BLE001 - try again next round
+            log.warning("멈춘 게시 시도를 확인하지 못했어요", exc_info=True)
+            return []
+        if closed:
+            log.warning("게시하던 프로세스가 멈춘 게시 시도 %d개를 정리했어요: %s", len(closed), ", ".join(closed))
+            hook = self.publish_recovery_hook
+            if hook is not None:
+                try:
+                    hook(closed)
+                except Exception:  # noqa: BLE001 - cleanup is best effort; the records are already right
+                    log.warning("정리한 게시 시도의 파일을 지우지 못했어요", exc_info=True)
+        return closed
 
     def mark_interrupted(self, *, watch: bool = True) -> int:
         """On startup: take over runs left ``running`` by a process that is gone (``recover_stale``).
@@ -1433,6 +1581,7 @@ class Workspace:
             note=row["note"], created_at=row["created_at"], updated_at=row["updated_at"],
             approved_version=int(row["approved_version"] or 0), approval_forced=bool(row["approval_forced"]),
             approved_score=row["approved_score"], approved_at=row["approved_at"] or "",
+            published_via=row["published_via"] or "", published_external_id=row["published_external_id"] or "",
         )
 
     @staticmethod
@@ -1449,6 +1598,18 @@ class Workspace:
         if row is None:
             raise NotFoundError(f"콘텐츠 {item_id}를 찾을 수 없어요")
         return row
+
+    @staticmethod
+    def _check_not_publishing(conn: sqlite3.Connection, item_id: str) -> None:
+        """Refuse any change to an item's versions or status while an API publish attempt of it is live (``sending``
+        or ``unknown``): what a person confirmed must stay exactly what gets (or got) published. Every write path
+        goes through the internal functions that call this (``_insert_version``, ``_refresh_item``,
+        ``_put_back_on_top``, ``attach_review``, ``set_item_status``), so the pipeline, jobs, ``import-run`` and the
+        dashboard are all stopped here. Title, note and scheduled date (``update_item``) stay editable."""
+        row = conn.execute("SELECT id, platform, status FROM publish_attempts WHERE item_id = ? AND status IN ('sending', 'unknown') "
+                           "ORDER BY created_at DESC LIMIT 1", (item_id,)).fetchone()
+        if row is not None:
+            raise ItemLockedError(attempt_id=row["id"], platform=row["platform"], status=row["status"])
 
     def _insert_item(self, conn: sqlite3.Connection, item_id: str, channel: str, title: str, *, run_id: str = "",
                      brief: Brief | None = None, status: str = "draft", scheduled_at: str = "", note: str = "") -> None:
@@ -1498,6 +1659,7 @@ class Workspace:
         if source not in VERSION_SOURCES:
             raise WorkspaceError(f"버전 출처는 agent 또는 human이어야 해요 (받은 값: {source!r})")
         item = self._item_row(conn, item_id)
+        self._check_not_publishing(conn, item_id)
         if draft.channel != item["channel"]:
             raise WorkspaceError(f"채널이 달라요: 콘텐츠는 {item['channel']}, 초안은 {draft.channel}")
         number = conn.execute("SELECT COALESCE(MAX(version), 0) FROM versions WHERE item_id = ?", (item_id,)).fetchone()[0] + 1
@@ -1525,6 +1687,7 @@ class Workspace:
         about it changes).
         """
         item = self._item_row(conn, item_id)
+        self._check_not_publishing(conn, item_id)
         latest = conn.execute("SELECT * FROM versions WHERE item_id = ? ORDER BY version DESC LIMIT 1", (item_id,)).fetchone()
         if latest is None:
             return
@@ -1658,6 +1821,7 @@ class Workspace:
                          run_id: str) -> DraftVersion:
         """Append a copy of ``kept_row`` (role ``restored``) so it is the latest version again; an approval of it
         moves to the copy (same content). The caller refreshes the item with ``keep_status=True``."""
+        self._check_not_publishing(conn, item_id)
         kept = self._version(kept_row)
         change_log = list(kept.draft.change_log)
         if kept_row["role"] == "restored" and change_log:  # a copy of a copy: replace its note instead of stacking notes
@@ -1717,6 +1881,7 @@ class Workspace:
             if row is None:
                 raise NotFoundError(f"버전 {version_id}를 찾을 수 없어요")
             item_id, before = row["item_id"], _loads(row["review"])
+            self._check_not_publishing(conn, item_id)
             conn.execute("UPDATE versions SET review = ? WHERE id = ?", (review.model_dump_json(), version_id))
             touched = {int(row["version"])}
             for copy in conn.execute("SELECT * FROM versions WHERE item_id = ? AND version > ? AND role = 'restored'",
@@ -1809,6 +1974,7 @@ class Workspace:
             raise WorkspaceError(f"알 수 없는 상태예요: {status!r} ({', '.join(CONTENT_STATUSES)} 중 하나)")
         with self._tx() as conn:
             row = self._item_row(conn, item_id)
+            self._check_not_publishing(conn, item_id)
             old = row["status"]
             if status != old and status not in TRANSITIONS.get(old, frozenset()):
                 hint = " 먼저 승인해 주세요." if status in ("scheduled", "published") and old in ("draft", "needs_changes") else ""
@@ -1856,7 +2022,8 @@ class Workspace:
             return self._item(self._item_row(conn, item_id))
 
     def published_history(self, channel: str | None = None, limit: int = 50) -> list[ContentItem]:
-        """Published items, newest first (the planner uses them to avoid repeating topics)."""
+        """Published items, newest first (the planner uses them to avoid repeating topics). Items "published" by the
+        fake publishing mode (``published_via='fake'``, tests and demos) were never posted and are left out."""
         params: list[Any] = []
         clause = ""
         if channel:
@@ -1866,7 +2033,7 @@ class Workspace:
             params.append(channel)
         limit = max(1, min(int(limit or 50), 1000))
         with self._read() as conn:
-            rows = conn.execute(f"SELECT * FROM items WHERE status = 'published' {clause} "
+            rows = conn.execute(f"SELECT * FROM items WHERE status = 'published' AND published_via <> 'fake' {clause} "
                                 "ORDER BY published_at DESC, rowid DESC LIMIT ?", (*params, limit)).fetchall()
         return [self._item(row) for row in rows]
 
@@ -2350,3 +2517,690 @@ class Workspace:
             rows = conn.execute("SELECT * FROM slots WHERE status = 'planned' AND date <= ?",
                                 (_check_date(until_date, "기준일"),)).fetchall()
         return self._sorted_slots([self._slot(row) for row in rows])
+
+    # -- API publishing (LinkedIn / Instagram): connections, previews, attempts ----------------------------------
+    # The workspace keeps records only; tokens and app secrets live in credentials/secrets.sqlite
+    # (insia_agents.publishers.store). The publishing package is the only caller of these methods.
+
+    @staticmethod
+    def _now_dt(now: datetime | None) -> datetime:
+        return (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+
+    @staticmethod
+    def _publish_connection(row: sqlite3.Row) -> PublishConnection:
+        return PublishConnection(
+            platform=row["platform"], account_id=row["account_id"], account_name=row["account_name"],
+            scopes=[s for s in (row["scopes"] or "").split() if s], status=row["status"],
+            status_reason=row["status_reason"], token_expires_at=row["token_expires_at"],
+            expires_estimated=bool(row["expires_estimated"]), token_issued_at=row["token_issued_at"],
+            token_refreshed_at=row["token_refreshed_at"], api_version=row["api_version"],
+            connected_at=row["connected_at"], updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _publish_preview(row: sqlite3.Row) -> PublishPreview:
+        return PublishPreview(
+            id=row["id"], item_id=row["item_id"], version=int(row["version"]), platform=row["platform"],
+            account_id=row["account_id"], payload=_loads(row["payload"], {}) or {}, payload_hash=row["payload_hash"],
+            created_via=row["created_via"], requested_by=row["requested_by"], created_at=row["created_at"],
+            expires_at=row["expires_at"], used_at=row["used_at"],
+        )
+
+    @staticmethod
+    def _publish_attempt(row: sqlite3.Row) -> PublishAttempt:
+        return PublishAttempt(
+            id=row["id"], item_id=row["item_id"], version=int(row["version"]), platform=row["platform"],
+            preview_id=row["preview_id"], payload_hash=row["payload_hash"], account_id=row["account_id"],
+            status=row["status"], step=row["step"], external_id=row["external_id"], permalink=row["permalink"],
+            state=_loads(row["state"], {}) or {}, error_code=row["error_code"], error=row["error"],
+            requested_by=row["requested_by"], resolved_by=row["resolved_by"], created_at=row["created_at"],
+            updated_at=row["updated_at"], finished_at=row["finished_at"],
+        )
+
+    @staticmethod
+    def _check_platform(platform: str) -> str:
+        if platform not in PUBLISH_PLATFORMS:
+            raise WorkspaceError(f"API 게시 플랫폼은 linkedin 또는 instagram이어야 해요 (받은 값: {platform!r})")
+        return platform
+
+    @staticmethod
+    def _merged_state(current: str | None, patch: Mapping[str, Any] | None) -> str:
+        state = _loads(current, {}) or {}
+        if patch:
+            bad = sorted(k for k in patch if str(k).lower() in _STATE_FORBIDDEN_KEYS)
+            if bad:
+                raise WorkspaceError(f"게시 시도 기록에 넣을 수 없는 값이에요: {', '.join(bad)}")
+            state.update(dict(patch))
+        return _dumps(state)
+
+    # connections (display copy; the authoritative account id sits next to the token in secrets.sqlite)
+    def get_publish_connection(self, platform: str) -> PublishConnection | None:
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM publish_connections WHERE platform = ?", (platform,)).fetchone()
+        return self._publish_connection(row) if row else None
+
+    def list_publish_connections(self) -> list[PublishConnection]:
+        with self._read() as conn:
+            rows = conn.execute("SELECT * FROM publish_connections ORDER BY platform").fetchall()
+        return [self._publish_connection(row) for row in rows]
+
+    def save_publish_connection(self, connection: PublishConnection | Mapping[str, Any]) -> PublishConnection:
+        """Insert or replace the connection row of ``connection.platform`` (``connected_at`` kept when it existed)."""
+        value = _as_model(PublishConnection, connection, "게시 연결 정보")
+        self._check_platform(value.platform)
+        if value.status not in PUBLISH_CONNECTION_STATUSES:
+            raise WorkspaceError(f"연결 상태가 올바르지 않아요: {value.status!r}")
+        now = utc_now()
+        with self._tx() as conn:
+            old = conn.execute("SELECT connected_at FROM publish_connections WHERE platform = ?", (value.platform,)).fetchone()
+            connected_at = value.connected_at or (old["connected_at"] if old else "") or now
+            conn.execute(
+                "INSERT INTO publish_connections (platform, account_id, account_name, scopes, status, status_reason, "
+                "token_expires_at, expires_estimated, token_issued_at, token_refreshed_at, api_version, connected_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (platform) DO UPDATE SET "
+                "account_id = excluded.account_id, account_name = excluded.account_name, scopes = excluded.scopes, "
+                "status = excluded.status, status_reason = excluded.status_reason, token_expires_at = excluded.token_expires_at, "
+                "expires_estimated = excluded.expires_estimated, token_issued_at = excluded.token_issued_at, "
+                "token_refreshed_at = excluded.token_refreshed_at, api_version = excluded.api_version, "
+                "connected_at = excluded.connected_at, updated_at = excluded.updated_at",
+                (value.platform, value.account_id, value.account_name, " ".join(value.scopes), value.status,
+                 value.status_reason, value.token_expires_at, 1 if value.expires_estimated else 0, value.token_issued_at,
+                 value.token_refreshed_at, value.api_version, connected_at, now))
+            row = conn.execute("SELECT * FROM publish_connections WHERE platform = ?", (value.platform,)).fetchone()
+        return self._publish_connection(row)
+
+    def set_publish_connection_status(self, platform: str, status: str, reason: str = "") -> None:
+        if status not in PUBLISH_CONNECTION_STATUSES:
+            raise WorkspaceError(f"연결 상태가 올바르지 않아요: {status!r}")
+        with self._tx() as conn:
+            conn.execute("UPDATE publish_connections SET status = ?, status_reason = ?, updated_at = ? WHERE platform = ?",
+                         (status, (reason or "")[:500], utc_now(), platform))
+
+    def delete_publish_connection(self, platform: str) -> bool:
+        """Remove the connection row (the service first refuses while an attempt is ``sending``/``unknown``)."""
+        with self._tx() as conn:
+            cursor = conn.execute("DELETE FROM publish_connections WHERE platform = ?", (platform,))
+        return cursor.rowcount > 0
+
+    # previews
+    def create_publish_preview(self, item_id: str, version: int, platform: str, account_id: str, payload: Mapping[str, Any],
+                               payload_hash: str, *, created_via: str, confirm_code_hash: str = "", requested_by: str = "",
+                               ttl_seconds: float = 1800, now: datetime | None = None) -> PublishPreview:
+        """Store exactly what would be sent (``payload``, canonical JSON, never a token) and its hash for 30 minutes.
+
+        ``created_via`` (``dashboard``/``cli``): a preview can only be sent from where it was made. A CLI send preview
+        stores only the sha256 of its random confirm code (``confirm_code_hash``); the code itself is never stored.
+        """
+        self._check_platform(platform)
+        if created_via not in PUBLISH_PREVIEW_VIA:
+            raise WorkspaceError(f"미리보기를 만든 곳은 dashboard 또는 cli여야 해요 (받은 값: {created_via!r})")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", payload_hash or ""):
+            raise WorkspaceError("미리보기 해시 형식이 올바르지 않아요")
+        if confirm_code_hash and not re.fullmatch(r"[0-9a-f]{64}", confirm_code_hash):
+            raise WorkspaceError("확인 코드 해시 형식이 올바르지 않아요")
+        now_dt = self._now_dt(now)
+        preview_id = f"pv_{secrets.token_hex(12)}"
+        text = json.dumps(to_jsonable(dict(payload)), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        created, expires = _fmt(now_dt), _fmt(now_dt + timedelta(seconds=float(ttl_seconds)))
+        with self._tx() as conn:
+            self._item_row(conn, item_id)
+            conn.execute(
+                "INSERT INTO publish_previews (id, item_id, version, platform, account_id, payload, payload_hash, created_via, "
+                "confirm_code_hash, requested_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (preview_id, item_id, int(version), platform, account_id or "", text, payload_hash, created_via,
+                 confirm_code_hash or "", (requested_by or "")[:200], created, expires))
+            row = conn.execute("SELECT * FROM publish_previews WHERE id = ?", (preview_id,)).fetchone()
+        return self._publish_preview(row)
+
+    def get_publish_preview(self, preview_id: str) -> PublishPreview | None:
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM publish_previews WHERE id = ?", (str(preview_id or ""),)).fetchone()
+        return self._publish_preview(row) if row else None
+
+    def check_confirm_code(self, preview_id: str, code: str) -> bool:
+        """Whether ``code`` (what the person typed, trimmed and upper-cased) matches the preview's stored hash.
+        False when the preview has no code (a dashboard preview or ``insia publish preview``)."""
+        with self._read() as conn:
+            row = conn.execute("SELECT confirm_code_hash FROM publish_previews WHERE id = ?", (str(preview_id or ""),)).fetchone()
+        stored = row["confirm_code_hash"] if row else ""
+        if not stored:
+            return False
+        typed = hashlib.sha256((code or "").strip().upper().encode("utf-8")).hexdigest()
+        return hmac.compare_digest(typed, stored)
+
+    def mark_publish_preview_used(self, preview_id: str, *, now: datetime | None = None) -> bool:
+        """Burn a preview without sending (e.g. a wrong CLI confirm code): it can never be sent afterwards."""
+        with self._tx() as conn:
+            cursor = conn.execute("UPDATE publish_previews SET used_at = ? WHERE id = ? AND used_at = ''",
+                                  (_fmt(self._now_dt(now)), str(preview_id or "")))
+        return cursor.rowcount == 1
+
+    def purge_publish_previews(self, now: str | datetime | None = None) -> list[str]:
+        """Ids of previews that are expired or used (their staged images can go), oldest first. Unused previews that
+        expired more than a day ago are deleted; used ones stay as the record of what a person confirmed."""
+        now_dt = now if isinstance(now, datetime) else (_parse_ts(now or "") or datetime.now(timezone.utc))
+        stamp, day_before = _fmt(now_dt), _fmt(now_dt - timedelta(days=1))
+        with self._tx() as conn:
+            rows = conn.execute("SELECT id FROM publish_previews WHERE used_at <> '' OR expires_at <= ? ORDER BY created_at",
+                                (stamp,)).fetchall()
+            conn.execute("DELETE FROM publish_previews WHERE used_at = '' AND expires_at <= ?", (day_before,))
+        return [row["id"] for row in rows]
+
+    # attempts — ownership
+    def _register_publish_worker(self, attempt_id: str, token: str) -> None:
+        with _PUBLISH_WORKERS_LOCK:
+            _PUBLISH_WORKERS[(self._key, attempt_id)] = token
+
+    def release_publish_worker(self, attempt_id: str) -> None:
+        """Forget this process's worker for ``attempt_id`` (the worker ended; safe to call more than once)."""
+        with _PUBLISH_WORKERS_LOCK:
+            _PUBLISH_WORKERS.pop((self._key, attempt_id), None)
+
+    def holds_publish_attempt(self, attempt_id: str) -> bool:
+        """Whether a worker of this process holds the attempt right now."""
+        with _PUBLISH_WORKERS_LOCK:
+            return (self._key, attempt_id) in _PUBLISH_WORKERS
+
+    def _live_attempt_error(self, conn: sqlite3.Connection, item_id: str, version: int, platform: str) -> Exception | None:
+        row = conn.execute("SELECT id, status, permalink FROM publish_attempts WHERE item_id = ? AND version = ? AND platform = ? "
+                           "AND status IN ('sending', 'published', 'unknown') ORDER BY created_at DESC LIMIT 1",
+                           (item_id, int(version), platform)).fetchone()
+        if row is None:
+            return None
+        if row["status"] == "published":
+            return PublishStateError("이미 게시한 버전이에요.", reason="already_published", attempt_id=row["id"],
+                                     permalink=row["permalink"])
+        return ItemLockedError(attempt_id=row["id"], platform=platform, status=row["status"])
+
+    @staticmethod
+    def _blocked_by(item: sqlite3.Row, version: int | None = None) -> str:
+        """Why an item cannot be published through the API right now ("" when it can): not_approved / version_changed /
+        published / archived. ``version``: the version a preview was made of (must still be the approved latest)."""
+        status = item["status"]
+        if status == "archived":
+            return "archived"
+        if status == "published":
+            return "published"
+        if status not in ("approved", "scheduled"):
+            return "not_approved"
+        current = max(1, int(item["version"] or 0))
+        if int(item["approved_version"] or 0) != current or (version is not None and int(version) != current):
+            return "version_changed"
+        return ""
+
+    def begin_publish_attempt(self, preview_id: str, preview_hash: str, *, via: str, requested_by: str,
+                              state: Mapping[str, Any] | None = None, now: datetime | None = None) -> tuple[PublishAttempt, str]:
+        """Start a confirmed publish, all in one transaction; returns ``(attempt, owner_token)``.
+
+        Checks: the preview exists, is unused and unexpired, was made by ``via`` and its hash equals
+        ``preview_hash``; the item has no live attempt, is ``approved``/``scheduled`` and its approved version is its
+        latest version and the preview's; that version was not published through the API already; the platform's
+        connection is ``connected`` with the preview's account. Then a ``sending`` attempt owned by this process
+        (fresh ``owner_token``, heartbeat now) is inserted, the preview is marked used and the worker is registered.
+        The partial unique index turns a concurrent second attempt into ``ItemLockedError`` / ``already_published``.
+        ``owner_token`` must stay in the worker's memory. Failures raise ``PublishStateError`` (``reason``) or
+        ``ItemLockedError``; nothing is sent then.
+        """
+        now_dt = self._now_dt(now)
+        stamp = _fmt(now_dt)
+        registered = False
+        attempt_id = ""
+        try:
+            with self._tx() as conn:
+                pv = conn.execute("SELECT * FROM publish_previews WHERE id = ?", (str(preview_id or ""),)).fetchone()
+                if pv is None:
+                    raise PublishStateError("미리보기를 찾을 수 없어요. 다시 확인해 주세요.", reason="preview_missing")
+                if pv["used_at"]:
+                    raise PublishStateError("이미 사용한 미리보기예요. 다시 확인해 주세요.", reason="preview_used")
+                expires = _parse_ts(pv["expires_at"])
+                if expires is None or expires <= now_dt:
+                    raise PublishStateError("미리보기가 30분이 지나 만료됐어요. 다시 확인해 주세요.", reason="preview_expired")
+                if pv["created_via"] != via:
+                    raise PublishStateError("다른 곳에서 만든 미리보기라 여기서 보낼 수 없어요. 다시 확인해 주세요.", reason="preview_via")
+                if not hmac.compare_digest(str(pv["payload_hash"]), str(preview_hash or "")):
+                    raise PublishStateError("확인한 뒤에 내용이 바뀌었어요. 다시 확인해 주세요.", reason="hash_mismatch")
+                item_id, version, platform = pv["item_id"], int(pv["version"]), pv["platform"]
+                item = self._item_row(conn, item_id)
+                self._check_not_publishing(conn, item_id)
+                blocked = self._blocked_by(item, version)
+                if blocked:
+                    raise PublishStateError("승인한 최신 버전만 API로 게시할 수 있어요. 다시 확인해 주세요.", reason="not_publishable",
+                                            blocked_by=blocked)
+                live = self._live_attempt_error(conn, item_id, version, platform)
+                if live is not None:
+                    raise live
+                connection = conn.execute("SELECT status, account_id FROM publish_connections WHERE platform = ?", (platform,)).fetchone()
+                if connection is None or connection["status"] != "connected":
+                    raise PublishStateError("계정 연결이 끝났거나 해제됐어요. 다시 연결해 주세요.", reason="not_connected")
+                if connection["account_id"] != pv["account_id"]:
+                    raise PublishStateError("확인한 뒤에 연결된 계정이 바뀌었어요. 다시 확인해 주세요.", reason="account_changed")
+                attempt_id = f"pa_{secrets.token_hex(12)}"
+                token = secrets.token_hex(16)
+                try:
+                    conn.execute(
+                        "INSERT INTO publish_attempts (id, item_id, version, platform, preview_id, payload_hash, account_id, status, "
+                        "state, requested_by, owner_pid, owner_host, owner_boot, owner_token, heartbeat_at, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 'sending', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (attempt_id, item_id, version, platform, pv["id"], pv["payload_hash"], pv["account_id"],
+                         self._merged_state("{}", state), (requested_by or "")[:200], os.getpid(), this_host(), boot_marker(),
+                         token, stamp, stamp, stamp))
+                except sqlite3.IntegrityError:
+                    live = self._live_attempt_error(conn, item_id, version, platform)
+                    raise live if live is not None else ItemLockedError(platform=platform) from None
+                cursor = conn.execute("UPDATE publish_previews SET used_at = ? WHERE id = ? AND used_at = ''", (stamp, pv["id"]))
+                if cursor.rowcount != 1:
+                    raise PublishStateError("이미 사용한 미리보기예요. 다시 확인해 주세요.", reason="preview_used")
+                row = conn.execute("SELECT * FROM publish_attempts WHERE id = ?", (attempt_id,)).fetchone()
+                # registered before the commit (still under the workspace lock): a recovery in another thread of this
+                # process can never see the new row without its worker
+                self._register_publish_worker(attempt_id, token)
+                registered = True
+        except BaseException:
+            if registered:
+                self.release_publish_worker(attempt_id)
+            raise
+        return self._publish_attempt(row), token
+
+    def heartbeat_publish_attempt(self, attempt_id: str, owner_token: str, *, now: datetime | None = None) -> bool:
+        """The worker's heartbeat; False when the attempt is no longer this worker's (recovered, finished)."""
+        if not owner_token:
+            return False
+        with self._tx() as conn:
+            cursor = conn.execute("UPDATE publish_attempts SET heartbeat_at = ? WHERE id = ? AND status = 'sending' AND owner_token = ?",
+                                  (_fmt(self._now_dt(now)), attempt_id, owner_token))
+        return cursor.rowcount == 1
+
+    def update_publish_attempt(self, attempt_id: str, owner_token: str, *, step: str | None = None,
+                               state_patch: Mapping[str, Any] | None = None, media_token: str | None = None,
+                               now: datetime | None = None) -> None:
+        """Record progress of a ``sending`` attempt this worker owns (step, merged state, media folder token).
+        ``AttemptTakenOverError`` when ownership was lost: the worker must stop without sending."""
+        stamp = _fmt(self._now_dt(now))
+        with self._tx() as conn:
+            row = conn.execute("SELECT state FROM publish_attempts WHERE id = ? AND status = 'sending' AND owner_token = ? "
+                               "AND owner_token <> ''", (attempt_id, owner_token or "")).fetchone()
+            if row is None:
+                raise AttemptTakenOverError(attempt_id=attempt_id)
+            values: dict[str, Any] = {"heartbeat_at": stamp, "updated_at": stamp}
+            if step is not None:
+                values["step"] = str(step)[:60]
+            if state_patch:
+                values["state"] = self._merged_state(row["state"], state_patch)
+            if media_token is not None:
+                if media_token and not re.fullmatch(r"[0-9a-f]{32}", media_token):
+                    raise WorkspaceError("미디어 폴더 이름 형식이 올바르지 않아요")
+                values["media_token"] = media_token
+            assignments = ", ".join(f"{key} = ?" for key in values)
+            cursor = conn.execute(f"UPDATE publish_attempts SET {assignments} WHERE id = ? AND status = 'sending' AND owner_token = ?",
+                                  (*values.values(), attempt_id, owner_token))
+            if cursor.rowcount != 1:
+                raise AttemptTakenOverError(attempt_id=attempt_id)
+
+    def claim_publish_write(self, attempt_id: str, owner_token: str, *, step: str = "write", now: datetime | None = None) -> None:
+        """Right before the irreversible call (LinkedIn ``POST /rest/posts``, Instagram ``media_publish``): a conditional
+        UPDATE that only succeeds while this worker still owns the ``sending`` attempt. ``AttemptTakenOverError``
+        otherwise — the caller must not send. After this, an interruption means the outcome is unknown."""
+        stamp = _fmt(self._now_dt(now))
+        with self._tx() as conn:
+            cursor = conn.execute("UPDATE publish_attempts SET step = ?, heartbeat_at = ?, updated_at = ? "
+                                  "WHERE id = ? AND status = 'sending' AND owner_token = ? AND owner_token <> ''",
+                                  (str(step)[:60], stamp, stamp, attempt_id, owner_token or ""))
+        if cursor.rowcount != 1:
+            raise AttemptTakenOverError(attempt_id=attempt_id)
+
+    # attempts — outcomes
+    def _mark_item_published_via_api(self, conn: sqlite3.Connection, item_id: str, version: int, *, via: str, url: str,
+                                     external_id: str, stamp: str) -> str:
+        """Content side of a confirmed API publish (the attempt is already recorded as published). Deliberately not
+        guarded by ``_check_not_publishing``: the only live attempt is this one. Returns "" or the Korean reason why
+        the item could not be moved (then it is left as it is)."""
+        item = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+        if item is None:
+            return PUBLISH_ITEM_UPDATE_ERROR
+        if item["status"] not in ("approved", "scheduled") or int(item["approved_version"] or 0) != int(version) \
+                or max(1, int(item["version"] or 0)) != int(version):
+            return PUBLISH_ITEM_UPDATE_ERROR
+        link = url if url and _URL.match(url) else ""
+        conn.execute(
+            "UPDATE items SET status = 'published', published_at = CASE WHEN published_at = '' THEN ? ELSE published_at END, "
+            "published_url = CASE WHEN ? <> '' THEN ? ELSE published_url END, published_via = ?, published_external_id = ?, "
+            "updated_at = ? WHERE id = ?", (stamp, link, link, via, external_id or "", stamp, item_id))
+        return ""
+
+    def _record_item_update(self, attempt_id: str, item_id: str, version: int, *, via: str, url: str, external_id: str,
+                            stamp: str) -> ContentItem | None:
+        """Second transaction after an attempt became ``published``: move the item. A failure never undoes the
+        attempt; it is noted in ``attempt.state.item_update_error``."""
+        try:
+            with self._tx() as conn:
+                reason = self._mark_item_published_via_api(conn, item_id, version, via=via, url=url,
+                                                           external_id=external_id, stamp=stamp)
+                if not reason:
+                    return self._item(self._item_row(conn, item_id))
+        except Exception:  # noqa: BLE001 - the success record must never be lost over the item update
+            log.warning("게시 시도 %s의 콘텐츠 상태를 바꾸지 못했어요", attempt_id, exc_info=True)
+            reason = PUBLISH_ITEM_UPDATE_ERROR
+        try:
+            with self._tx() as conn:
+                row = conn.execute("SELECT state FROM publish_attempts WHERE id = ?", (attempt_id,)).fetchone()
+                if row is not None:
+                    conn.execute("UPDATE publish_attempts SET state = ?, updated_at = ? WHERE id = ?",
+                                 (self._merged_state(row["state"], {"item_update_error": reason}), stamp, attempt_id))
+        except Exception:  # noqa: BLE001
+            log.warning("게시 시도 %s에 메모를 남기지 못했어요", attempt_id, exc_info=True)
+        return None
+
+    def finish_publish_success(self, attempt_id: str, owner_token: str, *, external_id: str = "", permalink: str = "",
+                               via: str, state_patch: Mapping[str, Any] | None = None,
+                               now: datetime | None = None) -> tuple[PublishAttempt, ContentItem | None]:
+        """The platform confirmed the post. ① The attempt becomes ``published`` and is committed right away (so the
+        fact and its permalink are never lost; the unique index keeps blocking a second post of this version).
+        ② The item becomes ``published`` (``published_at`` when empty, ``published_url`` = permalink when given,
+        ``published_via`` = ``via``, ``published_external_id``) — if that is impossible the item stays as it is and
+        ``attempt.state.item_update_error`` says so; no exception. ``AttemptTakenOverError`` when the worker no
+        longer owns the attempt (then the recovery's record stands)."""
+        if via not in PUBLISHED_VIA_VALUES or not via:
+            raise WorkspaceError(f"published_via 값이 올바르지 않아요: {via!r}")
+        stamp = _fmt(self._now_dt(now))
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM publish_attempts WHERE id = ? AND status = 'sending' AND owner_token = ? "
+                               "AND owner_token <> ''", (attempt_id, owner_token or "")).fetchone()
+            if row is None:
+                raise AttemptTakenOverError(attempt_id=attempt_id)
+            conn.execute("UPDATE publish_attempts SET status = 'published', external_id = ?, permalink = ?, state = ?, "
+                         "error_code = '', error = '', owner_token = '', heartbeat_at = ?, updated_at = ?, finished_at = ? "
+                         "WHERE id = ?", (external_id or "", permalink or "", self._merged_state(row["state"], state_patch),
+                                          stamp, stamp, stamp, attempt_id))
+        self.release_publish_worker(attempt_id)
+        item = self._record_item_update(attempt_id, row["item_id"], int(row["version"]), via=via, url=permalink or "",
+                                        external_id=external_id or "", stamp=stamp)
+        attempt = self.get_publish_attempt(attempt_id)
+        assert attempt is not None
+        return attempt, item
+
+    def finish_publish_failure(self, attempt_id: str, owner_token: str, *, status: str, error_code: str = "", error: str = "",
+                               state_patch: Mapping[str, Any] | None = None, now: datetime | None = None) -> PublishAttempt:
+        """Close a ``sending`` attempt this worker owns as ``failed`` (nothing was published) or ``unknown`` (the
+        irreversible call went out without an answer: the item stays locked until a person resolves it).
+        ``AttemptTakenOverError`` when ownership was lost."""
+        if status not in ("failed", "unknown"):
+            raise WorkspaceError(f"게시 실패 상태는 failed 또는 unknown이어야 해요 (받은 값: {status!r})")
+        stamp = _fmt(self._now_dt(now))
+        with self._tx() as conn:
+            row = conn.execute("SELECT state FROM publish_attempts WHERE id = ? AND status = 'sending' AND owner_token = ? "
+                               "AND owner_token <> ''", (attempt_id, owner_token or "")).fetchone()
+            if row is None:
+                raise AttemptTakenOverError(attempt_id=attempt_id)
+            conn.execute("UPDATE publish_attempts SET status = ?, error_code = ?, error = ?, state = ?, owner_token = '', "
+                         "heartbeat_at = ?, updated_at = ?, finished_at = ? WHERE id = ?",
+                         (status, (error_code or "")[:100], (error or "")[:1000], self._merged_state(row["state"], state_patch),
+                          stamp, stamp, stamp if status == "failed" else "", attempt_id))
+        self.release_publish_worker(attempt_id)
+        attempt = self.get_publish_attempt(attempt_id)
+        assert attempt is not None
+        return attempt
+
+    def set_publish_permalink(self, attempt_id: str, url: str, *, by: str, now: datetime | None = None) -> PublishAttempt:
+        """A person fills in the post address of a ``published`` attempt that has none; the item's ``published_url``
+        follows when the item was published by this attempt and has no URL. The caller checks the platform's hosts."""
+        url = (url or "").strip()
+        if not _URL.match(url) or not url.lower().startswith("https://") or len(url) > 2000:
+            raise WorkspaceError("게시물 주소는 https://로 시작하는 전체 주소여야 해요")
+        stamp = _fmt(self._now_dt(now))
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM publish_attempts WHERE id = ?", (attempt_id,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"게시 시도 {attempt_id}를 찾을 수 없어요")
+            if row["status"] != "published" or row["permalink"]:
+                raise PublishStateError("게시가 끝났고 주소가 비어 있는 기록에만 주소를 넣을 수 있어요.", reason="attempt_state")
+            conn.execute("UPDATE publish_attempts SET permalink = ?, state = ?, updated_at = ? WHERE id = ?",
+                         (url, self._merged_state(row["state"], {"permalink_by": (by or "")[:200]}), stamp, attempt_id))
+            conn.execute("UPDATE items SET published_url = ?, updated_at = ? WHERE id = ? AND status = 'published' "
+                         "AND published_url = '' AND published_via <> ''", (url, stamp, row["item_id"]))
+            row = conn.execute("SELECT * FROM publish_attempts WHERE id = ?", (attempt_id,)).fetchone()
+        return self._publish_attempt(row)
+
+    def resolve_publish_attempt(self, attempt_id: str, outcome: str, *, url: str = "", resolved_by: str, via: str = "",
+                                now: datetime | None = None) -> tuple[PublishAttempt, ContentItem | None]:
+        """A person closes an ``unknown`` attempt: ``published`` (it did go up; optional checked ``url``; the item
+        follows like ``finish_publish_success`` ②, ``published_via`` = ``via``) or ``not_published`` →
+        ``abandoned`` (item untouched). ``PublishStateError(reason="attempt_state")`` unless the attempt is
+        ``unknown``."""
+        if outcome not in ("published", "not_published"):
+            raise WorkspaceError("결과는 published 또는 not_published여야 해요")
+        url = (url or "").strip()
+        if url and (not _URL.match(url) or not url.lower().startswith("https://")):
+            raise WorkspaceError("게시물 주소는 https://로 시작하는 전체 주소여야 해요")
+        if outcome == "published" and (via not in PUBLISHED_VIA_VALUES or not via):
+            raise WorkspaceError(f"published_via 값이 올바르지 않아요: {via!r}")
+        stamp = _fmt(self._now_dt(now))
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM publish_attempts WHERE id = ?", (attempt_id,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"게시 시도 {attempt_id}를 찾을 수 없어요")
+            if row["status"] != "unknown":
+                raise PublishStateError("결과 확인이 필요한 기록만 정리할 수 있어요.", reason="attempt_state")
+            status = "published" if outcome == "published" else "abandoned"
+            conn.execute("UPDATE publish_attempts SET status = ?, permalink = CASE WHEN ? <> '' THEN ? ELSE permalink END, "
+                         "resolved_by = ?, owner_token = '', updated_at = ?, finished_at = ? WHERE id = ?",
+                         (status, url, url, (resolved_by or "")[:200], stamp, stamp, attempt_id))
+        item = None
+        if outcome == "published":
+            item = self._record_item_update(attempt_id, row["item_id"], int(row["version"]), via=via,
+                                            url=url or row["permalink"], external_id=row["external_id"], stamp=stamp)
+        attempt = self.get_publish_attempt(attempt_id)
+        assert attempt is not None
+        return attempt, item
+
+    def reconcile_publish_attempt(self, attempt_id: str, *, status: str, external_id: str = "", permalink: str = "",
+                                  error_code: str = "", error: str = "", via: str = "", resolved_by: str = "",
+                                  state_patch: Mapping[str, Any] | None = None,
+                                  now: datetime | None = None) -> tuple[PublishAttempt, ContentItem | None]:
+        """Close an ``unknown`` attempt from a read-only platform re-check (Instagram ``status_code``): ``published``
+        (the item follows like ``finish_publish_success`` ②) or ``failed``. ``status="unknown"`` only merges
+        ``state_patch`` / ``error`` (the check could not decide)."""
+        if status not in ("published", "failed", "unknown"):
+            raise WorkspaceError("재확인 결과는 published, failed, unknown 중 하나여야 해요")
+        if status == "published" and (via not in PUBLISHED_VIA_VALUES or not via):
+            raise WorkspaceError(f"published_via 값이 올바르지 않아요: {via!r}")
+        stamp = _fmt(self._now_dt(now))
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM publish_attempts WHERE id = ?", (attempt_id,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"게시 시도 {attempt_id}를 찾을 수 없어요")
+            if row["status"] != "unknown":
+                raise PublishStateError("결과 확인이 필요한 기록만 다시 확인할 수 있어요.", reason="attempt_state")
+            state = self._merged_state(row["state"], state_patch)
+            if status == "unknown":
+                conn.execute("UPDATE publish_attempts SET state = ?, error = CASE WHEN ? <> '' THEN ? ELSE error END, updated_at = ? "
+                             "WHERE id = ?", (state, error or "", (error or "")[:1000], stamp, attempt_id))
+            else:
+                conn.execute("UPDATE publish_attempts SET status = ?, external_id = CASE WHEN ? <> '' THEN ? ELSE external_id END, "
+                             "permalink = CASE WHEN ? <> '' THEN ? ELSE permalink END, error_code = ?, error = ?, state = ?, "
+                             "resolved_by = ?, owner_token = '', updated_at = ?, finished_at = ? WHERE id = ?",
+                             (status, external_id or "", external_id or "", permalink or "", permalink or "",
+                              "" if status == "published" else (error_code or "")[:100],
+                              "" if status == "published" else (error or "")[:1000], state, (resolved_by or "")[:200],
+                              stamp, stamp, attempt_id))
+        item = None
+        if status == "published":
+            item = self._record_item_update(attempt_id, row["item_id"], int(row["version"]), via=via,
+                                            url=permalink or row["permalink"], external_id=external_id or row["external_id"],
+                                            stamp=stamp)
+        attempt = self.get_publish_attempt(attempt_id)
+        assert attempt is not None
+        return attempt, item
+
+    def record_late_publish_success(self, attempt_id: str, *, external_id: str = "", permalink: str = "", via: str,
+                                    state_patch: Mapping[str, Any] | None = None,
+                                    now: datetime | None = None) -> tuple[PublishAttempt, ContentItem | None]:
+        """The platform confirmed the post after the worker had lost the attempt (recovery closed it, a person
+        resolved it, or an Instagram re-check closed it). A confirmed success is never dropped:
+
+        - ``unknown`` / ``failed`` / ``abandoned`` → ``published`` (``resolved_by`` = ``system:late_answer``; the
+          item follows like ``finish_publish_success`` ②), which also restores the unique index against a second
+          post of this version. If another live attempt of the same version already exists (a new send after
+          "안 올라갔어요"), the status stays and ``error`` asks the person to check for a duplicate;
+        - ``published`` (a person said "올라갔어요") → a missing external id / permalink is filled in, on the item
+          too when the API published it and it has none.
+
+        ``state.late_success`` always keeps what arrived (``external_id``, ``permalink``, ``at``, ``status_before``)."""
+        if via not in PUBLISHED_VIA_VALUES or not via:
+            raise WorkspaceError(f"published_via 값이 올바르지 않아요: {via!r}")
+        external_id, permalink = (external_id or "")[:300], (permalink or "")[:2000]
+        stamp = _fmt(self._now_dt(now))
+        moved = False
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM publish_attempts WHERE id = ?", (attempt_id,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"게시 시도 {attempt_id}를 찾을 수 없어요")
+            late = {"late_success": {"external_id": external_id, "permalink": permalink, "at": stamp,
+                                     "status_before": row["status"], "resolved_by_before": row["resolved_by"] or ""}}
+            state = self._merged_state(self._merged_state(row["state"], state_patch), late)
+            if row["status"] in ("unknown", "failed", "abandoned"):
+                other = conn.execute("SELECT id FROM publish_attempts WHERE item_id = ? AND version = ? AND platform = ? "
+                                     "AND status IN ('sending', 'published', 'unknown') AND id <> ? LIMIT 1",
+                                     (row["item_id"], row["version"], row["platform"], attempt_id)).fetchone()
+                moved = other is None
+            if moved:
+                conn.execute("UPDATE publish_attempts SET status = 'published', external_id = ?, "
+                             "permalink = CASE WHEN ? <> '' THEN ? ELSE permalink END, error_code = '', error = '', "
+                             "state = ?, resolved_by = ?, owner_token = '', updated_at = ?, finished_at = ? WHERE id = ?",
+                             (external_id, permalink, permalink, state, PUBLISH_LATE_ANSWER, stamp, stamp, attempt_id))
+            elif row["status"] == "published":
+                conn.execute("UPDATE publish_attempts SET external_id = CASE WHEN external_id = '' THEN ? ELSE external_id END, "
+                             "permalink = CASE WHEN permalink = '' THEN ? ELSE permalink END, state = ?, updated_at = ? "
+                             "WHERE id = ?", (external_id, permalink, state, stamp, attempt_id))
+                conn.execute("UPDATE items SET published_external_id = CASE WHEN published_external_id = '' THEN ? "
+                             "ELSE published_external_id END, published_url = CASE WHEN published_url = '' AND ? <> '' "
+                             "THEN ? ELSE published_url END, updated_at = ? WHERE id = ? AND status = 'published' "
+                             "AND published_via <> ''",
+                             (external_id, permalink, permalink, stamp, row["item_id"]))
+            else:  # blocked by another live attempt of this version (or, never expected, still 'sending')
+                conn.execute("UPDATE publish_attempts SET state = ?, error = ?, updated_at = ? WHERE id = ?",
+                             (state, PUBLISH_LATE_SUCCESS_BLOCKED, stamp, attempt_id))
+        item = None
+        if moved:
+            item = self._record_item_update(attempt_id, row["item_id"], int(row["version"]), via=via,
+                                            url=permalink or row["permalink"], external_id=external_id, stamp=stamp)
+        attempt = self.get_publish_attempt(attempt_id)
+        assert attempt is not None
+        return attempt, item
+
+    def get_publish_attempt(self, attempt_id: str) -> PublishAttempt | None:
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM publish_attempts WHERE id = ?", (str(attempt_id or ""),)).fetchone()
+        return self._publish_attempt(row) if row else None
+
+    def list_publish_attempts(self, *, item_id: str | None = None, status: str | None = None,
+                              limit: int = 50) -> list[PublishAttempt]:
+        """Attempts, newest first (optionally one item's / one status)."""
+        where, params = [], []
+        if item_id:
+            where.append("item_id = ?")
+            params.append(str(item_id))
+        if status:
+            if status not in PUBLISH_ATTEMPT_STATUSES:
+                raise WorkspaceError(f"게시 시도 상태는 {', '.join(PUBLISH_ATTEMPT_STATUSES)} 중 하나여야 해요 (받은 값: {status!r})")
+            where.append("status = ?")
+            params.append(status)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        limit = max(1, min(int(limit or 50), 1000))
+        with self._read() as conn:
+            rows = conn.execute(f"SELECT * FROM publish_attempts {clause} ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                                (*params, limit)).fetchall()
+        return [self._publish_attempt(row) for row in rows]
+
+    def active_publish_attempt(self, item_id: str) -> PublishAttempt | None:
+        """The item's live attempt (``sending`` or ``unknown``), if any — while it exists the item is locked."""
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM publish_attempts WHERE item_id = ? AND status IN ('sending', 'unknown') "
+                               "ORDER BY created_at DESC LIMIT 1", (str(item_id or ""),)).fetchone()
+        return self._publish_attempt(row) if row else None
+
+    def active_publish_attempts(self, platform: str | None = None) -> list[PublishAttempt]:
+        """All live attempts (``sending``/``unknown``), optionally of one platform."""
+        params: list[Any] = []
+        clause = ""
+        if platform:
+            clause, params = "AND platform = ?", [platform]
+        with self._read() as conn:
+            rows = conn.execute(f"SELECT * FROM publish_attempts WHERE status IN ('sending', 'unknown') {clause} "
+                                "ORDER BY created_at", params).fetchall()
+        return [self._publish_attempt(row) for row in rows]
+
+    def publish_attempt_media_token(self, attempt_id: str) -> str:
+        """The public media folder name of an attempt ("" when none) — internal, for cleanup."""
+        with self._read() as conn:
+            row = conn.execute("SELECT media_token FROM publish_attempts WHERE id = ?", (str(attempt_id or ""),)).fetchone()
+        return row["media_token"] if row else ""
+
+    def finished_media_tokens(self, *, older_than: str | datetime | None = None) -> list[str]:
+        """Public media folders that can go: attempts that ended (``published``/``failed``/``abandoned``) and, with
+        ``older_than``, ``unknown`` attempts created before it (containers live 24 hours)."""
+        with self._read() as conn:
+            if older_than is None:
+                rows = conn.execute("SELECT DISTINCT media_token FROM publish_attempts WHERE media_token <> '' "
+                                    "AND status IN ('published', 'failed', 'abandoned')").fetchall()
+            else:
+                bound = older_than if isinstance(older_than, str) else _fmt(older_than)
+                rows = conn.execute("SELECT DISTINCT media_token FROM publish_attempts WHERE media_token <> '' AND "
+                                    "(status IN ('published', 'failed', 'abandoned') OR (status = 'unknown' AND created_at < ?))",
+                                    (bound,)).fetchall()
+        return [row["media_token"] for row in rows]
+
+    # attempts — recovery
+    def _attempt_owner_alive(self, row: sqlite3.Row, now: datetime, stale_after: float) -> bool:
+        """Whether the worker recorded on a ``sending`` attempt may still be working (the runs' rule, with this
+        process's worker table instead of run leases):
+
+        1. a worker of this process holds the attempt's owner token → alive;
+        2. no heartbeat (nor any write) for ``stale_after`` seconds → gone; another host/container → only this rule;
+        3. same host: a reboot since → gone; our own pid without a registered worker → an earlier process → gone;
+           otherwise whether that pid still runs.
+        """
+        with _PUBLISH_WORKERS_LOCK:
+            held = _PUBLISH_WORKERS.get((self._key, row["id"]))
+        if held and row["owner_token"] and held == row["owner_token"]:
+            return True
+        moments = [m for m in (_parse_ts(row["heartbeat_at"]), _parse_ts(row["updated_at"])) if m is not None]
+        if not moments or (now - max(moments)).total_seconds() > stale_after:
+            return False
+        pid = int(row["owner_pid"] or 0)
+        host = row["owner_host"] or ""
+        if pid <= 0 or not host or host != this_host():
+            return True
+        if _same_boot(row["owner_boot"] or "", boot_marker()) is False:
+            return False
+        if pid == os.getpid():
+            return False
+        return pid_alive(pid)
+
+    def recover_publish_attempts(self, *, stale_after: float = PUBLISH_STALE_AFTER_SECONDS,
+                                 now: datetime | None = None) -> list[str]:
+        """Close ``sending`` attempts whose worker is gone; returns their ids.
+
+        From the write step on (``step`` ``write`` or ``permalink``) the post may exist → ``unknown`` (the item stays locked until a
+        person resolves it); before it nothing was sent → ``failed``. The owner token is cleared in the same
+        transaction, so a worker that wakes up later fails its next conditional write and never sends. Safe to run
+        from several processes (server every minute, every CLI ``publish`` command)."""
+        now_dt = self._now_dt(now)
+        stamp = _fmt(now_dt)
+        closed: list[str] = []
+        with self._tx() as conn:
+            for row in conn.execute("SELECT * FROM publish_attempts WHERE status = 'sending'").fetchall():
+                if self._attempt_owner_alive(row, now_dt, stale_after):
+                    continue
+                if row["step"] in PUBLISH_AFTER_WRITE_STEPS:
+                    status, error = "unknown", PUBLISH_INTERRUPTED_UNKNOWN.get(row["platform"], PUBLISH_INTERRUPTED_FAILED)
+                else:
+                    status, error = "failed", PUBLISH_INTERRUPTED_FAILED
+                cursor = conn.execute(
+                    "UPDATE publish_attempts SET status = ?, error_code = 'interrupted', error = ?, owner_token = '', "
+                    "updated_at = ?, finished_at = ? WHERE id = ? AND status = 'sending' AND owner_token = ?",
+                    (status, error, stamp, stamp if status == "failed" else "", row["id"], row["owner_token"]))
+                if cursor.rowcount == 1:
+                    closed.append(row["id"])
+        for attempt_id in closed:
+            self.release_publish_worker(attempt_id)
+        return closed

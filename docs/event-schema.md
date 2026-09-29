@@ -105,6 +105,7 @@ seq 40 run.completed
 | `review.completed` | reviewer | `channel`, `round`, `score`, `passed`, `rubric`, `issues`, `format_checks`, `fact_checks`, `needs_research`, `summary` |
 | `revision.requested` | reviewer | `channel`, `round`, `issues`, `top_issue`, `instructions`(사람 지시가 있을 때) |
 | `channel.completed` | orchestrator | `channel`, `passed`, `score`, `rounds`, `final_round`, `title`, `content`, `hashtags` |
+| `channel.store_skipped` | orchestrator | `channel`, `item_id`, `attempt_id`, `platform`, `status`, `message` |
 | `run.completed` | system | `duration_s`, `scores`, `passed`, `output_dir`, `errors`(선택), `items`(워크스페이스), `cost_usd`(선택), 작업이면 `kind`·`item_id`·`version`·`status`·`format_checks`(edit) |
 | `run.failed` | system | `error`, 예산 초과면 `budget_exceeded`·`budget_usd`·`cost_usd`·`completed_channels`·`stopped_channels`, 서버 재시작이면 `interrupted`, 작업이면 `kind`·`item_id` |
 | `log` | 누구나 | `level`, `message` |
@@ -258,6 +259,16 @@ live 모드에서는 모델이 실제로 보낸 검색어가 검색 순간에 �
 {"channel": "linkedin", "passed": true, "score": 86, "rounds": 1, "final_round": 1, "title": "반복 업무를 덜어 낸 방법",
  "content": "혼자 사업하면 홍보는 늘 '이번 주만 넘기고'가 됩니다.\n그런데 고객은 이번 주에도 검색하고 있습니다.\n\n…\n\n#1인창업 #콘텐츠마케팅 #AI에이전트 #스타트업",
  "hashtags": ["#1인창업", "#콘텐츠마케팅", "#AI에이전트", "#스타트업"]}
+```
+
+
+### `channel.store_skipped`
+
+그 채널의 콘텐츠를 API로 게시하는 중이라(게시 시도가 `sending`이거나 결과 확인이 필요한 `unknown`) 이번 실행의 결과를 보관함에 넣지 않았다는 알림이에요. 채널마다 한 번만 오고, 다른 채널은 그대로 진행해요. 그 채널의 초안·검수는 실행 기록에는 남고, 이어서 실행하면 다시 저장을 시도해요.
+
+```json
+{"channel": "linkedin", "item_id": "it_20260928-120000-ab12_linkedin", "attempt_id": "pa_3f2a…", "platform": "linkedin",
+ "status": "sending", "message": "이 콘텐츠를 API로 게시하는 중이라 이번 결과를 보관함에 넣지 않았어요. 실행 기록에는 남아요."}
 ```
 
 ### `run.completed`

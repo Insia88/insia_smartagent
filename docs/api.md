@@ -16,9 +16,10 @@
 5. [참고 자료](#참고-자료)
 6. [실행](#실행) — 시작, 목록, 상세, SSE, 이어서 실행, 중단, 묶음 내려받기
 7. [콘텐츠 보관함](#콘텐츠-보관함) — 목록, 상세, 직접 수정, 재검수, 수정 요청, 상태 변경, 내보내기
-8. [캘린더](#캘린더)
-9. [사용량](#사용량)
-10. [파이썬에서 서버 띄우기](#파이썬에서-서버-띄우기)
+8. [API 게시 (LinkedIn · 인스타그램)](#api-게시-linkedin--인스타그램) — 상태, 연결, 미리보기, 확인 게시, 게시 기록, 결과 정리
+9. [캘린더](#캘린더)
+10. [사용량](#사용량)
+11. [파이썬에서 서버 띄우기](#파이썬에서-서버-띄우기)
 
 ---
 
@@ -33,6 +34,16 @@
 | `Sec-Fetch-Site`를 보냈다면 `same-origin` 또는 `none`이어야 함 | POST · PUT · DELETE | 403 |
 | `Content-Type: application/json` | POST · PUT (본문이 없어도) | 415 |
 | 접근 토큰 (토큰 모드일 때) | `/api/login`, `/api/logout`을 뺀 모든 `/api` | 401 |
+| **사람 요청**: `Sec-Fetch-Site`가 있으면 `same-origin`만, 없으면 `Host`와 같은 `Origin`이 꼭 있어야 함. 토큰 모드에서는 `insia_token` 쿠키로 인증한 요청만(`Authorization: Bearer`는 거절) | `POST /api/items/<id>/publish`, `POST /api/publish/attempts/<pa>/resolve` | 403 `{"code": "not_human"}` |
+
+`/api` 밖에서 서버가 직접 답하는 경로는 두 개예요. 둘 다 `Host` 검사는 하고, 접근 토큰은 받지 않아요.
+
+| 경로 | 받는 것 | 답 |
+|---|---|---|
+| `GET /oauth/linkedin/callback` | LinkedIn이 돌려보낸 `code`·`state` + `insia_oauth` 쿠키 | 언제나 `303` 하나. 페이지를 그리지 않아요([LinkedIn 콜백](#get-oauthlinkedincallback)) |
+| `GET`·`HEAD /pub/m/<32자 hex>/<NN>.jpg` | 인스타그램이 가져갈 공개 이미지 | **구성 B에서만**(미디어 도메인이 `--public-host`에 있고 미디어 포트가 없을 때) `200 image/jpeg`. 그 밖에는 본문 없는 `404`(1분에 30번 넘으면 `429`) |
+
+`serve --media-port`로 여는 **미디어 전용 리스너**(구성 A)는 대시보드와 다른 소켓이에요. `/pub/m/<32자 hex>/<NN>.jpg` 말고는 모두 본문 없는 404(GET·HEAD가 아니면 405)이고, `/api`·`/oauth`·대시보드 파일이 아예 없어요.
 
 다른 사이트의 페이지는 JSON 요청을 보내려면 CORS 사전 요청(preflight)을 거쳐야 하는데, 이 서버는 사전 요청을 절대 허락하지 않습니다. 그래서 로그인한 브라우저라도 다른 사이트가 대신 실행·승인·삭제를 할 수 없습니다. 정적 파일(대시보드 화면)은 토큰 없이도 열리고, `X-Frame-Options: DENY`로 다른 사이트에 끼워 넣을 수 없습니다.
 
@@ -44,6 +55,8 @@
 | `PUT /api/items/<id>/draft` | 1MB (본문은 10만 자까지) |
 | `PUT /api/profile` | 256KB |
 | `POST /api/login` · `/api/logout` | 4KB |
+| `PUT /api/publish/instagram/token` | 8KB |
+| 그 밖의 API 게시 경로(`/api/publish/**`, `/api/items/<id>/publish/**`) | 4KB |
 | 나머지 JSON | 64KB |
 
 `Content-Length`가 필요합니다(chunked 전송은 411). 한도를 넘으면 본문을 읽기 전에 413으로 답합니다. `NaN`, `Infinity`, `1e999`처럼 무한대가 되는 수, 절댓값이 9,007,199,254,740,991(2⁵³−1)보다 큰 정수, 너무 깊게 중첩된 JSON은 400입니다. 본문이 `Content-Length`보다 짧게 끝나면 400, 헤더만 보내고 본문을 120초 동안 보내지 않으면 408입니다.
@@ -65,26 +78,37 @@
 
 같은 이유로 그 콘텐츠를 만든 실행이 도는 동안에는 재검수·수정 요청도 `409`이고, 실행의 콘텐츠 하나에 재검수·수정 요청이 돌거나 사람이 저장하는 중이면 그 실행을 이어서 실행하는 것도 `409`입니다. 모두 이 서버에서 도는 작업만 알 수 있어요(CLI로 따로 돌리는 실행은 모름).
 
+API로 게시하는 중(`sending`)이거나 게시됐는지 확인이 필요한(`unknown`) 콘텐츠는 버전과 상태가 잠겨요. 직접 수정 저장, 재검수, 수정 요청, 상태 변경(승인 취소·보관·게시 완료 표시), 그 콘텐츠를 만든 실행의 이어서 실행이 모두 `409`이고, 이 잠금은 CLI·파이프라인이 쓰는 워크스페이스에서 걸려서 서버 밖에서도 같아요. 예정일·제목·메모 바꾸기는 막지 않아요.
+
+```json
+{"error": "게시됐는지 확인이 필요한 기록이 있어요. 먼저 정리해 주세요.", "status": 409, "code": "item_locked",
+ "attempt_id": "pa_9338b06e91be3bc78267888e", "platform": "linkedin", "attempt_status": "unknown"}
+```
+
+반대로 에이전트가 그 콘텐츠를 쓰는 중이면(재검수·수정 요청, 또는 그 콘텐츠를 만든 실행) API 게시와 미리보기가 `409 {"code": "agent_job", "run_id": …}`예요.
+
 ### 상태 코드
 
 | 코드 | 뜻 |
 |---|---|
 | 200 | 성공 |
 | 201 | 새 실행·작업·자료·슬롯을 만들었어요 |
-| 202 | 요청을 받았고 백그라운드에서 진행해요 (이어서 실행, 중단) |
+| 202 | 요청을 받았고 백그라운드에서 진행해요 (이어서 실행, 중단, API 게시) |
 | 204 | SSE: 더 보낼 이벤트가 없어요 (EventSource가 재연결을 멈춤) |
 | 400 | 입력이 잘못됐어요 |
 | 401 | 로그인이 필요해요 (`"login": true`) |
-| 403 | 허용되지 않은 Host·Origin |
+| 303 | LinkedIn 연결 콜백 (`/oauth/linkedin/callback`, 언제나) |
+| 403 | 허용되지 않은 Host·Origin, API 게시·결과 정리가 사람 요청이 아님(`"code": "not_human"`) |
 | 404 | 없는 경로 또는 없는 id |
 | 405 | 그 경로에서 지원하지 않는 메서드 (`Allow` 헤더 참고) |
-| 409 | 지금 상태에서는 할 수 없어요 (승인 차단, 잘못된 상태 전환, 이미 실행 중 등) |
+| 409 | 지금 상태에서는 할 수 없어요 (승인 차단, 잘못된 상태 전환, 이미 실행 중, API 게시 잠금 등). API 게시 경로는 `code`로 이유를 알려 줘요 |
+| 422 | API 게시: 고칠 부분이 있는 미리보기로 게시하려 함, 카드 이미지를 그리지 못함 |
 | 408 | 요청 본문이 제시간(120초)에 도착하지 않았어요 |
 | 413 · 415 · 411 | 본문이 너무 큼 · JSON이 아님 · Content-Length 없음 |
 | 414 | 주소(URL)가 너무 길어요 (64KB 넘음) |
-| 429 | 동시 작업 수 초과, 또는 로그인 실패가 너무 많음 (`Retry-After`) |
+| 429 | 동시 작업 수 초과, 로그인 실패가 너무 많음, API 게시 미리보기·게시·연결 시도가 너무 많음 (`Retry-After`) |
 | 501 | 선택 설치 패키지가 없음 (예: Word 내보내기에 python-docx 필요) |
-| 502 | AI 백엔드(Anthropic API) 호출 실패 |
+| 502 | AI 백엔드(Anthropic API) 호출 실패, LinkedIn 코드 교환 실패(`"code": "exchange_failed"`) |
 
 서버가 라우팅 전에 거절하는 요청(414, 잘못된 요청 줄 400, 헤더가 너무 큼 431, 지원하지 않는 메서드 501)도 같은 `{"error": "…", "status": N}` 모양으로 답합니다. 응답을 받기 전에 연결을 끊은 클라이언트는 오류로 기록하지 않습니다(디버그 로그만).
 
@@ -179,7 +203,8 @@ location / {
               "linkedin": ["txt", "md", "docx", "zip"], "instagram": ["zip", "txt", "md", "docx"]},
   "active_jobs": {"live": 0, "mock": 1},
   "limits": {"live": 2, "mock": 4},
-  "token_required": false
+  "token_required": false,
+  "publish": {"enabled": true, "configured": true, "fake": false, "linkedin": "connected", "instagram": "disabled"}
 }
 ```
 
@@ -195,6 +220,7 @@ location / {
 | `formats` | 채널별 내보내기 형식 (첫 번째가 추천) |
 | `active_jobs` · `limits` | 지금 도는 작업 수와 동시 작업 한도 |
 | `token_required` | 토큰 모드인지 |
+| `publish` | API 게시 요약(네트워크 호출 없음): 켜짐 여부(`INSIA_PUBLISH=0`이면 `false`), 설정했는지, 가짜 게시 모드인지, 플랫폼별 상태([상태 값](#get-apipublish)). 게시 기능이 답하지 못하면 `null` |
 
 토큰 모드에서 로그인 전이면 `401 {"error": "로그인이 필요해요. …", "status": 401, "login": true}`.
 
@@ -422,7 +448,7 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 
 콘텐츠(item)는 채널 산출물 하나입니다. 파이프라인 결과는 `it_<run_id>_<channel>` id로 저장되고, 모든 초안 라운드와 사람 수정이 버전으로 쌓입니다.
 
-상태: `draft` 초안 · `needs_changes` 수정 필요(최신 검수 미통과) · `approved` 승인 · `scheduled` 게시 예정 · `published` 게시 완료 · `archived` 보관. **자동 게시는 없습니다.** 게시는 사람이 채널에 올린 뒤 `published`로 표시합니다.
+상태: `draft` 초안 · `needs_changes` 수정 필요(최신 검수 미통과) · `approved` 승인 · `scheduled` 게시 예정 · `published` 게시 완료 · `archived` 보관. **자동 게시는 없어요.** 사람이 채널에 직접 올린 뒤 `published`로 표시하거나, 승인한 LinkedIn·인스타그램 콘텐츠를 대시보드에서 미리보기로 확인하고 [API로 게시](#api-게시-linkedin--인스타그램)할 때(사람이 누를 때 한 건씩)만 `published`가 돼요. `published_via`가 어떻게 올렸는지 알려 줘요: `""` 사람이 직접 올린 기록, `linkedin_api`·`instagram_api` 사람이 확인한 뒤 INSIA가 API로 올림, `fake` 가짜 게시 모드(테스트용, 실제로 올라가지 않음). `published_external_id`는 API로 올린 게시물 id(LinkedIn URN, 인스타그램 미디어 id)예요.
 
 ### `GET /api/items`
 
@@ -433,7 +459,8 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
             "title": "반복 업무를 덜어 낸 방법", "status": "draft", "version": 2, "score": 86, "passed": true,
             "scheduled_at": "", "published_at": "", "published_url": "", "note": "",
             "created_at": "2026-09-28T10:10:39.209Z", "updated_at": "2026-09-28T10:10:39.216Z",
-            "approved_version": 0, "approval_forced": false, "approved_score": null, "approved_at": ""}]}
+            "approved_version": 0, "approval_forced": false, "approved_score": null, "approved_at": "",
+            "published_via": "", "published_external_id": ""}]}
 ```
 
 `approved_version`·`approved_score`·`approved_at`·`approval_forced`는 마지막 승인 기록입니다(승인한 버전, 그 버전의 검수 점수, 시각, 검수를 통과하지 못한 버전을 "그래도 승인"했는지). 게시한 뒤에도 남는 기록이라, `approval_forced`가 `true`이고 상태가 `approved`·`scheduled`·`published`면 대시보드는 "강제 승인"으로 표시합니다. 승인한 적이 없으면 `0`·`null`·`""`·`false`입니다.
@@ -442,7 +469,7 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
 
 ### `GET /api/items/<id>`
 
-`ContentItemDetail` + 내보내기 목록입니다.
+`ContentItemDetail` + 내보내기 목록 + API 게시 블록(`publish`)입니다.
 
 ```json
 {"item": {"id": "it_…_linkedin", "...": "..."},
@@ -456,10 +483,11 @@ data: {"seq": 1, "t": 0.0, "type": "run.started", ...}
  "exports": [{"format": "txt", "label": "붙여넣기용 텍스트 (.txt)", "available": true,
               "url": "/api/items/it_…_linkedin/export?format=txt"},
              {"format": "docx", "label": "Word·한글 문서 (.docx)", "available": false,
-              "url": "…", "hint": "Word 파일을 만들려면 pip install \"insia-smartagent[export]\"로 python-docx를 설치해 주세요."}]}
+              "url": "…", "hint": "Word 파일을 만들려면 pip install \"insia-smartagent[export]\"로 python-docx를 설치해 주세요."}],
+ "publish": null}
 ```
 
-`versions`는 오래된 것부터, 마지막이 현재 버전입니다. `source`: `agent`(에이전트) · `human`(사람). `instructions`는 수정 요청 때 사람이 준 지시입니다.
+`versions`는 오래된 것부터, 마지막이 현재 버전입니다. `source`: `agent`(에이전트) · `human`(사람). `instructions`는 수정 요청 때 사람이 준 지시입니다. `publish`는 [콘텐츠의 API 게시 블록](#콘텐츠-상세의-publish-블록)이에요. API 게시를 한 번도 설정하지 않았거나 꺼져 있으면 `null`이라, 대시보드는 게시 UI를 전혀 그리지 않아요.
 
 ### `PUT /api/items/<id>/draft`
 
@@ -566,6 +594,365 @@ X-Insia-Notes: PNG%20%EB%8C%80%EC%8B%A0%20slides.html%EC%9D%84%20%EB%84%A3%EC%97
 - `?info=1` → `{"filename": "2026-09-28_instagram_데모-…_v2.zip", "content_type": "application/zip", "size": 5175, "notes": ["PNG 대신 slides.html을 넣었어요 — …"]}`
 
 오류: 채널에 없는 형식·없는 버전(400), 없는 콘텐츠(404), python-docx 미설치(501 `{"error": "… pip install \"insia-smartagent[export]\" …", "package": "python-docx", "extra": "export"}`).
+
+---
+
+## API 게시 (LinkedIn · 인스타그램)
+
+승인한 `linkedin` 콘텐츠를 LinkedIn 개인 프로필에, `instagram` 콘텐츠를 인스타그램 캐러셀로 올려요. 사용자마다 **자기 개발자 앱**(LinkedIn 앱, Meta의 Instagram API with Instagram Login)을 연결해서 쓰고, INSIA는 공용 앱 키를 싣지 않아요. 네이버 블로그·사업계획서는 API 게시가 없어요.
+
+- **자동 게시·예약 게시는 없어요.** 한 번의 사람 확인이 게시물 하나예요. 흐름은 늘 `미리보기 → 사람이 보고 확인 → 게시`이고, 서버는 미리보기 때 저장한 바로 그 내용(본문·캡션·이미지 바이트의 해시)만 보내요. 백그라운드에서 스스로 다시 보내지 않아요.
+- 게시와 결과 정리는 브라우저의 대시보드에서 사람이 누른 요청만 받아요([사람 요청](#요청-보안)). 스크립트(`Authorization: Bearer`)로 게시하는 것은 LinkedIn API 약관 위반이라 서버가 403으로 막아요. 터미널에서는 `insia publish send`가 TTY에서만, 미리보기마다 새로 만든 무작위 확인 코드를 입력해야 돌아요.
+- 설정하지 않으면 지금과 똑같아요: 콘텐츠 상세의 `publish`가 `null`이고, 다른 응답도 그대로예요. `INSIA_PUBLISH=0`이면 기능 전체가 꺼져서 상태 조회 `GET /api/publish`만 `200 {"enabled": false, …}`로 답하고(대시보드가 이것을 보고 "API 게시 연결" 카드를 숨겨요), 나머지 게시 경로는 모두 `409 {"code": "disabled"}`예요.
+- 토큰·client secret·OAuth code·state는 어떤 응답·로그에도 나오지 않아요. 앱 정보는 `client_id_set`·`client_secret_set`처럼 있는지 여부만, 계정 id는 끝 3자(`id_hint`)만 보여요.
+- 인스타그램은 시험 중이라 기본으로 꺼져 있고 `INSIA_PUBLISH_INSTAGRAM=1`일 때만 켜져요. 이미지를 인스타그램이 가져갈 **공개 HTTPS 주소**가 있어야 해요(`serve --media-port … --media-base-url https://…`, 운영 안내 참고). 없으면 인스타그램은 `unavailable`이고 지금처럼 카드 묶음을 받아 앱에서 올리면 돼요.
+
+아래 예시는 테스트 워크스페이스에서 가짜 게시 모드(`INSIA_PUBLISH_FAKE=1`)로 받은 실제 응답이에요(긴 글은 `…`로 줄였어요). 가짜 게시 모드는 메모리 속 LinkedIn·인스타그램이 늘 성공하는 모드라, 게시물 주소가 `https://example.invalid/…`이고 `published_via`가 `fake`예요. 임시 폴더 워크스페이스에서만 켜져요.
+
+| 경로 | 하는 일 |
+|---|---|
+| `GET /api/publish[?check=1]` | 기능·플랫폼별 준비 상태 (`check=1`이면 토큰이 살아 있는지 플랫폼에 실제로 확인) |
+| `PUT /api/publish/linkedin/app` | LinkedIn 앱 정보(Client ID·Secret·Redirect URI) 저장 |
+| `POST /api/publish/linkedin/connect` | LinkedIn 동의 화면 주소 발급 (`redirect`/`paste` 모드) |
+| `POST /api/publish/linkedin/complete` | 동의한 뒤 이동한 주소를 붙여 넣어 연결 마치기 |
+| `GET /oauth/linkedin/callback` | LinkedIn이 돌려보내는 곳 (토큰 없음, 언제나 303) |
+| `PUT /api/publish/instagram/token` | 인스타그램 토큰 확인·저장 (인스타그램이 켜져 있을 때만) |
+| `DELETE /api/publish/<linkedin\|instagram>[?forget_app=1]` | 연결 해제 |
+| `POST /api/items/<id>/publish/preview` | 미리보기 만들기 |
+| `GET /api/publish/previews/<pv>/slides/<n>.jpg` | 인스타그램 미리보기 이미지 |
+| `POST /api/items/<id>/publish` | **확인 게시 시작 (사람 요청만)** → 202 |
+| `GET /api/items/<id>/publish` | 그 콘텐츠의 게시 기록 |
+| `GET /api/publish/attempts/<pa>` | 게시 시도 하나 (진행 확인) |
+| `PUT /api/publish/attempts/<pa>/permalink` | 게시했는데 주소가 빈 기록에 주소 넣기 |
+| `POST /api/publish/attempts/<pa>/resolve` | **게시됐는지 모르는 기록 정리 (사람 요청만)** |
+| `POST /api/publish/attempts/<pa>/check` | 인스타그램에서 다시 확인 (읽기만) |
+
+### `GET /api/publish`
+
+네트워크를 쓰지 않는 상태 조회예요(`?check=1`만 플랫폼에 물어봐요). 대시보드의 "API 게시 연결" 카드가 이 응답으로 그려져요.
+
+```json
+{"enabled": true, "configured": true, "fake": true,
+ "media": {"url": "", "mode": "none", "port": null, "valid": false,
+           "reason": "미디어 공개 주소(INSIA_MEDIA_BASE_URL / --media-base-url)가 없어요."},
+ "platforms": {
+  "linkedin": {"label": "LinkedIn", "channels": ["linkedin"], "state": "connected", "ready": true,
+               "reason": "가짜 게시 계정(LinkedIn 개인 프로필)에 올려요.", "blockers": [],
+               "app": {"client_id_set": true, "client_secret_set": true, "source": "env",
+                       "redirect_uri": "http://localhost:8765/oauth/linkedin/callback", "redirect_uri_source": "default"},
+               "account": {"id_hint": "…r01", "name": "가짜 게시 계정", "kind": "LinkedIn 개인 프로필"},
+               "token": {"expires_at": "2026-11-27T23:48:01Z", "days_left": 59, "estimated": false,
+                         "scopes": ["openid", "profile", "w_member_social"]},
+               "api_version": "202609", "api_version_sunset": "2027-09-15", "api_version_warning": ""},
+  "instagram": {"label": "인스타그램", "channels": ["instagram"], "state": "connected", "ready": true,
+                "reason": "@insia.fake에 올려요.", "blockers": [], "beta": true, "enabled_by": "env",
+                "account": {"id_hint": "…000", "username": "@insia.fake", "account_type": "BUSINESS",
+                            "kind": "인스타그램 비즈니스 계정"},
+                "token": {"expires_at": "2026-11-27T23:48:09Z", "days_left": 59, "estimated": false,
+                          "refreshed_at": "2026-09-28T23:48:09Z", "auto_refresh": true, "refresh_failed": false},
+                "api_version": "v25.0", "requirements": {"public_https": true, "render": true}}}}
+```
+
+| 필드 | 뜻 |
+|---|---|
+| `enabled` | API 게시가 켜져 있는지. `false`면 `{"enabled": false, "configured": false, "fake": false, "reason": "API 게시가 꺼져 있어요 (INSIA_PUBLISH=0).", "media": {…}, "platforms": {}}`만 와요 |
+| `configured` | 앱 정보·연결이 하나라도 저장돼 있거나 관련 환경 변수(`INSIA_LINKEDIN_CLIENT_ID`, `INSIA_PUBLISH_INSTAGRAM=1`)가 있는지. `false`면 보관함 화면에 게시 UI를 그리지 않아요 |
+| `fake` | 가짜 게시 모드(테스트용). 대시보드는 "실제로 올라가지 않아요" 띠를 띄워요 |
+| `media` | 인스타그램이 이미지를 가져갈 공개 주소. `mode`: `listener`(미디어 전용 포트, 구성 A) · `main`(대시보드 포트, 구성 B) · `none`. `valid: false`면 `reason`에 한국어 이유. 구성 A는 `listening`(리스너가 열렸는지)도 와요 |
+| `platforms.*.state` | `disabled` 꺼짐(인스타그램 시험 기능 꺼짐 포함) · `not_configured` 앱 정보 없음 · `not_connected` 계정 연결 안 됨 · `connected` 준비됨 · `expiring` 곧 만료(게시는 됨) · `needs_reconnect` 다시 연결 필요 · `unavailable` 요구 조건이 없음(`blockers`: `public_url_missing` 공개 주소 없음, `media_port_unavailable` 미디어 포트를 열 수 없음, `render_unavailable` 카드 이미지를 그릴 브라우저·한글 글꼴 없음) |
+| `ready` · `reason` | 지금 게시할 수 있는지와 버튼 옆에 그대로 보여 줄 한국어 한 문장 |
+| `app` | LinkedIn 앱 정보가 있는지만(`*_set`), 어디서 왔는지(`source`: `env` 환경 변수라 여기서 못 바꿈 · `workspace` · `""`), 지금 쓰는 Redirect URI와 그 출처(`env` · `workspace` · `default`) |
+| `account` · `token` | 연결한 계정(이름은 LinkedIn 약관 때문에 저장하지 않고 메모리에만 둬서 서버를 다시 켜면 `""`일 수 있어요)과 토큰 만료. 연결 전에는 `null` |
+| `api_version_*` | LinkedIn API 버전과 지원 종료일. 종료 60일 전부터 `api_version_warning`에 안내가 와요 |
+
+### `PUT /api/publish/linkedin/app`
+
+요청: `{"client_id": "86abcdefghijkl", "client_secret": "…", "redirect_uri": "http://localhost:8765/oauth/linkedin/callback"}`. 필드를 빼면 저장된 값을 그대로 두고, `""`이면 지워요. `client_secret`은 저장만 하고 다시 보여 주지 않아요.
+
+응답 `200`: `GET /api/publish`의 `linkedin` 블록(비밀값 없음).
+
+```json
+{"label": "LinkedIn", "channels": ["linkedin"], "state": "not_connected", "ready": false,
+ "reason": "LinkedIn 계정을 연결해야 해요.", "blockers": [],
+ "app": {"client_id_set": true, "client_secret_set": true, "source": "workspace",
+         "redirect_uri": "http://localhost:8765/oauth/linkedin/callback", "redirect_uri_source": "workspace"},
+ "account": null, "token": null, "api_version": "202609", "api_version_sunset": "2027-09-15", "api_version_warning": ""}
+```
+
+오류: 환경 변수로 정한 값을 바꾸려 함 `409 {"code": "env_locked"}`, Redirect URI 형식(절대 주소, `#` 없음, `http://`는 `localhost`·`127.0.0.1`·`[::1]`만) `400 {"code": "invalid_input"}`, 모르는 필드 400.
+
+### `POST /api/publish/linkedin/connect`
+
+본문 `{}`. 1회용 state(10분)를 만들고 LinkedIn 동의 화면 주소를 줘요. 대시보드를 연 주소의 출처(스킴·호스트·포트)가 Redirect URI의 출처와 같으면 `redirect` 모드(LinkedIn이 INSIA 콜백으로 바로 돌려보냄), 다르면 `paste` 모드(동의한 뒤 이동한 주소창 주소를 붙여 넣음)예요.
+
+```json
+{"mode": "paste",
+ "authorize_url": "https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=86abcdefghijkl&redirect_uri=http%3A%2F%2Flocalhost%3A8765%2Foauth%2Flinkedin%2Fcallback&state=…&scope=openid%20profile%20w_member_social",
+ "expires_in": 600, "redirect_uri": "http://localhost:8765/oauth/linkedin/callback",
+ "open_url": "http://localhost:8765/#/brand/connections"}
+```
+
+- `redirect` 모드는 응답에 쿠키가 붙어요: `Set-Cookie: insia_oauth=<state의 HMAC>; Path=/oauth/; Max-Age=600; HttpOnly; SameSite=Lax[; Secure]`. 콜백은 이 쿠키가 있는 브라우저에서 온 것만 받아요(로그인 CSRF 방지).
+- `open_url`은 `paste` 모드이고 Redirect URI의 호스트가 루프백 이름이거나 `--public-host`에 있을 때만 와요("LinkedIn 앱에 등록한 주소로 대시보드를 열면 바로 연결돼요").
+- 오류: 앱 정보 없음 `409 {"code": "not_configured"}`, Redirect URI 형식 400.
+
+### `POST /api/publish/linkedin/complete`
+
+요청: `{"url": "http://localhost:8765/oauth/linkedin/callback?code=…&state=…"}` (`code=…&state=…`만 붙여 넣어도 돼요). **이 서버가 만든 state만, 한 번만, 10분 안에만** 받아요. 출처 검사는 하지 않아요(대시보드를 LAN 주소로 열었을 때를 위한 경로라서). 응답 `200`: `GET /api/publish`의 `linkedin` 블록(`"state": "connected"`).
+
+| 오류 | 응답 |
+|---|---|
+| state가 없음·만료·이미 씀·이 서버가 만든 것이 아님 | `400 {"error": "연결 요청이 만료됐거나 올바르지 않아요. 다시 연결해 주세요.", "code": "oauth_state"}` |
+| LinkedIn에서 취소함 (`error=user_cancelled_*`) | `400 {"code": "oauth_cancelled"}` |
+| 주소 모양이 다름(경로가 Redirect URI와 다름, `http(s)` 아님) | `400 {"code": "invalid_input"}` |
+| 코드 교환 실패 | `502 {"code": "exchange_failed"}` |
+| 잘못된 state가 1분에 10번 넘음 | `429` + `Retry-After` (로그인 제한과 따로 세요) |
+
+### `GET /oauth/linkedin/callback`
+
+인증 없이 여는 유일한 페이지라 HTML을 만들지 않아요. 무슨 일이 있었든 `303`으로 대시보드의 고정 주소로 보내고, 쿼리 값(`error_description` 등)이나 LinkedIn 이름을 응답에 넣지 않아요.
+
+```
+HTTP/1.1 303 See Other
+Location: /#/brand/connections/linkedin/ok
+Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
+X-Frame-Options: DENY
+Referrer-Policy: no-referrer
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Set-Cookie: insia_oauth=; Path=/oauth/; Max-Age=0; HttpOnly; SameSite=Lax
+Content-Type: text/plain; charset=utf-8
+```
+
+`Location` 끝의 결과는 `ok` · `cancelled` · `expired` · `exchange_failed` · `invalid` 중 하나예요(state 없음·재사용·쿠키 불일치는 `invalid`). 대시보드가 결과를 보고 한국어 문구를 그려요. 잘못된·만료된 state는 IP마다 1분에 10번까지이고, 넘으면 `429`(같은 보안 헤더 + `Retry-After`)예요. 접근 로그에는 `/oauth/` 요청의 쿼리(code·state)를 남기지 않아요.
+
+### `PUT /api/publish/instagram/token`
+
+요청: `{"access_token": "IGAA…"}` (Meta 개발자 앱의 Generate token으로 만든 장기 토큰). `/me`로 계정을 확인하고(프로페셔널 계정만), 바로 한 번 갱신을 시도해 정확한 만료일을 얻은 뒤 저장해요. 응답 `200`: `instagram` 블록(토큰 없음).
+
+```json
+{"label": "인스타그램", "channels": ["instagram"], "state": "connected", "ready": true, "reason": "@insia.fake에 올려요.",
+ "blockers": [], "beta": true, "enabled_by": "env",
+ "account": {"id_hint": "…000", "username": "@insia.fake", "account_type": "BUSINESS", "kind": "인스타그램 비즈니스 계정"},
+ "token": {"expires_at": "2026-11-27T23:48:09Z", "days_left": 59, "estimated": false,
+           "refreshed_at": "2026-09-28T23:48:09Z", "auto_refresh": true, "refresh_failed": false},
+ "api_version": "v25.0", "requirements": {"public_https": true, "render": true}}
+```
+
+`estimated: true`는 발급한 지 24시간이 안 돼 아직 갱신할 수 없어서 만료일을 "붙여 넣은 시각 + 60일"로 추정했다는 뜻이에요(24시간 뒤 자동 갱신으로 맞춰요). 오류: 인스타그램이 꺼져 있음 `409 {"code": "disabled"}`, 토큰이 틀림·만료 `400 {"code": "invalid_token"}`, 개인 계정 `400 {"code": "account_type"}`.
+
+### `DELETE /api/publish/<platform>`
+
+INSIA에 저장한 그 플랫폼의 토큰을 지워요(`?forget_app=1`이면 LinkedIn 앱 정보도). 플랫폼 쪽 앱 권한은 사람이 거둬야 해서 응답에 방법이 와요.
+
+```json
+{"label": "LinkedIn", "state": "not_connected", "ready": false, "reason": "LinkedIn 계정을 연결해야 해요.", "...": "...",
+ "account": null, "token": null,
+ "revoke_hint": "INSIA에서 토큰을 지웠어요. LinkedIn 설정 → 데이터 개인정보 → 권한 있는 서비스에서 앱 권한도 지울 수 있어요."}
+```
+
+게시 중이거나 결과 확인이 필요한 기록이 있으면 `409 {"code": "item_locked", "attempt_id": …}`.
+
+### 콘텐츠 상세의 `publish` 블록
+
+`GET /api/items/<id>`에 붙어서, 대시보드가 요청 하나로 버튼 상태를 알 수 있어요. API 게시가 꺼져 있거나 한 번도 설정하지 않았으면 `null`이에요.
+
+```json
+"publish": {"platform": "linkedin", "available": true, "state": "connected",
+            "reason": "가짜 게시 계정(LinkedIn 개인 프로필)에 올려요.", "blocked_by": "", "blockers": [],
+            "active_attempt": null, "last_attempt": null}
+```
+
+- `platform`이 `null`이면(네이버 블로그·사업계획서) 버튼을 그리지 않아요.
+- `available`: 지금 "API로 게시"를 누를 수 있는지(`state`가 `connected`·`expiring`이고, 막는 이유가 없고, 진행 중인 시도가 없음).
+- `blocked_by`: `not_approved` 승인 전 · `version_changed` 승인한 뒤 새 버전 · `published` 게시 완료 · `published_attempt` 이 버전은 API로 올렸는데 보관함 상태를 바꾸지 못함 · `archived` 보관 · `agent_job` 에이전트가 작업 중 · `""`.
+- `active_attempt`: 게시 중(`sending`)이거나 결과 확인이 필요한(`unknown`) 시도. 있으면 편집·재검수·보관이 잠겨요. `last_attempt`: 이 플랫폼의 가장 최근 시도. 둘 다 [시도 JSON](#post-apiitemsidpublish) 모양이에요.
+
+### `POST /api/items/<id>/publish/preview`
+
+지금 올리면 보낼 내용을 그대로 만들어 30분 동안 저장해요. 요청:
+
+- LinkedIn: `{"platform": "linkedin", "options": {"visibility": "PUBLIC"}}` — `visibility`는 `PUBLIC`(전체 공개, 기본) · `CONNECTIONS`(1촌 공개).
+- 인스타그램: `{"platform": "instagram", "options": {"is_ai_generated": false}}` — **`is_ai_generated`는 꼭 `true`나 `false`로 보내야 해요**(게시마다 사람이 골라요, 기본값 없음). 빠지거나 `0`·`"false"`처럼 bool이 아니면 아무것도 그리기 전에 `400 {"error": "AI 정보 라벨을 붙일지 골라 주세요 (options.is_ai_generated: true 또는 false)", "code": "invalid_options"}`예요.
+- `platform`은 빼도 돼요(콘텐츠 채널로 정해져요).
+
+응답 `200` (LinkedIn):
+
+```json
+{"preview_id": "pv_7d518a8567bbfa100a024cea",
+ "preview_hash": "sha256:fd273ee1593d3ab9a5c53bb0257036e1938b860bf8079fa487e9a8fd0a19ab34",
+ "expires_at": "2026-09-29T00:18:01.996Z", "platform": "linkedin",
+ "item": {"id": "it_0a803d87a98b", "version": 1, "title": "반복 업무를 덜어 낸 방법", "channel": "linkedin",
+          "approved_version": 1, "approval_forced": true, "approved_score": null},
+ "account": {"name": "가짜 게시 계정", "kind": "LinkedIn 개인 프로필", "id_hint": "…r01"},
+ "content": {"text": "혼자 창업하면 마케팅은 늘 '이번 주만 넘기고'가 돼요.\n\n…\n\n#1인창업 #AI마케팅 #콘텐츠마케팅",
+             "chars": 1014, "limit": 3000, "hashtags": ["#1인창업", "#AI마케팅", "#콘텐츠마케팅"],
+             "options": {"visibility": "PUBLIC"}, "visibility_label": "전체 공개", "hashtag_mode": "plain"},
+ "slides": [], "errors": [],
+ "warnings": [{"level": "warning", "code": "format_length", "message": "분량(공백 포함): 992자 (기준 1,300~2,000자 (최대 3,000자))"},
+              {"level": "warning", "code": "forced_approval", "message": "검수를 통과하지 않은 버전(검수 없음)을 그래도 승인했어요."}],
+ "notices": [{"code": "single_post", "message": "지금 이 글 한 건만 올려요. INSIA는 예약·반복 게시를 하지 않아요. LinkedIn API 이용약관이 자동 게시를 금지하기 때문이에요."},
+             {"code": "edit_on_platform", "message": "올린 뒤 고치거나 지우려면 LinkedIn에서 직접 해야 해요."},
+             {"code": "manual_done", "message": "이미 LinkedIn에 직접 올렸다면 여기서 게시하지 말고 ‘게시 완료 표시’를 눌러 주세요."}],
+ "quota": null, "first_comment_link": "",
+ "request_preview": [{"method": "POST", "url": "https://api.linkedin.com/rest/posts",
+                      "headers": {"Authorization": "Bearer ***", "Linkedin-Version": "202609",
+                                  "X-Restli-Protocol-Version": "2.0.0", "Content-Type": "application/json"},
+                      "body": {"author": "urn:li:person:…r01", "commentary": "혼자 창업하면 …", "visibility": "PUBLIC",
+                               "distribution": {"feedDistribution": "MAIN_FEED", "targetEntities": [],
+                                                "thirdPartyDistributionChannels": []},
+                               "lifecycleState": "PUBLISHED", "isReshareDisabledByAuthor": false}}],
+ "can_publish": true}
+```
+
+인스타그램은 실제로 보낼 JPEG(1080×1350)를 이때 한 번 그려서 저장하고, 게시할 때 다시 그리지 않아요(10~30초 걸릴 수 있어요). 달라지는 부분만 옮기면:
+
+```json
+{"platform": "instagram",
+ "account": {"name": "@insia.fake", "kind": "인스타그램 비즈니스 계정", "id_hint": "…000", "username": "@insia.fake"},
+ "content": {"text": "혼자 콘텐츠를 다 쓰는 대표님께: …\n#1인창업 #AI마케팅자동화 #SNS운영 #사업계획서 #AI에이전트",
+             "chars": 923, "limit": 2200,
+             "hashtags": ["#1인창업", "#AI마케팅자동화", "#SNS운영", "#사업계획서", "#AI에이전트"],
+             "options": {"is_ai_generated": false}},
+ "slides": [{"n": 1, "alt": "인디고 배경에 \"블로그·인스타·사업계획서, 혼자 다 쓰고 있다면\"이라는 큰 제목과 …",
+             "bytes": 70966, "width": 1080, "height": 1350,
+             "sha256": "9fca107012f5ff234e3f159891840010e0fc346d5ec5473d270ad272f7178334",
+             "url": "/api/publish/previews/pv_b1f584cf8e18eaf96885ab13/slides/1.jpg"}],
+ "notices": [{"code": "no_delete", "message": "인스타그램 API로 올린 게시물은 INSIA에서 지울 수 없어요. 잘못 올렸다면 인스타그램 앱에서 직접 삭제해야 해요."},
+             {"code": "public_media", "message": "카드 이미지 9장을 잠깐 공개 주소(https://example.invalid/pub/m/…)에 올려 인스타그램이 가져가게 해요. 게시가 끝나면 바로 지워요(늦어도 24시간 안에)."},
+             {"code": "quota", "message": "오늘 남은 게시 한도: 50/50개"},
+             {"code": "no_tags", "message": "사람 태그·공동 작업자·유료 파트너십 표시는 API로 넣을 수 없어요. 필요하면 앱에서 올려 주세요."},
+             {"code": "single_post", "message": "지금 이 게시물 한 건만 올려요. INSIA는 예약·반복 게시를 하지 않아요."},
+             {"code": "manual_done", "message": "이미 인스타그램 앱에서 직접 올렸다면 여기서 게시하지 말고 ‘게시 완료 표시’를 눌러 주세요."}],
+ "quota": {"used": 0, "total": 50},
+ "request_preview": [{"method": "POST", "url": "https://graph.instagram.com/v25.0/<IG_ID>/media",
+                      "fields": {"image_url": "https://example.invalid/pub/m/<token>/01.jpg", "is_carousel_item": "true",
+                                 "alt_text": "인디고 배경에 …"}}]}
+```
+
+- 고칠 부분이 있으면 `200`에 `errors`가 담기고 `can_publish: false`예요(대화상자가 오류를 보여 주고 게시 버튼을 꺼요). 그런 미리보기도 저장하지만 게시에는 쓸 수 없어요.
+- 미리보기를 만들 수 없을 때만 4xx: 앱 정보 없음 `409 not_configured` · 연결 안 됨 `409 not_connected` · 다시 연결 필요 `409 reconnect` · 요구 조건 없음 `409 unavailable`(`blockers`) · 승인 전·승인 뒤 새 버전·보관·게시 완료 `409 not_publishable`(`blocked_by`) · 이 버전을 이미 API로 올림 `409 already_published`(`permalink`) · 게시 중·결과 확인 필요 `409 item_locked` · 에이전트 작업 중 `409 agent_job` · 다른 미리보기의 카드를 그리는 중 `409 busy` · 카드 이미지를 그리지 못함 `422 render` · 네이버 블로그·사업계획서 `409 not_publishable`.
+- 확인 코드는 이 응답에 **없어요.** 대시보드는 체크박스 + `preview_hash` + 사람 요청 검사로 확인하고, CLI의 확인 코드는 `insia publish send` 프로세스 안에서만 만들어 그 터미널에만 보여 줘요.
+- IP마다 1분에 10번까지예요(넘으면 `429 {"code": "too_many"}` + `Retry-After`).
+
+`GET /api/publish/previews/<pv>/slides/<n>.jpg`는 저장한 JPEG를 그대로 줘요(`Content-Type: image/jpeg`, `Cache-Control: no-store`). 만료됐거나 없는 미리보기·장 번호는 404예요.
+
+### `POST /api/items/<id>/publish`
+
+확인한 미리보기를 보내기 시작해요. **브라우저의 대시보드에서 사람이 누른 요청만** 받아요([사람 요청](#요청-보안)).
+
+요청: `{"platform": "linkedin", "preview_id": "pv_7d518a8567bbfa100a024cea", "preview_hash": "sha256:fd273ee1…", "confirm": true}`
+
+응답 `202`:
+
+```json
+{"attempt": {"id": "pa_370a9fd598f1aa12e278f8a2", "item_id": "it_0a803d87a98b", "version": 1, "platform": "linkedin",
+             "preview_id": "pv_7d518a8567bbfa100a024cea", "payload_hash": "sha256:fd273ee1…",
+             "account_id": "fakeMember01", "status": "sending", "step": "", "external_id": "", "permalink": "",
+             "error_code": "", "error": "", "requested_by": "dashboard@127.0.0.1", "resolved_by": "",
+             "created_at": "2026-09-28T23:48:02.000Z", "updated_at": "2026-09-28T23:48:02.000Z", "finished_at": "",
+             "progress": {"done": 0, "total": 1}, "visibility": "PUBLIC", "item_update_error": ""},
+ "poll_url": "/api/publish/attempts/pa_370a9fd598f1aa12e278f8a2"}
+```
+
+게시는 백그라운드에서 돌아요. 대시보드는 `poll_url`을 2초마다 읽어요. 끝나면:
+
+```json
+{"attempt": {"id": "pa_370a9fd598f1aa12e278f8a2", "status": "published", "step": "write",
+             "external_id": "urn:li:share:7000000000000000002",
+             "permalink": "https://example.invalid/linkedin/feed/update/urn:li:share:7000000000000000002/",
+             "finished_at": "2026-09-28T23:48:02.004Z", "progress": {"done": 1, "total": 1}, "...": "..."}}
+```
+
+그리고 콘텐츠가 `published`가 되고 `published_at`·`published_url`·`published_via`(`linkedin_api`·`instagram_api`, 가짜 게시 모드는 `fake`)·`published_external_id`가 채워져요.
+
+시도 JSON:
+
+| 필드 | 뜻 |
+|---|---|
+| `status` | `sending` 보내는 중 · `published` 게시됨 · `failed` 실패(아무것도 올라가지 않음) · `unknown` 결과 모름(올라갔을 수도 있음, 콘텐츠 잠김) · `abandoned` 사람이 "안 올라갔어요"로 정리 |
+| `step` | 진행 단계: `check` · `children 3/8`(인스타그램 이미지 등록) · `polling` · `carousel` · `write`(되돌릴 수 없는 게시 요청) · `permalink` |
+| `progress` | `{"done", "total"}`. `total`은 LinkedIn 1, 인스타그램 `슬라이드 수 + 3`(부모, 게시, 링크). 인스타그램 9장이면 끝났을 때 `{"done": 12, "total": 12}` |
+| `error_code` · `error` | 실패·결과 모름의 이유(플랫폼 오류 코드와 한국어 문장). 예: `"timeout"` · "LinkedIn의 응답을 받지 못했어요. 글이 올라갔을 수도 있어요. LinkedIn 내 활동에서 확인한 뒤 알려 주세요." |
+| `requested_by` · `resolved_by` | 누가 게시했는지(`dashboard@<클라이언트>`, `cli:<사용자>@<호스트>`)와 결과 불명을 누가 어떻게 정리했는지 |
+| `visibility` · `is_ai_generated` | 그 게시에 고른 옵션 (LinkedIn · 인스타그램) |
+| `item_update_error` | 게시는 됐지만 보관함 상태를 바꾸지 못했을 때의 안내("‘게시 완료 표시’를 눌러 주세요"). 그 버전의 API 게시 버튼은 `blocked_by: published_attempt`로 꺼져요 |
+| `permalink_missing` | (있을 때만) 게시는 됐지만 주소를 받지 못함 → [주소 넣기](#put-apipublishattemptspapermalink) |
+
+| 오류 | 응답 |
+|---|---|
+| `confirm`이 `true`가 아님 | `400 {"code": "invalid_input"}` |
+| 사람 요청이 아님(Bearer 토큰, 다른 사이트, `Sec-Fetch-Site`·`Origin` 없음) | `403 {"error": "API 게시는 대시보드에서 사람이 직접 눌러야 해요. 스크립트(Bearer 토큰)나 다른 사이트에서는 게시할 수 없어요.", "code": "not_human"}` |
+| 미리보기가 30분 지남·이미 씀·없음 | `409 {"code": "preview_expired"}` |
+| 해시 불일치, 확인한 뒤 내용·계정이 바뀜, CLI에서 만든 미리보기, 다른 콘텐츠·플랫폼의 미리보기 | `409 {"code": "changed"}` |
+| 이미 게시 중·결과 확인 필요 | `409 {"code": "item_locked", "attempt_id": …, "attempt_status": …}` |
+| 이 버전은 이미 게시함 | `409 {"code": "already_published", "permalink": …, "attempt_id": …}` |
+| 연결·준비 안 됨 | `409` `not_connected` · `reconnect` · `unavailable` · `not_configured` |
+| 같은 콘텐츠를 에이전트가 작업 중 | `409 {"code": "agent_job", "run_id": …}` |
+| 같은 플랫폼의 다른 게시가 진행 중(대기열 없음) | `409 {"code": "busy"}` "다른 게시가 진행 중이에요. 끝난 뒤 다시 눌러 주세요." |
+| 고칠 부분이 있는 미리보기 | `422 {"code": "validation", "errors": […]}` |
+| IP마다 1분에 5번 넘음 | `429 {"code": "too_many"}` + `Retry-After` |
+
+실제 전송 단계의 오류(플랫폼이 거절, 한도, 공개 주소에 접속 안 됨 등)는 HTTP 오류가 아니라 시도의 `status`·`error`로 와요.
+
+### `GET /api/items/<id>/publish` · `GET /api/publish/attempts/<pa>`
+
+`{"item_id": "it_0a803d87a98b", "attempts": [{…시도…}]}`(최근순, 50개까지) · `{"attempt": {…}}`. 없는 id는 404.
+
+### `PUT /api/publish/attempts/<pa>/permalink`
+
+게시는 됐는데 주소를 받지 못한 기록(LinkedIn이 201만 주고 게시물 id를 주지 않은 경우, 결과 불명을 주소 없이 "올라갔어요"로 정리한 경우)에 사람이 주소를 넣어요. 콘텐츠의 `published_url`도 채워요.
+
+요청: `{"permalink": "https://www.linkedin.com/feed/update/urn:li:share:7243/"}` → `200 {"attempt": {…, "permalink": "https://www.linkedin.com/feed/update/urn:li:share:7243/"}}`
+
+`https` + 그 플랫폼의 도메인(LinkedIn `www.linkedin.com`·`linkedin.com`, 인스타그램 `www.instagram.com`·`instagram.com`)만 받아요(아니면 `400 {"error": "LinkedIn 게시물 주소(https://www.linkedin.com/…)를 넣어 주세요.", "code": "invalid_input"}`). 주소가 이미 있거나 게시되지 않은 기록은 `409 {"error": "게시가 끝났고 주소가 비어 있는 기록에만 주소를 넣을 수 있어요.", "code": "attempt_state"}`.
+
+### `POST /api/publish/attempts/<pa>/resolve`
+
+결과를 모르는(`unknown`) 시도를 사람이 플랫폼에서 직접 확인한 뒤 정리해요. **사람 요청만** 받아요. LinkedIn은 게시물을 다시 읽을 수 없어서 이 정리가 끝날 때까지 콘텐츠가 잠겨 있어요.
+
+요청: `{"outcome": "published", "url": "https://www.linkedin.com/feed/update/urn:li:share:…/"}`(주소는 선택) 또는 `{"outcome": "not_published"}`.
+
+응답 `200` (주소 없이 "올라갔어요"):
+
+```json
+{"attempt": {"id": "pa_9338b06e91be3bc78267888e", "status": "published", "step": "write", "permalink": "",
+             "error_code": "timeout", "resolved_by": "dashboard@127.0.0.1 · 올라갔어요",
+             "finished_at": "2026-09-28T23:51:55.639Z", "progress": {"done": 1, "total": 1}, "...": "..."},
+ "item": {"id": "it_ef68ccc1e09c", "status": "published", "published_at": "2026-09-28T23:51:55.639Z",
+          "published_url": "", "published_via": "fake", "published_external_id": "", "...": "..."}}
+```
+
+`not_published`는 시도를 `abandoned`로 닫고 콘텐츠는 그대로 둬요(`"item": null`). 다시 게시하려면 새 미리보기부터 해요. 대시보드는 "LinkedIn 피드에서 먼저 확인했나요? 같은 글이 두 번 올라갈 수 있어요."를 한 번 더 물어요.
+
+오류: `unknown`이 아님 `409 {"error": "결과 확인이 필요한 기록만 정리할 수 있어요.", "code": "attempt_state"}` · 사람 요청 아님 403 · `outcome`이 다름·`not_published`에 주소를 보냄·주소가 그 플랫폼 도메인이 아님 400.
+
+### `POST /api/publish/attempts/<pa>/check`
+
+인스타그램의 `unknown` 시도를 인스타그램에서 다시 확인해요(읽기만, 게시를 다시 부르지 않아요). 게시됐으면 `published`로, 게시되지 않았으면 `failed`로 닫고, 확인하지 못하면 `unknown`으로 남아요. 응답 `200 {"attempt": {…}}`. LinkedIn은 다시 읽을 수 없어서 `409 {"error": "LinkedIn 게시물은 INSIA가 다시 읽을 수 없어요. LinkedIn 내 활동에서 확인한 뒤 ‘올라갔어요’ 또는 ‘안 올라갔어요’를 눌러 주세요.", "code": "attempt_state"}`예요.
+
+### 오류 `code` 한눈에 보기
+
+API 게시 경로의 오류에는 늘 `code`가 붙어요. 대시보드는 문장(`error`)을 그대로 보여 주고, `code`로 버튼(다시 연결, 다시 확인 등)을 골라요.
+
+| `code` | 상태 | 뜻 |
+|---|---|---|
+| `disabled` | 409 | API 게시가 꺼져 있음(`INSIA_PUBLISH=0`, 가짜 게시 모드를 임시 폴더가 아닌 곳에서 켬, 인스타그램 시험 기능 꺼짐) |
+| `not_configured` · `not_connected` · `reconnect` · `unavailable` | 409 | 앱 정보 없음 · 계정 연결 안 됨 · 다시 연결 필요(`"reconnect": true`) · 요구 조건 없음(`blockers`) |
+| `not_publishable` | 409 | 승인한 최신 버전이 아님, API 게시가 없는 채널(`blocked_by`) |
+| `preview_expired` · `changed` | 409 | 미리보기 만료·사용됨 · 확인한 뒤 내용·계정이 바뀜 |
+| `item_locked` | 409 | 게시 중·결과 확인이 필요한 콘텐츠(`attempt_id`, `platform`, `attempt_status`) |
+| `already_published` | 409 | 이 버전은 이미 API로 게시함(`permalink`, `attempt_id`) |
+| `busy` | 409 | 같은 플랫폼의 다른 게시·카드 렌더링이 진행 중 |
+| `agent_job` · `editing` | 409 | 에이전트가 작업 중(`run_id`) · 사람이 고친 내용을 저장하는 중 |
+| `attempt_state` | 409 | 그 시도 상태에서는 할 수 없음 |
+| `env_locked` | 409 | 환경 변수로 정한 값 |
+| `not_human` | 403 | 사람 요청이 아님 |
+| `invalid_input` · `invalid_options` | 400 | 입력이 잘못됨 · 미리보기 옵션이 잘못됨(인스타그램 AI 정보 라벨을 고르지 않음 포함) |
+| `oauth_state` · `oauth_cancelled` · `invalid_token` · `account_type` · `connect_failed` | 400 | 연결 실패(state 만료·재사용, 취소, 토큰 틀림, 개인 계정, 그 밖) |
+| `validation` · `render` | 422 | 고칠 부분이 있는 미리보기 · 카드 이미지를 그리지 못함 |
+| `too_many` | 429 | 미리보기·게시·연결 시도가 너무 많음(`Retry-After`) |
+| `exchange_failed` | 502 | LinkedIn 코드 교환 실패 |
 
 ---
 
@@ -695,13 +1082,16 @@ try:
     serve(settings, host="0.0.0.0", port=8765, web_dir=None, quiet=True,
           token=None,                          # None이면 INSIA_ACCESS_TOKEN
           public_hosts=["insia.example.com"],  # --public-host (여러 개)
-          trust_proxy=True)                    # --trust-proxy
+          trust_proxy=True,                    # --trust-proxy
+          media_port=None,                     # --media-port (인스타그램 API 게시용 이미지 전용 포트)
+          media_base_url=None)                 # --media-base-url (그 포트를 바깥에서 여는 https 주소)
 except ServerConfigError as exc:               # ValueError: 토큰 없음·짧음, 잘못된 도메인, IPv6 불가, 워크스페이스 오류
     print(f"오류: {exc}")
 except OSError as exc:                         # 포트 사용 중 등
     print(f"서버를 시작하지 못했어요: {exc}")
 ```
 
-- `make_server(settings, host="127.0.0.1", port=8765, web_dir=None, heartbeat=15.0, quiet=True, *, token=None, public_hosts=(), trust_proxy=False, workspace=None, max_live=None, max_mock=None)`는 서버 객체만 만듭니다(`serve_forever()`로 시작, `server_close()`로 정리 — 도는 작업을 중단하고 워크스페이스를 닫습니다). 루프백이 아닌 `host`, `public_hosts`, `trust_proxy` 중 하나라도 있는데 토큰이 없으면 `ServerConfigError`입니다. `host`는 IPv6 주소(`::1`, `::`)도 됩니다.
-- `serve()`는 시작 안내(주소, 모드, 워크스페이스, 토큰 여부, 정리한 중단 실행 수)를 출력하고 Ctrl+C나 SIGTERM까지 돕니다. SIGTERM(`docker stop`, systemd)도 Ctrl+C와 똑같이 처리해서(`sigterm_as_interrupt()`, 메인 스레드에서만) 도는 실행을 멈추고 저장한 뒤 종료 코드 0으로 끝납니다(`stop_serving()`: 최대 `SHUTDOWN_GRACE` = 20초 기다림). 직접 `serve_forever()`를 돌릴 때도 `with sigterm_as_interrupt():`로 감싸고 끝에 `stop_serving(server)`를 부르면 같아요.
+- `make_server(settings, host="127.0.0.1", port=8765, web_dir=None, heartbeat=15.0, quiet=True, *, token=None, public_hosts=(), trust_proxy=False, workspace=None, max_live=None, max_mock=None, media_port=None, media_base_url=None, publish_service=None)`는 서버 객체만 만듭니다(`serve_forever()`로 시작, `server_close()`로 정리 — 도는 작업을 중단하고 워크스페이스를 닫습니다). 루프백이 아닌 `host`, `public_hosts`, `trust_proxy` 중 하나라도 있는데 토큰이 없으면 `ServerConfigError`입니다. `host`는 IPv6 주소(`::1`, `::`)도 됩니다.
+- API 게시: `make_server`는 같은 워크스페이스로 `PublishService`를 만들고(환경 변수 `INSIA_PUBLISH*`·`INSIA_LINKEDIN_*`·`INSIA_MEDIA_*`), 멈춘 게시 시도를 정리하고, 6시간마다 도는 정리·인스타그램 토큰 갱신 작업을 켜요(게시는 하지 않아요). `media_port`·`media_base_url`은 `serve --media-port`·`--media-base-url`(기본 `INSIA_MEDIA_PORT`·`INSIA_MEDIA_BASE_URL`)이고, 미디어 포트가 있으면 같은 `host`에 `/pub/m/`만 제공하는 두 번째 소켓을 열어요. 그 포트를 열 수 없어도 서버는 시작하고 인스타그램만 `unavailable`이 돼요. 환경 변수 값이 잘못돼도 서버는 시작하고 경고만 남겨요. `publish_service`는 테스트용(서비스 바꿔 끼우기)이에요. `server_close()`가 미디어 리스너와 게시 작업도 정리해요.
+- `serve()`는 시작 안내(주소, 모드, 워크스페이스, 토큰 여부, 정리한 중단 실행 수, API 게시를 설정했다면 "API 게시: LinkedIn 연결됨 · 인스타그램 공개 주소 없음(수동 게시)" 같은 한 줄)를 출력하고 Ctrl+C나 SIGTERM까지 돕니다. SIGTERM(`docker stop`, systemd)도 Ctrl+C와 똑같이 처리해서(`sigterm_as_interrupt()`, 메인 스레드에서만) 도는 실행을 멈추고 저장한 뒤 종료 코드 0으로 끝납니다(`stop_serving()`: 최대 `SHUTDOWN_GRACE` = 20초 기다림). 직접 `serve_forever()`를 돌릴 때도 `with sigterm_as_interrupt():`로 감싸고 끝에 `stop_serving(server)`를 부르면 같아요.
 - 서버가 켜질 때 `running`으로 남은 실행 중 실행하던 프로세스가 없어진 것만 `interrupted`로 정리합니다([실행](#실행) 참고). 같은 워크스페이스에서 CLI 실행(`insia run`, `insia run-due`)이 도는 중에 서버를 켜도 그 실행은 그대로 이어집니다.

@@ -27,7 +27,7 @@ AGENTS = ("orchestrator", "researcher", "reviewer", "system")
 EVENT_TYPES = frozenset({
     "run.started", "agent.status", "handoff", "plan.created", "research.query", "research.source",
     "research.finding", "research.completed", "draft.created", "review.started", "review.completed",
-    "revision.requested", "channel.completed", "run.completed", "run.failed", "log",
+    "revision.requested", "channel.completed", "channel.store_skipped", "run.completed", "run.failed", "log",
 })
 
 
