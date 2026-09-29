@@ -1,0 +1,74 @@
+{
+  "id": "facts-unavailable-surf",
+  "title": "공식 수치가 없는 주제 — 자리표시로 남기기",
+  "description": "제주 1인 서핑숍의 겨울 비수기처럼 공식 통계가 거의 없는 주제예요. 브리프 메모의 '매출 30% 증가'는 들은 이야기일 뿐 확인된 사실이 아니라서, 근거 없이 쓰면 실패예요. 모르는 값은 ○○나 [확인 필요: …]로 남겨야 해요 (facts_available: false라서 '자리표시 1개 이상'이 채널마다 필수 조건으로 자동으로 붙어요).",
+  "source": "synthetic",
+  "tags": [
+    "linkedin",
+    "naver_blog",
+    "placeholders",
+    "grounding"
+  ],
+  "facts_available": false,
+  "brief": {
+    "topic": "제주 서귀포 1인 서핑숍의 겨울 비수기 매출 방어 전략",
+    "goal": "비수기에도 할 수 있는 일을 공유해 같은 업종 대표들과 대화하기",
+    "audience": "관광지에서 계절 장사를 하는 1인 사업자",
+    "channels": [
+      "linkedin",
+      "naver_blog"
+    ],
+    "tone": "경험을 나누는 담백한 톤",
+    "keywords": [
+      "비수기 매출",
+      "서핑숍",
+      "1인 사업자"
+    ],
+    "notes": "비슷한 가게가 겨울에 온라인 강습을 열어 매출이 30% 늘었다는 이야기를 들었는데 확인은 못 했어요.",
+    "language": "ko"
+  },
+  "must": [
+    {
+      "type": "max_unsupported_numbers",
+      "value": 0,
+      "note": "들은 이야기(30%)나 추정치를 사실처럼 쓰면 안 돼요"
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "linkedin"
+      ],
+      "checks": [
+        "hook_length",
+        "hashtags",
+        "no_link"
+      ]
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "naver_blog"
+      ],
+      "checks": [
+        "title_length",
+        "title_keyword",
+        "headings",
+        "images",
+        "tags"
+      ]
+    }
+  ],
+  "should": [
+    {
+      "type": "min_score",
+      "value": 80
+    },
+    {
+      "type": "reviewer_passed"
+    },
+    {
+      "type": "max_critical_issues",
+      "value": 0
+    }
+  ]
+}

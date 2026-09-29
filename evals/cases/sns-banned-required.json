@@ -1,0 +1,117 @@
+{
+  "id": "sns-banned-required",
+  "title": "SNS — 금지 표현과 필수 문구 #광고",
+  "description": "브랜드 프로필의 금지 표현(최고, 무조건, 100% 보장)을 쓰지 않고, 협찬·광고 표시 문구 '#광고'를 인스타그램과 링크드인에 반드시 넣는지 봐요. 브리프 메모에 과장 표현이 섞여 있어서 그대로 옮기면 실패해요.",
+  "source": "synthetic",
+  "tags": [
+    "instagram",
+    "linkedin",
+    "brand",
+    "profile"
+  ],
+  "brief": {
+    "topic": "1:1 소도구 필라테스 스튜디오 '코어핏'의 가을 체험 수업 안내",
+    "goal": "체험 수업 신청 유도",
+    "audience": "허리·자세가 고민인 30~40대 직장인",
+    "channels": [
+      "instagram",
+      "linkedin"
+    ],
+    "tone": "따뜻하고 차분한 코치 톤",
+    "keywords": [
+      "필라테스 체험",
+      "자세 교정",
+      "직장인 운동"
+    ],
+    "notes": "수강생들이 우리 스튜디오가 동네 최고라고 해요. 무조건 효과 본다는 느낌을 살려 주세요. 제휴 협찬 게시물이라 광고 표시는 필요해요.",
+    "language": "ko"
+  },
+  "profile": {
+    "company_name": "코어핏 필라테스",
+    "service_name": "코어핏",
+    "one_liner": "퇴근길 50분, 소도구로 하는 1:1 자세 필라테스",
+    "industry": "운동·피트니스",
+    "target_customers": "사무직 30~40대",
+    "tone": "차분하고 다정한 코치 말투, 효과를 단정하지 않음",
+    "banned_words": [
+      "최고",
+      "무조건",
+      "100% 보장"
+    ],
+    "required_phrases": [
+      "#광고"
+    ],
+    "default_hashtags": [
+      "#코어핏",
+      "#필라테스"
+    ],
+    "cta": "체험 수업 신청은 프로필 링크에서 받아요",
+    "instagram_handle": "@corefit_pilates"
+  },
+  "must": [
+    {
+      "type": "checks_pass",
+      "checks": [
+        "banned_words",
+        "required_phrases"
+      ],
+      "note": "프로필 브랜드 규칙"
+    },
+    {
+      "type": "not_contains",
+      "values": [
+        "최고",
+        "무조건",
+        "100% 보장"
+      ]
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "instagram"
+      ],
+      "checks": [
+        "slides",
+        "hashtags",
+        "hook_length",
+        "caption_length"
+      ]
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "linkedin"
+      ],
+      "checks": [
+        "hashtags",
+        "no_link",
+        "hook_length"
+      ]
+    },
+    {
+      "type": "max_unsupported_numbers",
+      "value": 0,
+      "note": "운동 효과 수치를 지어내면 안 돼요"
+    }
+  ],
+  "should": [
+    {
+      "type": "all_checks_pass"
+    },
+    {
+      "type": "min_score",
+      "value": 80
+    },
+    {
+      "type": "reviewer_passed"
+    },
+    {
+      "type": "max_rounds",
+      "value": 1
+    },
+    {
+      "type": "max_critical_issues",
+      "value": 0
+    }
+  ]
+}

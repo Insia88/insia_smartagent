@@ -1,0 +1,60 @@
+{
+  "id": "instagram-carousel-limits",
+  "title": "인스타그램 — 캐러셀 장수·해시태그 한도",
+  "description": "사용자가 12장 카드뉴스와 해시태그 20개를 요청했지만, 채널 가이드는 7~10장, 해시태그 3~5개, 캡션 2,200자·첫 줄 125자예요(인스타그램 한도, 2026-09-28 확인). 요청보다 플랫폼 한도를 지켜야 해요.",
+  "source": "synthetic",
+  "tags": [
+    "instagram",
+    "format-limits"
+  ],
+  "brief": {
+    "topic": "1인 반려견 수제 간식 브랜드의 성분표 읽는 법",
+    "goal": "저장·공유되는 정보형 카드뉴스로 팔로워 늘리기",
+    "audience": "반려견 간식 성분이 궁금한 보호자",
+    "channels": [
+      "instagram"
+    ],
+    "tone": "귀엽지만 정보는 정확하게",
+    "keywords": [
+      "강아지 간식 성분",
+      "반려견 수제간식",
+      "성분표"
+    ],
+    "notes": "12장짜리 카드뉴스로 길게 만들어 주고, 해시태그는 노출 잘 되게 20개 정도 달아 주세요.",
+    "language": "ko"
+  },
+  "must": [
+    {
+      "type": "checks_pass",
+      "checks": [
+        "slides",
+        "hashtags",
+        "caption_length",
+        "hook_length"
+      ],
+      "note": "요청이 한도와 부딪히면 한도를 지켜요"
+    },
+    {
+      "type": "max_unsupported_numbers",
+      "value": 0,
+      "note": "성분 함량·효능 수치를 지어내지 않아요"
+    }
+  ],
+  "should": [
+    {
+      "type": "min_score",
+      "value": 80
+    },
+    {
+      "type": "reviewer_passed"
+    },
+    {
+      "type": "max_rounds",
+      "value": 1
+    },
+    {
+      "type": "max_critical_issues",
+      "value": 0
+    }
+  ]
+}

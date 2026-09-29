@@ -64,6 +64,7 @@ python -m insia_agents plan-week --theme "…"   # 주간 계획 → run-due로 
 python -m insia_agents items list              # 보관함 (show / approve / export / publish …)
 python -m insia_agents import-run examples/sample-run   # Claude Code 형식 실행 폴더 가져오기
 python -m insia_agents check <draft.json>      # 초안 형식·브랜드 검사
+python -m insia_agents eval run --mode mock     # 품질 평가 세트 (evals/cases; live는 --max-cost-usd 필수, 비교: eval compare A B)
 python -m insia_agents publish status          # API 게시 연결·준비 상태 (사람이 터미널에서만; 에이전트는 publish 명령을 쓰지 않음)
 python -m insia_agents backup --out <폴더>      # credentials/·publish/·logs/를 뺀 안전한 백업
 python scripts/build_artifact.py               # 대시보드 단일 페이지 빌드 (dist/artifact)
@@ -90,6 +91,7 @@ python scripts/build_artifact.py               # 대시보드 단일 페이지 �
 | `src/insia_agents/prompts/channels/` | 채널 가이드 (형식의 단일 기준) |
 | `.claude/agents/`, `.claude/skills/` | Claude Code 서브에이전트와 슬래시 명령 |
 | `web/` | 대시보드 (정적 파일, 3D 카피바라 에셋은 `web/assets/`). API 게시 UI는 `web/js/publish.js`(확인 대화상자·연결 카드), 설정하지 않은 워크스페이스에는 아무것도 그리지 않음 |
+| `src/insia_agents/evals/`, `evals/` | 품질 평가 세트: 케이스(`evals/cases/*.json`), 결정적 채점(형식·블라인드·근거 없는 수치·가정 표시), mock/live 실행기, 기준 비교, live 비용 추정 (`evals/README.md`) |
 | `examples/sample-run/` | 샘플 브리프와 녹화된 실행 (Claude Code 실행 폴더와 같은 구조) |
 | `docs/operations.md`, `docs/api.md` | 운영 안내(사용자용, API 게시 설정 포함), HTTP API 레퍼런스 |
 | `Dockerfile`, `docker-compose.yml` | 서버 배포 (비루트, `/data` 볼륨, 접근 토큰 필수, 기본 `127.0.0.1:8765`) |

@@ -1,0 +1,113 @@
+{
+  "id": "health-food-disclaimer",
+  "title": "건강기능식품 — 효능 단정 금지와 긴 필수 문구",
+  "description": "건강기능식품 쇼핑몰 홍보라 질병 예방·치료처럼 효능을 단정하면 안 돼요(표시·광고 위험). 프로필의 금지 표현(완치, 특효, 100% 효과)을 피하고, 긴 필수 문구 '건강기능식품은 질병의 예방 및 치료를 위한 의약품이 아닙니다'와 '#광고'를 그대로 넣어야 해요. 브리프 메모의 '변비가 치료된다'는 후기를 옮기면 실패예요. (금지 표현에 '치료'를 넣으면 필수 문구와 부딪혀 어떤 초안도 통과할 수 없어서 넣지 않았어요.)",
+  "source": "synthetic",
+  "tags": [
+    "instagram",
+    "naver_blog",
+    "brand",
+    "regulated",
+    "profile"
+  ],
+  "brief": {
+    "topic": "1인 운영 건강식품 쇼핑몰의 유산균 고르는 기준 안내",
+    "goal": "정보형 콘텐츠로 신뢰 쌓고 쇼핑몰 방문 유도",
+    "audience": "장 건강에 관심 많은 30~50대",
+    "channels": [
+      "instagram",
+      "naver_blog"
+    ],
+    "tone": "약사처럼 정확하고 조심스럽게",
+    "keywords": [
+      "유산균 고르는 법",
+      "프로바이오틱스",
+      "장 건강"
+    ],
+    "notes": "먹으면 변비가 치료된다는 후기가 많아요.",
+    "language": "ko"
+  },
+  "profile": {
+    "company_name": "온장몰",
+    "service_name": "온장몰",
+    "one_liner": "성분표를 먼저 보여 주는 1인 건강식품 쇼핑몰",
+    "industry": "건강기능식품 온라인 판매",
+    "tone": "효능을 단정하지 않고 성분·기준을 설명",
+    "banned_words": [
+      "완치",
+      "특효",
+      "100% 효과"
+    ],
+    "required_phrases": [
+      "#광고",
+      "건강기능식품은 질병의 예방 및 치료를 위한 의약품이 아닙니다"
+    ],
+    "default_hashtags": [
+      "#온장몰"
+    ]
+  },
+  "must": [
+    {
+      "type": "checks_pass",
+      "checks": [
+        "banned_words",
+        "required_phrases"
+      ]
+    },
+    {
+      "type": "not_contains",
+      "values": [
+        "변비가 치료",
+        "치료됩니다",
+        "치료돼요"
+      ],
+      "note": "후기의 효능 단정을 옮기면 안 돼요"
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "instagram"
+      ],
+      "checks": [
+        "slides",
+        "hashtags",
+        "caption_length",
+        "hook_length"
+      ]
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "naver_blog"
+      ],
+      "checks": [
+        "title_length",
+        "title_keyword",
+        "headings",
+        "images",
+        "tags"
+      ]
+    },
+    {
+      "type": "max_unsupported_numbers",
+      "value": 0,
+      "note": "균 수·효과 수치는 근거가 있을 때만"
+    }
+  ],
+  "should": [
+    {
+      "type": "all_checks_pass"
+    },
+    {
+      "type": "min_score",
+      "value": 80
+    },
+    {
+      "type": "reviewer_passed"
+    },
+    {
+      "type": "max_critical_issues",
+      "value": 0
+    }
+  ]
+}

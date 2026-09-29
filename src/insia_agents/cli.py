@@ -7,6 +7,7 @@ Commands (grouped the way the weekly routine uses them)::
     library       items list|show|approve|schedule|publish|archive|restore|export · review · revise
     runs          run · resume · runs list|show|export · usage
     Claude Code   import-run <folder> · check <draft.json>
+    quality eval  eval list|run|compare (evals/cases; live needs --max-cost-usd)
     server        serve · healthcheck · sample-brief · backup
     API 게시      publish status|setup|connect|disconnect|preview|send|attempts|resolve|refresh
 
@@ -1757,6 +1758,66 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# eval (quality evaluation set: evals/cases, see evals/README.md)
+# ---------------------------------------------------------------------------
+
+
+def cmd_eval_list(args: argparse.Namespace) -> int:
+    from .evals.cases import CaseError, case_summary, find_cases_dir, load_cases
+
+    cases_dir = find_cases_dir(args.cases)
+    try:
+        cases = load_cases(cases_dir)
+    except CaseError as exc:
+        raise UsageError(str(exc)) from None
+    rows = [case_summary(case) for case in cases]
+    if args.json:
+        _print_json(rows)
+        return 0
+    print(f"평가 케이스 {len(rows)}개 ({cases_dir})")
+    print_table(["ID", "채널", "프로필", "자료", "필수", "권장", "제목"],
+                [[r["id"], ", ".join(channel_label(c) for c in r["channels"]), "있음" if r["profile"] else "-",
+                  r["documents"] or "-", r["must"], r["should"], r["title"]] for r in rows],
+                max_widths=[0, 40, 0, 0, 0, 0, 48])
+    print("\n돌리기: insia eval run --mode mock (무료) · 비교: insia eval compare <기준 폴더> <이번 폴더>")
+    return 0
+
+
+def cmd_eval_run(args: argparse.Namespace) -> int:
+    from .evals.runner import DEFAULT_TIMEOUT_S, EvalOptions, ask_yes_no, run_eval
+
+    case_ids = [c for value in (args.case or []) for c in _split(value)]
+    channels = [CHANNEL_ALIASES.get(c.lower(), c.lower()) for c in _split(args.channels)]
+    options = EvalOptions(
+        mode=args.mode, cases_dir=Path(args.cases) if args.cases else None, case_ids=case_ids, channels=channels,
+        out_dir=Path(args.out) if args.out else None, max_cost_usd=args.max_cost_usd, model=args.model,
+        reps=args.reps, baseline=Path(args.baseline) if args.baseline else None, max_score_drop=args.max_score_drop,
+        timeout_s=args.timeout_s or DEFAULT_TIMEOUT_S, resume=args.resume, dry_run=args.dry_run,
+        estimate_from=Path(args.estimate_from) if args.estimate_from else None, judge=args.judge,
+        judge_model=args.judge_model or "", assume_yes=args.yes, max_rounds=args.max_rounds, pass_score=args.pass_score,
+    )
+    stream = sys.stderr if args.json else sys.stdout
+    summary = run_eval(options, printer=lambda line: print(line, file=stream, flush=True), confirm=ask_yes_no)
+    if args.json:
+        _print_json(summary)
+    return int(summary.get("exit_code", 1))
+
+
+def cmd_eval_compare(args: argparse.Namespace) -> int:
+    from .evals.compare import compare_summaries, render_compare
+    from .evals.runner import load_summary
+
+    baseline, current = load_summary(args.baseline), load_summary(args.current)
+    result = compare_summaries(baseline, current, max_score_drop=args.max_score_drop, baseline_dir=args.baseline,
+                               current_dir=args.current)
+    if args.json:
+        _print_json(result)
+    else:
+        print(render_compare(result).rstrip())
+    return int(result["exit_code"])
+
+
+# ---------------------------------------------------------------------------
 # publish (LinkedIn / Instagram API publishing — only after a person confirms, one post at a time)
 # ---------------------------------------------------------------------------
 # Only the cmd_publish_* / _publish_* functions below import insia_agents.publishers (AST guard:
@@ -2978,6 +3039,60 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--home", default=argparse.SUPPRESS, help="워크스페이스 폴더 (--workspace-profile용)")
     check.add_argument("--json", action="store_true", help="JSON으로 출력")
     check.set_defaults(func=cmd_check)
+
+    # -- quality eval ------------------------------------------------------------------------
+    evaluation = sub.add_parser(
+        "eval", help="품질 평가: 케이스 목록·실행·결과 비교 (프롬프트·가이드·모델을 바꾸기 전에)",
+        description="evals/cases/의 케이스(브리프 + 프로필·자료 + 꼭 지킬 조건)를 실제 파이프라인으로 돌려 결정적 검사"
+                    "(형식·블라인드·금지 표현·근거 없는 수치·가정 표시)로 채점하고, 지난 결과와 비교해요. mock은 무료, "
+                    "live는 돈이 들어서 --max-cost-usd가 꼭 필요해요. 안내: evals/README.md")
+    eval_sub = evaluation.add_subparsers(dest="eval_command", metavar="<동작>", title="동작", required=True,
+                                         help="자세한 도움말: <동작> -h")
+    cases_help = "케이스 폴더 (기본 evals/cases)"
+    p = eval_sub.add_parser("list", parents=[js], help="평가 케이스 목록")
+    p.add_argument("--cases", help=cases_help)
+    p.set_defaults(func=cmd_eval_list)
+    p = eval_sub.add_parser(
+        "run", parents=[js], help="케이스를 돌려 채점해요 (결과: summary.json · report.md · cases/ · runs/)",
+        description="케이스마다 임시 워크스페이스에서 파이프라인을 돌려요(내 워크스페이스는 건드리지 않아요). 필수 조건이 하나라도 "
+                    "실패하거나, 평가 못 한 채널이 있거나, --baseline보다 나빠지면 종료 코드 1이에요.")
+    p.add_argument("--mode", choices=["mock", "live"], default="mock",
+                   help="mock(기본, 무료·오프라인) 또는 live(Anthropic API, 돈이 들어요)")
+    p.add_argument("--cases", help=cases_help)
+    p.add_argument("--case", action="append", metavar="ID", help="이 케이스만 (여러 번 쓰거나 쉼표로 구분)")
+    p.add_argument("--channels", help=f"이 채널만 (쉼표로 구분: {','.join(ALL_CHANNELS)})")
+    p.add_argument("--model", help="live 모델 ID (기본 INSIA_MODEL 또는 claude-opus-5)")
+    p.add_argument("--max-cost-usd", dest="max_cost_usd", type=_type_usd, metavar="USD",
+                   help="live 평가 전체의 예산 상한 (live에서는 꼭 필요해요, 넘으면 남은 케이스를 건너뛰어요, "
+                        "가격을 모르는 모델이면 시작하지 않아요)")
+    p.add_argument("--out", help="결과 폴더 (기본 evals/results/<시각>-<모드>)")
+    p.add_argument("--baseline", metavar="폴더",
+                   help="비교할 지난 결과 폴더 (보고서에 회귀를 먼저 보여 줘요, --case·--channels로 일부만 돌리면 그 부분만 비교해요)")
+    p.add_argument("--max-score-drop", dest="max_score_drop", type=float, default=5.0, metavar="점",
+                   help="기준보다 평균 검수 점수가 이만큼 넘게 떨어지면 실패 (기본 5)")
+    p.add_argument("--reps", type=_type_positive, default=1, help="케이스마다 반복 횟수 (기본 1, live는 비용이 그만큼 늘어요)")
+    p.add_argument("--timeout-s", dest="timeout_s", type=float, metavar="초",
+                   help="live 실행 1번의 최대 시간 (기본 1800초, 넘으면 멈추고 '시간 초과'로 기록)")
+    p.add_argument("--resume", action="store_true",
+                   help="--out 폴더에서 이어서 해요 (케이스·채널·모드가 그대로인 끝난 실행은 다시 쓰고, 이미 쓴 비용도 예산 상한에 넣어요)")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="돌리지 않고 계획과 (live) 예상 비용만 보여 줘요")
+    p.add_argument("--estimate-from", dest="estimate_from", metavar="폴더",
+                   help="예상 비용을 지난 live 평가의 실측 비용으로 계산해요")
+    p.add_argument("--judge", action="store_true",
+                   help="(돈이 들어요) LLM이 이번 최종본과 --baseline 최종본을 짝지어 비교 채점해요. live 전용, 기본 꺼짐")
+    p.add_argument("--judge-model", dest="judge_model", help="비교 채점 모델 (기본 claude-sonnet-5, 평가 대상 모델과 다르게)")
+    p.add_argument("--yes", action="store_true", help="live 시작 확인을 묻지 않아요 (예산 상한은 그대로 지켜요)")
+    p.add_argument("--max-rounds", type=int, dest="max_rounds", help="최대 수정 횟수 (기본 2)")
+    p.add_argument("--pass-score", type=int, dest="pass_score", help="통과 점수 (기본 80)")
+    p.set_defaults(func=cmd_eval_run)
+    p = eval_sub.add_parser("compare", parents=[js], help="두 결과를 비교해요 (회귀가 있으면 종료 코드 1)",
+                            description="기준(A)에서 통과하던 필수 조건이 이번(B)에 실패하거나, 평가 못 한 채널이 생기거나, "
+                                        "평균 검수 점수가 --max-score-drop보다 많이 떨어지면 종료 코드 1이에요.")
+    p.add_argument("baseline", help="기준 결과 폴더 (A)")
+    p.add_argument("current", help="이번 결과 폴더 (B)")
+    p.add_argument("--max-score-drop", dest="max_score_drop", type=float, default=5.0, metavar="점",
+                   help="허용하는 평균 검수 점수 하락 (기본 5)")
+    p.set_defaults(func=cmd_eval_compare)
 
     # -- server ---------------------------------------------------------------------------
     srv = sub.add_parser("serve", parents=[ws], help="대시보드 서버를 띄워요",

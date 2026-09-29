@@ -1,0 +1,45 @@
+{
+  "id": "very-short-brief",
+  "title": "아주 짧은 브리프 — 주제 한 줄",
+  "description": "주제 한 줄만 있고 목적·독자·키워드·메모가 없는 브리프예요. 빈칸을 지어낸 사실로 채우지 않고 링크드인 형식(첫 2줄 210자, 해시태그 3~5개, 본문 링크 없음, 1,300~2,000자)을 지키는지 봐요.",
+  "source": "synthetic",
+  "tags": [
+    "linkedin",
+    "minimal-brief"
+  ],
+  "brief": {
+    "topic": "비건 도시락 정기 배송",
+    "channels": [
+      "linkedin"
+    ],
+    "language": "ko"
+  },
+  "must": [
+    {
+      "type": "all_checks_pass",
+      "note": "링크드인 형식 전부"
+    },
+    {
+      "type": "max_unsupported_numbers",
+      "value": 0,
+      "note": "시장·고객 수치를 지어내지 않아요"
+    }
+  ],
+  "should": [
+    {
+      "type": "min_score",
+      "value": 80
+    },
+    {
+      "type": "reviewer_passed"
+    },
+    {
+      "type": "max_rounds",
+      "value": 1
+    },
+    {
+      "type": "max_critical_issues",
+      "value": 0
+    }
+  ]
+}

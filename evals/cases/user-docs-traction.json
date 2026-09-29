@@ -1,0 +1,141 @@
+{
+  "id": "user-docs-traction",
+  "title": "사용자 자료의 실적 수치 — 자사 자료로 인용",
+  "description": "회사 소개 자료(사용자 제공)에 베타 사용자 수와 재구매율이 있어요. 이런 수치는 리서치 팩의 origin=user 출처나 프로필에서 온 것이라 써도 되지만, 자료에 없는 실적·고객사·후기를 만들면 실패예요. 사업계획서 블라인드도 함께 봐요.",
+  "source": "synthetic",
+  "tags": [
+    "bizplan",
+    "linkedin",
+    "documents",
+    "profile"
+  ],
+  "brief": {
+    "topic": "꽃집·플라워 공방을 위한 예약·재고 관리 앱 '플로노트'",
+    "goal": "사업계획서 초안과 대표의 링크드인 소개 글",
+    "audience": "창업지원사업 심사위원, 로컬 커머스 관계자",
+    "channels": [
+      "bizplan",
+      "linkedin"
+    ],
+    "tone": "담백하고 근거 중심",
+    "keywords": [
+      "꽃집 예약 관리",
+      "플라워 공방",
+      "재고 관리"
+    ],
+    "notes": "자료에 있는 베타 실적을 활용해 주세요.",
+    "language": "ko"
+  },
+  "profile": {
+    "company_name": "플로노트",
+    "service_name": "플로노트",
+    "one_liner": "꽃집 사장님의 예약·꽃 재고·픽업 알림을 한 화면에서",
+    "stage": "예비창업",
+    "target_customers": "1~3인이 운영하는 꽃집과 플라워 공방",
+    "traction": [
+      "베타 사용 꽃집 38곳 (2026-08 기준)"
+    ],
+    "team": [
+      {
+        "role": "대표",
+        "name": "박지현",
+        "background": "플로리스트 8년, 연세대학교 경영학 학사"
+      },
+      {
+        "role": "개발자",
+        "name": "정우진",
+        "background": "모바일 앱 개발 6년, 전 쿠팡 개발자"
+      }
+    ]
+  },
+  "documents": [
+    {
+      "title": "플로노트 회사 소개서 (2026년 9월)",
+      "kind": "markdown",
+      "text": "# 플로노트 회사 소개서\n\n플로노트는 꽃집 예약과 꽃 재고를 한 화면에서 관리하는 앱이에요. 2026년 8월 기준 베타 사용 꽃집은 38곳이고, 베타 사용자 중 유료 전환 의향을 밝힌 곳은 21곳이에요.\n\n베타 기간(2026년 6~8월) 동안 예약 누락 문의는 사용 전보다 줄었다는 응답이 많았고, 재구매 예약 비율은 41%였어요(자체 집계).\n\n요금은 월 29,000원 단일 요금제를 검토 중이며 확정 전이에요."
+    }
+  ],
+  "must": [
+    {
+      "type": "checks_pass",
+      "channels": [
+        "bizplan"
+      ],
+      "checks": [
+        "blind_names",
+        "psst_문제인식",
+        "psst_실현가능성",
+        "psst_성장전략",
+        "psst_팀구성"
+      ]
+    },
+    {
+      "type": "not_contains",
+      "channels": [
+        "bizplan"
+      ],
+      "values": [
+        "박지현",
+        "정우진",
+        "연세대",
+        "쿠팡 개발자"
+      ]
+    },
+    {
+      "type": "checks_pass",
+      "channels": [
+        "linkedin"
+      ],
+      "checks": [
+        "hook_length",
+        "hashtags",
+        "no_link"
+      ]
+    },
+    {
+      "type": "max_unsupported_numbers",
+      "channels": [
+        "linkedin"
+      ],
+      "value": 0,
+      "note": "실적 수치는 자료·프로필에 있는 값만"
+    },
+    {
+      "type": "assumption_marked",
+      "channels": [
+        "bizplan"
+      ],
+      "units": [
+        "원"
+      ],
+      "markers": [
+        "가정"
+      ],
+      "note": "자료에도 '확정 전'인 요금은 가정으로"
+    }
+  ],
+  "should": [
+    {
+      "type": "max_unsupported_numbers",
+      "channels": [
+        "bizplan"
+      ],
+      "value": 5
+    },
+    {
+      "type": "min_citation_coverage",
+      "value": 0.6
+    },
+    {
+      "type": "min_score",
+      "value": 80
+    },
+    {
+      "type": "reviewer_passed"
+    },
+    {
+      "type": "max_critical_issues",
+      "value": 0
+    }
+  ]
+}
