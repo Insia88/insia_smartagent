@@ -312,8 +312,10 @@ def test_02_studio_run(e2e, page):
     page.wait_for_selector("#briefDialog", state="hidden")
     page.wait_for_selector('#runBar[data-kind="done"]')
     page.wait_for_selector('#runBar:has-text("결과 4개")')
+    # the run bar (GET /api/runs/<id>) and the summary tiles (the stage's next frame after run.completed) are drawn
+    # by two independent paths, so wait for the tiles instead of reading them the instant the bar says done
+    page.wait_for_function("document.querySelectorAll('#summaryResults .result-tile').length === 4")
     assert page.inner_text("#sourceTag") == "실시간 실행"
-    assert page.locator("#summaryResults .result-tile").count() == 4
     shot(e2e, page, "02_studio_done")
     runs = srv.api("/api/runs?kind=pipeline")["runs"]
     assert runs[0]["status"] == "completed" and len(runs[0]["items"]) == 4
