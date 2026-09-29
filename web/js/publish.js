@@ -1,7 +1,8 @@
 /* INSIA 에이전트 스튜디오 — API 게시 (LinkedIn · 인스타그램), human-confirmed only.
  *
  * Hooks used by the other views (every hook returns null / does nothing unless the server says publishing is
- * configured, so a workspace that never set it up renders exactly as before):
+ * configured, so a workspace that never set it up renders exactly as before; an item whose attempt still needs a
+ * person also gets a minimal block while publishing is off — state 'disabled' — for its lock and 결과 불명 card):
  *   I.publish.button(ctx)        보관함 "검토와 게시" card: the "…에 API로 게시" button (end of the action row)
  *   I.publish.section(ctx)       below the action row: why the button is off, progress, result, 결과 불명 card
  *   I.publish.panel(key, ctx)    panel 'api_attempts' (게시 기록); 'api_publish' is the dialog (no panel body)
@@ -163,6 +164,7 @@
     var conn = { href: '#/brand/connections' };
     if (by === 'version_changed') out.note = '승인한 뒤에 내용이 바뀌었어요. 다시 승인하면 API로 게시할 수 있어요.';
     else if (by === 'published_attempt') { out.note = '게시는 됐지만 보관함 상태를 바꾸지 못했어요. ‘게시 완료 표시’를 눌러 주세요.'; out.kind = 'warn'; }
+    else if (by === 'already_published') out.note = b.reason || '이 버전은 이미 API로 게시했어요. 다시 올리려면 내용을 고쳐 새 버전으로 승인해 주세요.';
     else if (by === 'agent_job' || ctx.job) out.note = '에이전트가 이 콘텐츠를 수정하는 중이에요.';
     else if (b.state === 'not_configured') { out.note = label(p) + ' 앱 정보가 없어요.'; out.link = { href: conn.href, text: '연결 설정 열기' }; }
     else if (b.state === 'not_connected') { out.note = label(p) + ' 계정을 연결해야 해요.'; out.link = { href: conn.href, text: label(p) + ' 연결하기' }; }
@@ -219,11 +221,21 @@
   }
 
   // ------------------------------------------------------------------ section under the action row
+  // The server sends the step in Korean (attempt.step_label, publishers/base.py STEP_LABELS); this copy is only the
+  // fallback for an older server. A step without words is left out — a machine name is never shown.
+  var STEP_TEXT = { check: '연결 확인', media: '이미지 올릴 준비', self_check: '공개 주소 확인', polling: '인스타그램이 이미지를 처리하는 중',
+    carousel: '캐러셀 만드는 중', write: '게시 요청 보내는 중', permalink: '게시물 주소를 받는 중' };
   function stepText(a) {
+    if (typeof a.step_label === 'string') return a.step_label;
     var step = String(a.step || '');
     var m = /^children (\d+)\/(\d+)$/.exec(step);
-    if (m) return '이미지 ' + m[1] + '/' + m[2] + ' 등록';
-    return { check: '연결 확인', polling: '인스타그램이 이미지를 처리하는 중', carousel: '캐러셀 만드는 중', write: '게시 요청을 보냈어요', permalink: '게시물 주소를 받는 중' }[step] || step;
+    if (m) return '이미지 등록 ' + m[1] + '/' + m[2];
+    return Object.prototype.hasOwnProperty.call(STEP_TEXT, step) ? STEP_TEXT[step] : '';
+  }
+  /** A failed attempt's message saying "nothing was posted" once (the rule of publishers/base.py with_nothing_posted). */
+  function failText(error) {
+    var text = String(error || '').trim() || '원인을 알 수 없어요.';
+    return /(올라가|올리|게시되|게시하)지 않았/.test(text) ? text : text + ' 아무것도 올라가지 않았어요.';
   }
 
   function progressNode(a, p) {
@@ -253,29 +265,49 @@
     return isHttps(url) ? el('a', { href: url, target: '_blank', rel: 'noopener noreferrer', text: url + ' ↗' }) : el('span', { text: url });
   }
 
-  /** "게시했어요. 게시물 주소를 받지 못했어요." + 주소 입력칸 (PUT /api/publish/attempts/<pa>/permalink). */
+  /** "게시했어요. 게시물 주소를 받지 못했어요." + 주소 입력칸 (PUT /api/publish/attempts/<pa>/permalink). When an
+   *  Instagram re-check found several recent posts (attempt.candidates, DESIGN.md 4-2-7) they are listed to pick from:
+   *  the server matches the picked address to its media id. */
   function permalinkForm(ctx, attempt, p) {
     var id = 'pubPermalink';
     var input = el('input', { id: id, type: 'url', inputmode: 'url', placeholder: p === 'instagram' ? 'https://www.instagram.com/p/…' : 'https://www.linkedin.com/feed/update/…', autocomplete: 'off' });
     var err = el('p', { class: 'form-error', role: 'alert', hidden: true });
+    var buttons = [];
+    function put(u) {
+      buttons.forEach(function (b) { b.disabled = true; });
+      ws.put('/api/publish/attempts/' + encodeURIComponent(attempt.id) + '/permalink', { permalink: u }).then(function () {
+        delete P.results[ctx.item.id];
+        delete P.attempts[ctx.item.id];
+        ws.ui.toast('게시물 주소를 저장했어요.', 'success');
+        ctx.refresh();
+      }, function (ex) {
+        buttons.forEach(function (b) { b.disabled = false; });
+        if (ex.auth) return;
+        err.textContent = '저장하지 못했어요: ' + ex.message;
+        err.hidden = false;
+      });
+    }
     var save = el('button', {
       type: 'button', class: 'btn btn--small btn--primary', 'data-key': 'api-permalink-save', text: '저장', onclick: function () {
         var u = input.value.trim();
         if (!isHttps(u)) { err.textContent = 'https://로 시작하는 게시물 주소를 넣어 주세요.'; err.hidden = false; input.focus(); return; }
-        save.disabled = true;
-        ws.put('/api/publish/attempts/' + encodeURIComponent(attempt.id) + '/permalink', { permalink: u }).then(function () {
-          delete P.results[ctx.item.id];
-          ws.ui.toast('게시물 주소를 저장했어요.', 'success');
-          ctx.refresh();
-        }, function (ex) {
-          save.disabled = false;
-          if (ex.auth) return;
-          err.textContent = '저장하지 못했어요: ' + ex.message;
-          err.hidden = false;
-        });
+        put(u);
       }
     });
+    buttons.push(save);
+    var candidates = (Array.isArray(attempt.candidates) ? attempt.candidates : []).filter(function (c) { return c && isHttps(c.permalink); });
+    var pick = candidates.length ? el('div', { class: 'pub-candidates', role: 'group', 'aria-label': '최근 게시물 중에서 고르기', 'data-key': 'api-candidates' }, [
+      el('p', { class: 'panel-lead', text: '이 게시 시도 뒤에 올라온 게시물이 ' + candidates.length + '개라 주소를 하나로 정하지 못했어요. 인스타그램 앱에서 확인하고 맞는 게시물을 골라 주세요.' }),
+      el('ul', null, candidates.map(function (c) {
+        var b = el('button', { type: 'button', class: 'btn btn--small', 'data-key': 'api-candidate-pick', text: '이 게시물이에요', onclick: function () { put(c.permalink); } });
+        buttons.push(b);
+        return el('li', { class: 'pub-candidate' }, [
+          el('span', { class: 'pa-time', text: c.timestamp ? ws.date.dateTime(c.timestamp) : '시각 모름' }), ' ', linkOut(c.permalink), ' ', b
+        ]);
+      }))
+    ]) : null;
     return el('div', { class: 'pub-permalink' }, [
+      pick,
       el('label', { class: 'field', for: id }, [el('span', null, ['게시물 주소 ', el('small', { text: '선택 · ' + (p === 'instagram' ? '인스타그램' : 'LinkedIn 내 활동') + '에서 복사해 넣어 주세요' })]), input]),
       err,
       el('div', { class: 'form-foot' }, [save])
@@ -300,7 +332,7 @@
       var again = buttonState(ctx);
       return ws.ui.notice('error', [
         el('div', { class: 'notice-row' }, [el('b', { text: '게시하지 못했어요' }), close]),
-        el('p', { text: (a.error || '원인을 알 수 없어요.') + ' 아무것도 올라가지 않았어요.' }),
+        el('p', { text: failText(a.error) }),
         again.show && again.enabled && !activeAttempt(ctx) ? el('div', { class: 'form-foot' }, el('button', {
           type: 'button', class: 'btn btn--small', 'data-key': 'api-retry', 'aria-haspopup': 'dialog', text: '다시 확인하고 게시',
           disabled: ctx.busy || ctx.editing, onclick: function (e) { openDialog(ctx, e.currentTarget); }
@@ -311,10 +343,12 @@
     return null;
   }
 
-  /** 결과 불명 카드 (DESIGN.md 7-5). */
+  /** 결과 불명 카드 (DESIGN.md 7-5). Answering needs no platform call, so it also works while API publishing is off
+   *  (block.state 'disabled'); only Instagram's re-check calls the platform, so it is left out then. */
   function unknownCard(ctx, a, p) {
     var itemId = ctx.item.id;
     var step = P.resolving[itemId] || '';
+    var canCheck = p === 'instagram' && (block(ctx) || {}).state !== 'disabled';
     var err = el('p', { class: 'form-error', role: 'alert', hidden: true });
     function fail(ex) { if (ex.auth) return; err.textContent = ex.message; err.hidden = false; setBusy(false); }
     var buttons = [];
@@ -340,7 +374,8 @@
     var nodes = [
       el('b', { text: '게시됐는지 확인하지 못했어요' }),
       el('p', { text: p === 'instagram'
-        ? '인스타그램의 응답이 끊겼어요. 게시물이 올라갔을 수도 있어요. ‘인스타그램에서 다시 확인’을 누르거나 인스타그램 앱에서 확인해 주세요.'
+        ? (canCheck ? '인스타그램의 응답이 끊겼어요. 게시물이 올라갔을 수도 있어요. ‘인스타그램에서 다시 확인’을 누르거나 인스타그램 앱에서 확인해 주세요.'
+          : '인스타그램의 응답이 끊겼어요. 게시물이 올라갔을 수도 있어요. 인스타그램 앱에서 확인한 뒤 알려 주세요.')
         : 'LinkedIn의 응답이 끊겼어요. 글이 올라갔을 수도 있어요. LinkedIn 내 활동에서 확인해 주세요.' }),
       a.error ? el('p', { class: 'notice-foot', text: '기록된 내용: ' + a.error }) : null
     ];
@@ -366,7 +401,7 @@
     } else {
       nodes.push(err);
       nodes.push(el('div', { class: 'form-foot pub-unknown-actions' }, [
-        p === 'instagram' ? btn('api-check', '인스타그램에서 다시 확인', true, function () {
+        canCheck ? btn('api-check', '인스타그램에서 다시 확인', true, function () {
           setBusy(true);
           ws.post('/api/publish/attempts/' + encodeURIComponent(a.id) + '/check', {}).then(function (resp) {
             var fresh = ws.unwrap(resp, 'attempt') || {};
@@ -377,7 +412,7 @@
             ctx.refresh();
           }, fail);
         }) : null,
-        btn('api-resolve-published', '올라갔어요 — 주소 넣기(선택)', p !== 'instagram', function () { P.resolving[itemId] = 'published'; ctx.rerender(); focusIn('#pubResolveUrl'); }),
+        btn('api-resolve-published', '올라갔어요 — 주소 넣기(선택)', !canCheck, function () { P.resolving[itemId] = 'published'; ctx.rerender(); focusIn('#pubResolveUrl'); }),
         btn('api-resolve-not', '안 올라갔어요', false, function () { P.resolving[itemId] = 'not_published'; ctx.rerender(); focusIn('[data-key="api-resolve-not-yes"]'); })
       ]));
     }
@@ -400,7 +435,7 @@
     }
     if (last.status === 'failed' && (item.status === 'approved' || item.status === 'scheduled')) {
       return el('p', { class: 'pub-note', 'data-kind': 'error' },
-        '마지막 API 게시 시도' + (last.created_at ? '(' + ws.date.dateTime(last.created_at) + ')' : '') + '가 실패했어요: ' + (last.error || '원인을 알 수 없어요.') + ' 아무것도 올라가지 않았어요.');
+        '마지막 API 게시 시도' + (last.created_at ? '(' + ws.date.dateTime(last.created_at) + ')' : '') + '가 실패했어요: ' + failText(last.error));
     }
     if (last.status === 'abandoned' && (item.status === 'approved' || item.status === 'scheduled')) {
       return el('p', { class: 'pub-note', text: '지난 API 게시 시도는 ‘안 올라갔어요’로 정리했어요. 다시 게시하면 새 미리보기부터 시작해요.' });
@@ -444,8 +479,10 @@
   }
 
   // ------------------------------------------------------------------ 게시 기록 (panel 'api_attempts')
+  var SYSTEM_WHO = { instagram_check: '인스타그램 재확인', 'system:late_answer': '늦게 도착한 응답(자동)' };
   function whoText(by) {
     var s = String(by || '');
+    if (Object.prototype.hasOwnProperty.call(SYSTEM_WHO, s)) return SYSTEM_WHO[s];
     var m = /^dashboard@(.+)$/.exec(s);
     if (m) return '대시보드(' + m[1] + ')';
     m = /^cli:(.+)$/.exec(s);

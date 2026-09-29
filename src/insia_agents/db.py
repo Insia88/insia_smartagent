@@ -145,6 +145,7 @@ ACTIVE_PUBLISH_STATUSES = ("sending", "unknown")  # the item's versions and stat
 # Steps recorded at or after the irreversible call: an interrupted attempt there may have been published.
 PUBLISH_AFTER_WRITE_STEPS = ("write", "permalink")
 PUBLISHED_VIA_VALUES = ("", "linkedin_api", "instagram_api", "fake")
+PUBLISHED_VIA_BY_PLATFORM = {"linkedin": "linkedin_api", "instagram": "instagram_api"}
 PUBLISH_CONNECTION_STATUSES = ("connected", "needs_reconnect")
 PUBLISH_PREVIEW_VIA = ("dashboard", "cli")
 # attempt.state never holds a credential (the service only records ids, steps and choices)
@@ -153,6 +154,15 @@ PUBLISH_ITEM_UPDATE_ERROR = "게시는 됐지만 보관함 상태를 바꾸지 �
 PUBLISH_LATE_SUCCESS_BLOCKED = ("이 기록을 정리한 뒤에 플랫폼이 게시 성공을 알려 왔어요. 같은 버전의 다른 게시 기록이 있어 "
                                 "상태를 바꾸지 않았어요. 같은 글이 두 번 올라갔는지 확인해 주세요.")
 PUBLISH_LATE_ANSWER = "system:late_answer"
+# An item's publish fields describe one post. Details that arrive later for a published attempt (the address a
+# person fills in, a late answer) reach the item only while it still describes that attempt's post: published
+# through the API and no newer version posted since (params: the attempt's version) …
+_ITEM_STILL_SHOWS_POST = ("status = 'published' AND published_via <> '' AND NOT EXISTS (SELECT 1 FROM publish_attempts "
+                          "newer WHERE newer.item_id = items.id AND newer.status = 'published' AND newer.version > ?)")
+# … and its address is replaced only when it has none: empty, or an older post's address (another attempt's
+# permalink, which items published before the final review F1 fixes could keep) (params: the attempt's id)
+_ITEM_URL_UNSET = ("(published_url = '' OR published_url IN (SELECT other.permalink FROM publish_attempts other "
+                   "WHERE other.item_id = items.id AND other.id <> ? AND other.permalink <> ''))")
 PUBLISH_INTERRUPTED_FAILED = "게시 도중 프로그램이 멈춰서 아무것도 올리지 않았어요. 다시 확인하고 게시해 주세요."
 PUBLISH_INTERRUPTED_UNKNOWN = {
     "linkedin": "게시 도중 프로그램이 멈춰서 LinkedIn에 올라갔는지 확인하지 못했어요. LinkedIn 내 활동에서 확인한 뒤 알려 주세요.",
@@ -2014,12 +2024,52 @@ class Workspace:
                 values["published_url"] = url
             if status == "published" and not row["published_at"]:
                 values["published_at"] = utc_now()
+            if status == "published" and old != "published":  # 게시 완료 표시 by a person
+                values.update(self._published_by_hand(conn, row, url_given=bool((published_url or "").strip())))
             if note is not None:
                 values["note"] = note.strip()[:MAX_NOTE_CHARS]
             values["updated_at"] = utc_now()
             assignments = ", ".join(f"{key} = ?" for key in values)
             conn.execute(f"UPDATE items SET {assignments} WHERE id = ?", (*values.values(), item_id))
             return self._item(self._item_row(conn, item_id))
+
+    @staticmethod
+    def _published_by_hand(conn: sqlite3.Connection, row: sqlite3.Row, *, url_given: bool) -> dict[str, Any]:
+        """The API fields when a person marks an item published: they must say how *this* version went up.
+
+        - The current version has a published API attempt (the item was moved back — 보관 → 복원 → 승인 — after that
+          post, or recording the item failed): ``published_via`` is that API post's (the attempt's ``item_via``, the
+          item's own value, else the platform's), ``published_external_id`` its id, ``published_at`` its time and
+          its permalink the address (unless one is given here; an older post's address is never kept for it). An
+          accidental 보관 → 복원 → 게시 완료 표시 thus comes back to the same record.
+        - Otherwise the person posted this version by hand (DESIGN.md 5-4): ``published_via`` and
+          ``published_external_id`` are ``''``; an address and time left from an older version's API post are not
+          kept (a new address given here stays)."""
+        version = max(1, int(row["version"] or 0))
+        attempt = conn.execute("SELECT * FROM publish_attempts WHERE item_id = ? AND version = ? AND status = 'published' "
+                               "ORDER BY finished_at DESC, rowid DESC LIMIT 1", (row["id"], version)).fetchone()
+        if attempt is None:
+            out: dict[str, Any] = {"published_via": "", "published_external_id": ""}
+            if row["published_via"]:  # the address and time belong to an older version's API post
+                out["published_at"] = utc_now()
+                if not url_given:
+                    out["published_url"] = ""
+            return out
+        state = _loads(attempt["state"], {}) or {}
+        via = (str(state.get("item_via") or "") or str(row["published_via"] or "")
+               or PUBLISHED_VIA_BY_PLATFORM.get(str(attempt["platform"]), ""))
+        out = {"published_via": via if via in PUBLISHED_VIA_VALUES else "",
+               "published_external_id": str(attempt["external_id"] or "")}
+        link = str(attempt["permalink"] or "")
+        if not url_given and link and _URL.match(link):
+            out["published_url"] = link
+        elif not url_given and row["published_url"] and conn.execute(
+                "SELECT 1 FROM publish_attempts WHERE item_id = ? AND id <> ? AND permalink = ? LIMIT 1",
+                (row["id"], attempt["id"], row["published_url"])).fetchone() is not None:
+            out["published_url"] = ""  # an older post's address, not this one's
+        if attempt["finished_at"]:
+            out["published_at"] = str(attempt["finished_at"])
+        return out
 
     def published_history(self, channel: str | None = None, limit: int = 50) -> list[ContentItem]:
         """Published items, newest first (the planner uses them to avoid repeating topics). Items "published" by the
@@ -2853,7 +2903,12 @@ class Workspace:
                                      external_id: str, stamp: str) -> str:
         """Content side of a confirmed API publish (the attempt is already recorded as published). Deliberately not
         guarded by ``_check_not_publishing``: the only live attempt is this one. Returns "" or the Korean reason why
-        the item could not be moved (then it is left as it is)."""
+        the item could not be moved (then it is left as it is).
+
+        The item is approved/scheduled at this very version, so any ``published_at`` / ``published_url`` it still
+        holds belong to an earlier post (보관 → 복원 → 고친 뒤 다시 게시): the publish fields are all this post's —
+        its time, its permalink (``''`` when the platform gave none, so the address a person fills in later lands
+        on the item) and its id."""
         item = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
         if item is None:
             return PUBLISH_ITEM_UPDATE_ERROR
@@ -2862,9 +2917,8 @@ class Workspace:
             return PUBLISH_ITEM_UPDATE_ERROR
         link = url if url and _URL.match(url) else ""
         conn.execute(
-            "UPDATE items SET status = 'published', published_at = CASE WHEN published_at = '' THEN ? ELSE published_at END, "
-            "published_url = CASE WHEN ? <> '' THEN ? ELSE published_url END, published_via = ?, published_external_id = ?, "
-            "updated_at = ? WHERE id = ?", (stamp, link, link, via, external_id or "", stamp, item_id))
+            "UPDATE items SET status = 'published', published_at = ?, published_url = ?, published_via = ?, "
+            "published_external_id = ?, updated_at = ? WHERE id = ?", (stamp, link, via, external_id or "", stamp, item_id))
         return ""
 
     def _record_item_update(self, attempt_id: str, item_id: str, version: int, *, via: str, url: str, external_id: str,
@@ -2883,9 +2937,10 @@ class Workspace:
         try:
             with self._tx() as conn:
                 row = conn.execute("SELECT state FROM publish_attempts WHERE id = ?", (attempt_id,)).fetchone()
-                if row is not None:
+                if row is not None:  # item_via: what 게시 완료 표시 records later (set_item_status)
                     conn.execute("UPDATE publish_attempts SET state = ?, updated_at = ? WHERE id = ?",
-                                 (self._merged_state(row["state"], {"item_update_error": reason}), stamp, attempt_id))
+                                 (self._merged_state(row["state"], {"item_update_error": reason, "item_via": via}),
+                                  stamp, attempt_id))
         except Exception:  # noqa: BLE001
             log.warning("게시 시도 %s에 메모를 남기지 못했어요", attempt_id, exc_info=True)
         return None
@@ -2895,8 +2950,8 @@ class Workspace:
                                now: datetime | None = None) -> tuple[PublishAttempt, ContentItem | None]:
         """The platform confirmed the post. ① The attempt becomes ``published`` and is committed right away (so the
         fact and its permalink are never lost; the unique index keeps blocking a second post of this version).
-        ② The item becomes ``published`` (``published_at`` when empty, ``published_url`` = permalink when given,
-        ``published_via`` = ``via``, ``published_external_id``) — if that is impossible the item stays as it is and
+        ② The item becomes ``published`` with this post's fields (``published_at`` = now, ``published_url`` = the
+        permalink or ``''``, ``published_via`` = ``via``, ``published_external_id``) — if that is impossible the item stays as it is and
         ``attempt.state.item_update_error`` says so; no exception. ``AttemptTakenOverError`` when the worker no
         longer owns the attempt (then the recovery's record stands)."""
         if via not in PUBLISHED_VIA_VALUES or not via:
@@ -2940,10 +2995,15 @@ class Workspace:
         assert attempt is not None
         return attempt
 
-    def set_publish_permalink(self, attempt_id: str, url: str, *, by: str, now: datetime | None = None) -> PublishAttempt:
+    def set_publish_permalink(self, attempt_id: str, url: str, *, by: str, external_id: str = "",
+                              now: datetime | None = None) -> PublishAttempt:
         """A person fills in the post address of a ``published`` attempt that has none; the item's ``published_url``
-        follows when the item was published by this attempt and has no URL. The caller checks the platform's hosts."""
+        follows while the item still shows this attempt's post (``_ITEM_STILL_SHOWS_POST``: no newer version posted
+        through the API since) and has no address of its own (``_ITEM_URL_UNSET``: an older post's address counts as
+        none). ``external_id`` (the media id of the Instagram candidate the person picked) fills an empty external id
+        of the attempt and of that item. The caller checks the platform's hosts and the candidate."""
         url = (url or "").strip()
+        external_id = (external_id or "").strip()[:300]
         if not _URL.match(url) or not url.lower().startswith("https://") or len(url) > 2000:
             raise WorkspaceError("게시물 주소는 https://로 시작하는 전체 주소여야 해요")
         stamp = _fmt(self._now_dt(now))
@@ -2953,10 +3013,13 @@ class Workspace:
                 raise NotFoundError(f"게시 시도 {attempt_id}를 찾을 수 없어요")
             if row["status"] != "published" or row["permalink"]:
                 raise PublishStateError("게시가 끝났고 주소가 비어 있는 기록에만 주소를 넣을 수 있어요.", reason="attempt_state")
-            conn.execute("UPDATE publish_attempts SET permalink = ?, state = ?, updated_at = ? WHERE id = ?",
-                         (url, self._merged_state(row["state"], {"permalink_by": (by or "")[:200]}), stamp, attempt_id))
-            conn.execute("UPDATE items SET published_url = ?, updated_at = ? WHERE id = ? AND status = 'published' "
-                         "AND published_url = '' AND published_via <> ''", (url, stamp, row["item_id"]))
+            conn.execute("UPDATE publish_attempts SET permalink = ?, external_id = CASE WHEN external_id = '' THEN ? "
+                         "ELSE external_id END, state = ?, updated_at = ? WHERE id = ?",
+                         (url, external_id, self._merged_state(row["state"], {"permalink_by": (by or "")[:200]}), stamp,
+                          attempt_id))
+            conn.execute("UPDATE items SET published_url = ?, published_external_id = CASE WHEN published_external_id = '' "
+                         f"THEN ? ELSE published_external_id END, updated_at = ? WHERE id = ? AND {_ITEM_STILL_SHOWS_POST} "
+                         f"AND {_ITEM_URL_UNSET}", (url, external_id, stamp, row["item_id"], int(row["version"]), attempt_id))
             row = conn.execute("SELECT * FROM publish_attempts WHERE id = ?", (attempt_id,)).fetchone()
         return self._publish_attempt(row)
 
@@ -3042,7 +3105,7 @@ class Workspace:
           post of this version. If another live attempt of the same version already exists (a new send after
           "안 올라갔어요"), the status stays and ``error`` asks the person to check for a duplicate;
         - ``published`` (a person said "올라갔어요") → a missing external id / permalink is filled in, on the item
-          too when the API published it and it has none.
+          too while it still shows this post and has none (like ``set_publish_permalink``).
 
         ``state.late_success`` always keeps what arrived (``external_id``, ``permalink``, ``at``, ``status_before``)."""
         if via not in PUBLISHED_VIA_VALUES or not via:
@@ -3072,10 +3135,9 @@ class Workspace:
                              "permalink = CASE WHEN permalink = '' THEN ? ELSE permalink END, state = ?, updated_at = ? "
                              "WHERE id = ?", (external_id, permalink, state, stamp, attempt_id))
                 conn.execute("UPDATE items SET published_external_id = CASE WHEN published_external_id = '' THEN ? "
-                             "ELSE published_external_id END, published_url = CASE WHEN published_url = '' AND ? <> '' "
-                             "THEN ? ELSE published_url END, updated_at = ? WHERE id = ? AND status = 'published' "
-                             "AND published_via <> ''",
-                             (external_id, permalink, permalink, stamp, row["item_id"]))
+                             f"ELSE published_external_id END, published_url = CASE WHEN ? <> '' AND {_ITEM_URL_UNSET} "
+                             f"THEN ? ELSE published_url END, updated_at = ? WHERE id = ? AND {_ITEM_STILL_SHOWS_POST}",
+                             (external_id, permalink, attempt_id, permalink, stamp, row["item_id"], int(row["version"])))
             else:  # blocked by another live attempt of this version (or, never expected, still 'sending')
                 conn.execute("UPDATE publish_attempts SET state = ?, error = ?, updated_at = ? WHERE id = ?",
                              (state, PUBLISH_LATE_SUCCESS_BLOCKED, stamp, attempt_id))

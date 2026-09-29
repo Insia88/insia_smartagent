@@ -37,8 +37,11 @@ Rules kept here:
 * Access-log lines never hold an OAuth code/state (``/oauth/`` queries are cut) or a whole public media token;
   the server's own logger (500 tracebacks included) runs through the publishing ``SecretFilter``.
 * ``INSIA_PUBLISH=0`` → ``GET /api/publish`` answers ``200 {"enabled": false, …, "platforms": {}}`` (so the
-  dashboard draws no connection card) and every other route here answers 409 ``{"code": "disabled"}`` (the
-  callback 303s to ``invalid``, ``/pub/m/`` is 404).
+  dashboard draws no connection card) and every route that could reach a platform answers 409
+  ``{"code": "disabled"}`` (the callback 303s to ``invalid``, ``/pub/m/`` is 404). The record-only routes keep
+  working — ``GET /api/items/<id>/publish``, ``GET /api/publish/attempts/<pa>``, ``PUT …/permalink`` and
+  ``POST …/resolve`` (still human requests only) — so an attempt left ``unknown`` before the switch was flipped
+  can be answered and its item unlocked (``_publish(allow_disabled=True)``).
 """
 
 from __future__ import annotations
@@ -229,12 +232,14 @@ class PublishHandlerMixin:
     server: "InsiaServer"
 
     # -- plumbing ---------------------------------------------------------------------
-    def _publish(self) -> PublishService:
-        """The process's service, or 409 ``disabled`` (``INSIA_PUBLISH=0`` / the fake mode was refused)."""
+    def _publish(self, *, allow_disabled: bool = False) -> PublishService:
+        """The process's service, or 409 ``disabled`` (``INSIA_PUBLISH=0`` / the fake mode was refused).
+        ``allow_disabled`` — for the record-only routes (attempt history, polling, permalink, resolve), which never
+        call a platform: an attempt left ``unknown`` must stay answerable after publishing was switched off."""
         service = getattr(self.server, "publish", None)
         if service is None:
             raise PublishDisabledError()
-        if not service.settings.enabled:
+        if not service.settings.enabled and not allow_disabled:
             raise PublishDisabledError(service.settings.disabled_reason or None)
         return service
 
@@ -573,7 +578,7 @@ class PublishHandlerMixin:
                               "poll_url": f"/api/publish/attempts/{attempt.id}"})
 
     def _h_publish_item_attempts(self, item_id: str, *, query: dict[str, list[str]]) -> None:
-        service = self._publish()
+        service = self._publish(allow_disabled=True)
         self._item_detail(item_id)
         attempts = service.list_attempts(item_id=item_id, limit=50)
         self._send_json(200, {"item_id": item_id,  # type: ignore[attr-defined]
@@ -581,11 +586,11 @@ class PublishHandlerMixin:
 
     # -- attempts ----------------------------------------------------------------------------------
     def _h_publish_attempt(self, attempt_id: str, *, query: dict[str, list[str]]) -> None:
-        service = self._publish()
+        service = self._publish(allow_disabled=True)
         self._send_json(200, {"attempt": service.attempt_json(service.get_attempt(attempt_id))})  # type: ignore[attr-defined]
 
     def _h_publish_permalink(self, attempt_id: str, *, query: dict[str, list[str]]) -> None:
-        service = self._publish()
+        service = self._publish(allow_disabled=True)
         body = self._read_json(PUBLISH_BODY, required=True, empty_message="게시물 주소(permalink)를 보내 주세요")  # type: ignore[attr-defined]
         _only_keys(body, {"permalink"})
         url = _str_field(body, "permalink", label="게시물 주소", limit=2000, required=True) or ""
@@ -593,8 +598,9 @@ class PublishHandlerMixin:
         self._send_json(200, {"attempt": service.attempt_json(attempt)})  # type: ignore[attr-defined]
 
     def _h_publish_resolve(self, attempt_id: str, *, query: dict[str, list[str]]) -> None:
-        """``POST /api/publish/attempts/<pa>/resolve``: a person says whether an ``unknown`` attempt went out."""
-        service = self._publish()
+        """``POST /api/publish/attempts/<pa>/resolve``: a person says whether an ``unknown`` attempt went out (also
+        while publishing is off: nothing is sent, only the record and the item change)."""
+        service = self._publish(allow_disabled=True)
         self._require_human()
         body = self._read_json(PUBLISH_BODY, required=True, empty_message="결과(outcome)를 보내 주세요")  # type: ignore[attr-defined]
         _only_keys(body, {"outcome", "url"})

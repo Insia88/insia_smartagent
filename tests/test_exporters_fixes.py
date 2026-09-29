@@ -767,3 +767,17 @@ def test_bizplan_docx_export_notes_carry_the_word_box_warning():
     assert "고려대학교" in exported.notes[0]
     assert export_item(detail("bizplan", "- 대표: ○○ 분야 7년 (자사 자료)"), "docx", profile).notes == ()
     assert export_item(detail("linkedin", "카카오 출신 PM 7년, 고려대학교 졸업"), "docx", profile).notes == ()
+
+
+def test_render_hints_point_docker_users_to_the_render_build(monkeypatch):
+    """In the Docker image a pip install or browser download does not last: the hint names INSIA_WITH_RENDER=1."""
+    from insia_agents.exporters.instagram import render_install_hint
+
+    monkeypatch.delenv("INSIA_WEB_DIR", raising=False)
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    assert "playwright install chromium" in render_install_hint()
+    assert "INSIA_WITH_RENDER" not in render_install_hint()
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/playwright")
+    for hint in (render_install_hint(), render_install_hint(browser_only=True)):
+        assert "INSIA_WITH_RENDER=1" in hint and "docker compose up -d --build" in hint
+        assert "pip install" not in hint

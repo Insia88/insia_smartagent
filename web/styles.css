@@ -1536,6 +1536,9 @@ a.btn--primary { color: var(--accent-ink); }
 .pub-note { font-size: var(--fs-sm); color: var(--ink-2); overflow-wrap: anywhere; }
 .pub-note[data-kind="warn"] { color: var(--gold-ink); }
 .pub-note[data-kind="error"] { color: var(--danger-ink); }
+.pub-candidates { display: grid; gap: 6px; min-width: 0; }
+.pub-candidates ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.pub-candidate { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; font-size: var(--fs-sm); overflow-wrap: anywhere; }
 .pub-note a { font-weight: 600; white-space: nowrap; }
 .pub-progress { display: grid; gap: 8px; padding: 10px 12px; border-radius: var(--r-sm); font-size: var(--fs-sm); color: var(--ink-2);
   border: 1px solid color-mix(in srgb, var(--c-res) 45%, var(--line)); background: color-mix(in srgb, var(--c-res) 9%, var(--surface)); }

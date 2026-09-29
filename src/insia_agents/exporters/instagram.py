@@ -47,6 +47,22 @@ LONG_TEXT_WORDS = 80
 LONG_SOURCE_WORDS = 120
 
 
+def in_docker_image() -> bool:
+    """Running in the INSIA Docker image (its Dockerfile sets these): pip or a browser download inside the container
+    does not last, so rendering comes from the image built with INSIA_WITH_RENDER=1 (docs/operations.md 1-2)."""
+    return (os.environ.get("INSIA_WEB_DIR") == "/app/web"
+            or os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == "/opt/playwright")
+
+
+def render_install_hint(*, browser_only: bool = False) -> str:
+    """How to get card-news PNG rendering on this machine (Korean, one sentence)."""
+    if in_docker_image():
+        return ".env에 INSIA_WITH_RENDER=1을 넣고 docker compose up -d --build로 이미지를 다시 빌드해 주세요."
+    if browser_only:
+        return "브라우저가 없다면 `playwright install chromium`을 실행하거나 INSIA_CHROMIUM으로 브라우저 경로를 정해 주세요"
+    return f"`{EXTRA_HINT.format(extra='render')}` 설치 후 `playwright install chromium`을 실행해 주세요."
+
+
 class RenderUnavailable(RuntimeError):
     """PNG rendering is not possible here; ``str(exc)`` is a Korean reason."""
 
@@ -636,10 +652,7 @@ def render_images(page_html: str, count: int, *, image_type: str = "png", qualit
     try:
         from playwright.sync_api import Error as PlaywrightError
     except ImportError as exc:
-        raise RenderUnavailable(
-            f"PNG를 만들려면 Playwright가 필요해요. `{EXTRA_HINT.format(extra='render')}` 설치 후 "
-            "`playwright install chromium`을 실행하세요"
-        ) from exc
+        raise RenderUnavailable(f"PNG를 만들려면 Playwright가 필요해요. {render_install_hint()}") from exc
 
     executable = (os.environ.get("INSIA_CHROMIUM") or "").strip() or None
     if executable and not Path(executable).exists():
@@ -653,7 +666,7 @@ def render_images(page_html: str, count: int, *, image_type: str = "png", qualit
         raise
     except PlaywrightError as exc:
         first = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
-        hint = "" if executable else " (브라우저가 없다면 `playwright install chromium` 또는 INSIA_CHROMIUM 설정)"
+        hint = "" if executable else f" ({render_install_hint(browser_only=True)})"
         raise RenderUnavailable(f"브라우저로 슬라이드를 그리지 못했어요: {first[:200]}{hint}") from exc
     except Exception as exc:  # noqa: BLE001 — never fail the export over rendering; fall back to slides.html
         raise RenderUnavailable(f"브라우저로 슬라이드를 그리지 못했어요: {str(exc).strip()[:200] or exc.__class__.__name__}") from exc
@@ -736,7 +749,7 @@ def _readme(draft: Draft, slides: list[Slide], *, rendered: bool, reason: str, m
             "PNG 이미지를 만들지 못해서 slides.html을 대신 넣었어요.",
             f"이유: {reason}",
             "slides.html을 크롬으로 열고 인쇄(Ctrl+P) → 'PDF로 저장' → 여백 '없음'으로 저장하면 한 장에 한 슬라이드씩 나와요.",
-            "PNG를 바로 받으려면 이 PC에 `pip install \"insia-smartagent[render]\"`와 `playwright install chromium`을 실행한 뒤 다시 내보내세요.",
+            f"PNG를 바로 받으려면: {render_install_hint()} 그다음 다시 내보내세요.",
             "",
         ]
     lines += [

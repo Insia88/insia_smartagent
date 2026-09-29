@@ -710,3 +710,162 @@ def test_cleanup_and_the_background_job(publish_kit):
     ws.publish_recovery_hook = service._after_recovery
     service.shutdown(timeout=2)
     assert ws.publish_recovery_hook is None and not service._bg_thread.is_alive()
+
+
+def test_every_worker_step_has_korean_words_and_failures_say_nothing_posted_once(publish_kit):
+    """Final review F1-3: the dashboard and the CLI show a step in Korean from one table (the attempt JSON's
+    ``step_label``), never the machine name ('media', 'self_check'), and a failure says "nothing was posted" once."""
+    import ast
+    from pathlib import Path
+
+    from insia_agents.publishers import base
+
+    package = Path(service_module.__file__).parent
+    emitted = set()
+    for name in ("instagram.py", "linkedin.py"):
+        for node in ast.walk(ast.parse((package / name).read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("step", "_poll"):
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        emitted.add(arg.value)
+    emitted |= {"write", "children 3/8"}  # claim_write()'s default step, and the formatted child step
+    assert {"check", "media", "self_check", "polling", "carousel", "permalink"} <= emitted
+    for step in emitted:
+        assert base.step_label(step) and base.step_label(step) != step, step
+    assert base.step_label("children 3/8") == "이미지 등록 3/8" and base.step_label("new_step") == ""
+    service, fake = linkedin(publish_kit)
+    fake.add("POST", POSTS, json_response(403, {"status": 403, "message": "ACCESS_DENIED"}))
+    item = publish_kit.item("linkedin")
+    preview = service.preview(item, via="dashboard", requested_by="dashboard@127.0.0.1")
+    attempt = service.send(confirm(preview), background=False)
+    data = service.attempt_json(attempt)
+    assert data["step_label"] == base.step_label(attempt.step) and data["step_label"]
+    assert attempt.status == "failed" and base.with_nothing_posted(attempt.error) == attempt.error  # said already
+    for said in ("인스타그램에서 오류가 났어요(코드 100). 아무것도 게시되지 않았어요.", "중단해서 아무것도 올리지 않았어요."):
+        assert base.with_nothing_posted(said) == said
+    assert base.with_nothing_posted("이미지 형식을 인스타그램이 받지 않았어요(INSIA 오류).").endswith(
+        "받지 않았어요(INSIA 오류). 아무것도 올라가지 않았어요.")
+    assert base.with_nothing_posted("") == "이유를 받지 못했어요. 아무것도 올라가지 않았어요."
+
+
+def test_moving_an_api_published_item_back_keeps_an_honest_record(publish_kit, monkeypatch):
+    """Final review F1-4: 보관 → 복원 → 승인 after an API post is 'already_published' (not "the status update
+    failed"); 게시 완료 표시 records how *this* version went up — the API post's via/id when it was API-posted
+    (an accidental round trip comes back to the same record), '' for a version posted by hand."""
+    ws = publish_kit.workspace
+    service, fake = linkedin(publish_kit)
+
+    def api_post(item_id: str, urn: str):
+        preview = service.preview(item_id, via="dashboard", requested_by="d")
+        fake.add("POST", POSTS, created(urn))
+        return service.send(confirm(preview), background=False)
+
+    def fields(item_id: str) -> tuple:
+        item = ws.get_item(item_id).item
+        return item.status, item.published_via, item.published_url, item.published_external_id, item.published_at
+
+    # A: moved back, then marked published again with another address
+    a = publish_kit.item()
+    api_post(a, "urn:li:share:7001")
+    ws.set_item_status(a, "archived")
+    assert service.item_block(ws.get_item(a).item)["blocked_by"] == "archived"
+    ws.set_item_status(a, "draft")
+    assert service.item_block(ws.get_item(a).item)["blocked_by"] == "not_approved"
+    ws.set_item_status(a, "approved", force=True)
+    block = service.item_block(ws.get_item(a).item)
+    assert block["blocked_by"] == "already_published" and block["available"] is False
+    assert "이미 API로 게시했어요" in block["reason"] and "바꾸지 못했어요" not in block["reason"]
+    with pytest.raises(AlreadyPublishedError):
+        service.preview(a, via="dashboard", requested_by="d")
+    url = "https://www.linkedin.com/feed/update/urn:li:share:9999/"
+    ws.set_item_status(a, "published", published_url=url)
+    assert fields(a)[:4] == ("published", "linkedin_api", url, "urn:li:share:7001")  # this version was API-posted
+    # B: an accidental round trip comes back to exactly the same record
+    b = publish_kit.item()
+    api_post(b, "urn:li:share:7002")
+    before = fields(b)
+    for status in ("archived", "draft", "approved", "published"):
+        ws.set_item_status(b, status, force=status == "approved")
+    assert fields(b) == before
+    # E: edited into v2 and posted by hand: no API badge, no old post id, no old address or time
+    publish_kit.clock.advance(3600)
+    for status in ("archived", "draft"):
+        ws.set_item_status(b, status)
+    ws.add_version(b, Draft(channel="linkedin", round=1, title="t", content="다음 주에 다시 쓰려고 고친 본문이에요.",
+                            hashtags=["#창업", "#마케팅", "#1인기업"]), source="human")
+    ws.set_item_status(b, "approved", force=True)
+    assert service.item_block(ws.get_item(b).item)["blocked_by"] == ""  # v2 was never posted: API publishing is offered
+    ws.set_item_status(b, "published")
+    status, via, link, external, published_at = fields(b)
+    assert (status, via, link, external) == ("published", "", "", "") and published_at != before[4]
+    # D: recording the item really failed: 'published_attempt', then 게시 완료 표시 fills in the API post
+    d = publish_kit.item()
+    monkeypatch.setattr(ws, "_mark_item_published_via_api", lambda *args, **kwargs: "게시는 됐지만 보관함 상태를 바꾸지 못했어요.")
+    attempt = api_post(d, "urn:li:share:7003")
+    monkeypatch.undo()
+    assert attempt.state["item_via"] == "linkedin_api"
+    assert service.item_block(ws.get_item(d).item)["blocked_by"] == "published_attempt"
+    ws.set_item_status(d, "published")
+    assert fields(d)[:4] == ("published", "linkedin_api", attempt.permalink, "urn:li:share:7003") and fields(d)[4]
+
+
+def _instagram_unknown(publish_kit):
+    """An Instagram attempt whose media_publish answer was lost; returns (service, fake, attempt, item_id, platform)."""
+    fake = FakeTransport()
+    service = publish_kit.service(transport=fake, instagram=True)
+    publish_kit.connect_instagram(service)
+    fake.add("GET", r"/v25\.0/me$", json_response(200, {"user_id": publish_kit.IG_ID, "username": "a"}), repeat=True)
+    fake.add("GET", r"/content_publishing_limit$", json_response(200, {"data": [{"quota_usage": 0, "config": {"quota_total": 50}}]}),
+             repeat=True)
+    item_id = publish_kit.item("instagram")
+    preview = service.preview(item_id, options={"is_ai_generated": False}, via="dashboard", requested_by="d")
+    ids = iter(range(1000, 1100))
+    fake.add("POST", r"/media$", lambda r: json_response(200, {"id": str(next(ids))}), repeat=True)
+    platform = {"published": False}
+
+    def status(request):
+        done = platform["published"] and request.url.endswith("/1007")
+        return json_response(200, {"status_code": "PUBLISHED" if done else "FINISHED"})
+
+    fake.add("GET", r"/v25\.0/1\d{3}$", status, repeat=True)
+    fake.add("POST", r"/media_publish$", json_response(502, {}))
+    attempt = service.send(confirm(preview), background=False)
+    assert attempt.status == "unknown"
+    return service, fake, attempt, item_id, platform
+
+
+def test_instagram_recheck_lists_candidates_and_a_picked_one_fills_the_id(publish_kit):
+    """Final review F1-6: several recent posts → the attempt keeps them as ``candidates`` (normalized, Instagram hosts
+    only, INSIA's own recorded posts left out); the address a person picks fills the permalink and the media id."""
+    from datetime import datetime, timezone
+
+    service, fake, attempt, item_id, platform = _instagram_unknown(publish_kit)
+    other = publish_kit.item("instagram", title="먼저 올린 다른 콘텐츠")  # a post INSIA already recorded
+    ws = publish_kit.workspace
+    digest = "sha256:" + "d" * 64
+    pv = ws.create_publish_preview(other, 1, "instagram", publish_kit.IG_ID, {"schema": 1}, digest, created_via="dashboard")
+    recorded, owner = ws.begin_publish_attempt(pv.id, digest, via="dashboard", requested_by="d")
+    ws.claim_publish_write(recorded.id, owner)
+    ws.finish_publish_success(recorded.id, owner, external_id="18000000000000003", permalink="", via="instagram_api")
+    platform["published"] = True
+    start = datetime.fromisoformat(attempt.created_at.replace("Z", "+00:00")).timestamp()
+    iso = lambda seconds: datetime.fromtimestamp(start + seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")  # noqa: E731
+    fake.add("GET", r"/17841400000000001/media$", json_response(200, {"data": [
+        {"id": "18000000000000003", "permalink": "https://www.instagram.com/p/OTHERINSIA/", "timestamp": iso(300)},
+        {"id": "18000000000000002", "permalink": "https://www.instagram.com/p/MANUAL/", "timestamp": iso(240)},
+        {"id": "18000000000000009", "permalink": "https://evil.example/p/X/", "timestamp": iso(200)},
+        {"id": "18000000000000001", "permalink": "https://www.instagram.com/p/APIPOST/", "timestamp": iso(20)},
+        {"id": "17999999999999999", "permalink": "https://www.instagram.com/p/OLD/", "timestamp": iso(-2 * 86400)}]}),
+        repeat=True)
+    checked = service.check_attempt(attempt.id)
+    assert checked.status == "published" and checked.permalink == "" and checked.external_id == ""
+    candidates = service.attempt_json(checked)["candidates"]
+    assert [c["id"] for c in candidates] == ["18000000000000002", "18000000000000009", "18000000000000001"]
+    assert candidates[1]["permalink"] == ""  # off Instagram's hosts: never offered as a link
+    assert all(c["timestamp"].endswith("Z") and "+0000" not in c["timestamp"] for c in candidates)
+    picked = service.set_permalink(checked.id, "https://www.instagram.com/p/APIPOST/", by="dashboard@127.0.0.1")
+    assert (picked.permalink, picked.external_id) == ("https://www.instagram.com/p/APIPOST/", "18000000000000001")
+    item = ws.get_item(item_id).item
+    assert (item.published_url, item.published_external_id) == ("https://www.instagram.com/p/APIPOST/", "18000000000000001")
+    with pytest.raises(AttemptStateError):  # once only
+        service.set_permalink(checked.id, "https://www.instagram.com/p/MANUAL/", by="d")

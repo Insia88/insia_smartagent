@@ -45,6 +45,7 @@ log = get_logger(__name__)
 
 MEDIA_TTL_SECONDS = 24 * 3600            # public folder lifetime (= Instagram container lifetime)
 STAGING_MAX_AGE_SECONDS = 2 * 3600       # staged preview images older than this are always removed
+UNFINISHED_PUBLISH_GRACE_SECONDS = 120  # a public folder without .expires younger than this is still being written
 NOT_FOUND_LIMIT = 30                     # error answers (404, 405, malformed) per client per minute on the listener
 NOT_FOUND_WINDOW_SECONDS = 60.0
 # The listener faces the internet (through a tunnel or proxy): a client that goes quiet mid-request is dropped after
@@ -271,6 +272,15 @@ class PublicMediaHost:
                 if not folder.is_dir() or not _TOKEN.match(folder.name):
                     continue
                 expires = _read_expires(folder / EXPIRES_FILE)
+                if expires is None:
+                    # publish() writes the images first and ``.expires`` last: a young folder without it is being
+                    # filled right now (a send in progress), so leave it; an old one is a leftover from a crash
+                    try:
+                        age = now - folder.stat().st_mtime
+                    except OSError:
+                        continue
+                    if age < UNFINISHED_PUBLISH_GRACE_SECONDS:
+                        continue
                 if expires is None or expires <= now:
                     if self.expire(folder.name):
                         removed["public"] += 1

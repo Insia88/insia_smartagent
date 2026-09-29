@@ -270,3 +270,91 @@ def test_a_late_success_reopens_a_closed_attempt_as_published(tmp_path):
         assert (item.status, item.published_external_id, item.published_url) == ("published", "urn:li:share:5", url)
         with pytest.raises(PublishStateError):  # the unique index blocks a second post of this version again
             _begin(ws, item_id, digest="sha256:" + "f" * 64)
+
+
+def _post(ws: Workspace, item_id: str, urn: str, permalink: str, *, now: datetime):
+    attempt, token = _begin(ws, item_id, now=now, digest="sha256:" + urn[-1] * 64)
+    ws.claim_publish_write(attempt.id, token, now=now)
+    return ws.finish_publish_success(attempt.id, token, external_id=urn, permalink=permalink, via="linkedin_api",
+                                     now=now)
+
+
+def _edited_and_approved(ws: Workspace, item_id: str) -> None:
+    """보관 → 복원 → 고쳐서 v2 → 승인: the way an item a person already posted comes back for another post."""
+    ws.set_item_status(item_id, "archived")
+    ws.set_item_status(item_id, "draft")
+    ws.add_version(item_id, _draft(1, "다시 올리려고 고친 본문"), source="human")
+    ws.set_item_status(item_id, "approved", force=True)
+
+
+def test_an_api_post_of_a_new_version_replaces_the_older_posts_record(tmp_path, monkeypatch):
+    """Final review F1 (follow-up to F1-4): once v2 is posted through the API, the item's publish fields are v2's
+    post — its time, its id and its address or none, never v1's — so the address a person fills in later lands on
+    the item (also over a v1 address an item kept before this fix). Details arriving later for the older post (a
+    filled-in address, a late answer) leave the newer post's record alone; 게시 완료 표시 after a failed item update
+    records the v2 post, not v1's address."""
+    link = "https://www.linkedin.com/feed/update/urn:li:share:{}/".format
+    later = NOW + timedelta(days=3)
+    with Workspace(tmp_path / "ws") as ws:
+        _connect(ws)
+        # A: v1 posted with an address; v2 posted without one (the platform gave none)
+        a = _approved(ws)
+        _post(ws, a, "urn:li:share:1", link(1), now=NOW)
+        _edited_and_approved(ws, a)
+        v2, item = _post(ws, a, "urn:li:share:2", "", now=later)
+        assert (item.status, item.version, item.published_via, item.published_external_id, item.published_url,
+                item.published_at) == ("published", 2, "linkedin_api", "urn:li:share:2", "", db._fmt(later))
+        with ws.transaction() as conn:  # what the code before this fix kept: v1's address on v2's record
+            conn.execute("UPDATE items SET published_url = ? WHERE id = ?", (link(1), a))
+        ws.set_publish_permalink(v2.id, link(2), by="d")
+        assert ws.get_item(a).item.published_url == link(2)
+        # B: v1 posted without an address, v2 with one; v1's address and a late answer for v1 arrive afterwards
+        b = _approved(ws)
+        v1, _ = _post(ws, b, "urn:li:share:3", "", now=NOW)
+        _edited_and_approved(ws, b)
+        _post(ws, b, "urn:li:share:4", link(4), now=later)
+        ws.set_publish_permalink(v1.id, link(3), by="d")
+        ws.record_late_publish_success(v1.id, external_id="urn:li:share:3", permalink=link(3), via="linkedin_api",
+                                       now=later)
+        assert ws.get_publish_attempt(v1.id).permalink == link(3)
+        item = ws.get_item(b).item
+        assert (item.published_url, item.published_external_id, item.published_at) == \
+            (link(4), "urn:li:share:4", db._fmt(later))
+        # D: v2's API post could not move the item; 게시 완료 표시 then records the v2 post (no v1 address or time)
+        d = _approved(ws)
+        _post(ws, d, "urn:li:share:5", link(5), now=NOW)
+        _edited_and_approved(ws, d)
+        monkeypatch.setattr(ws, "_mark_item_published_via_api", lambda *args, **kwargs: db.PUBLISH_ITEM_UPDATE_ERROR)
+        v2, item = _post(ws, d, "urn:li:share:6", "", now=later)
+        monkeypatch.undo()
+        assert item is None and ws.get_item(d).item.published_url == link(5)
+        item = ws.set_item_status(d, "published")
+        assert (item.published_via, item.published_external_id, item.published_url, item.published_at) == \
+            ("linkedin_api", "urn:li:share:6", "", db._fmt(later))
+
+
+def test_review_and_revise_refuse_a_publish_locked_item_before_any_paid_call(tmp_path, settings):
+    """actions.review_item / revise_item check the publish lock first: no run row, no backend call."""
+    from insia_agents import actions
+
+    class Boom:  # any backend use would be a paid call on a result that could never be stored
+        name = "boom"
+        model = "boom"
+
+        def __getattr__(self, attr):
+            raise AssertionError(f"backend used while the item is locked: {attr}")
+
+    ws = Workspace(tmp_path / "ws")
+    try:
+        item_id = _approved(ws)
+        _connect(ws)
+        attempt, _token = _begin(ws, item_id)
+        runs_before = len(ws.list_runs())
+        for call in (lambda: actions.review_item(ws, item_id, settings=settings, backend=Boom()),
+                     lambda: actions.revise_item(ws, item_id, "짧게", settings=settings, backend=Boom())):
+            with pytest.raises(ItemLockedError) as info:
+                call()
+            assert info.value.attempt_id == attempt.id and info.value.status == "sending"
+        assert len(ws.list_runs()) == runs_before
+    finally:
+        ws.close()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import threading
 import time
@@ -56,7 +57,35 @@ BLOCKER_RENDER_UNAVAILABLE = "render_unavailable"      # Instagram: no Playwrigh
 
 # GET /api/items/<id> ``publish.blocked_by`` values (DESIGN.md 6-2).
 BLOCKED_BY: tuple[str, ...] = ("", "not_approved", "version_changed", "published", "published_attempt",
-                               "archived", "agent_job")
+                               "already_published", "archived", "agent_job")
+
+# Worker progress steps (``PublishAttempt.step``) in the words people see — one table for the dashboard (the
+# attempt JSON's ``step_label``) and ``insia publish send`` (its progress lines). ``children 3/8`` is built below.
+STEP_LABELS: dict[str, str] = {
+    "check": "연결 확인", "media": "이미지 올릴 준비", "self_check": "공개 주소 확인",
+    "polling": "인스타그램이 이미지를 처리하는 중", "carousel": "캐러셀 만드는 중", "write": "게시 요청 보내는 중",
+    "permalink": "게시물 주소를 받는 중",
+}
+_CHILDREN_STEP = re.compile(r"^children (\d+)/(\d+)$")
+NOTHING_POSTED = "아무것도 올라가지 않았어요."
+# publisher failure messages mostly say it already ("글은 올라가지 않았어요", "아무것도 게시되지 않았어요" …);
+# web/js/publish.js (failText) uses the same pattern
+_NOTHING_POSTED_SAID = re.compile(r"(올라가|올리|게시되|게시하)지 않았")
+
+
+def step_label(step: str | None) -> str:
+    """The Korean words for a worker step; ``""`` for a step without words (a machine name is never shown)."""
+    text = str(step or "").strip()
+    match = _CHILDREN_STEP.match(text)
+    if match:
+        return f"이미지 등록 {match.group(1)}/{match.group(2)}"
+    return STEP_LABELS.get(text, "")
+
+
+def with_nothing_posted(message: str | None) -> str:
+    """A failed attempt's message that says "nothing was posted" exactly once."""
+    text = str(message or "").strip() or "이유를 받지 못했어요."
+    return text if _NOTHING_POSTED_SAID.search(text) else f"{text} {NOTHING_POSTED}"
 
 # LinkedIn OAuth (DESIGN.md 3-1). The callback answers only ``303 Location: CALLBACK_REDIRECT.format(result=…)``
 # where ``result`` is one of CALLBACK_RESULTS; the dashboard draws the Korean sentence itself.
@@ -804,13 +833,13 @@ __all__ = [
     "BLOCKER_RENDER_UNAVAILABLE", "CALLBACK_REDIRECT", "CALLBACK_RESULTS", "CHANNEL_PLATFORM",
     "CONFIRM_CODE_ALPHABET", "CONFIRM_CODE_LENGTH", "FAKE_VIA", "LINKEDIN_CALLBACK_PATH", "LINKEDIN_VISIBILITIES",
     "MEDIA_PATH_PATTERN", "OAUTH_COOKIE_NAME", "OAUTH_COOKIE_PATH", "OAUTH_STATE_TTL_SECONDS", "PLATFORM_LABELS",
-    "PREVIEW_HASH_SCHEMA", "PREVIEW_TTL_SECONDS", "PUBLISHED_VIA_API", "PUBLISH_PLATFORMS", "READINESS_STATES",
-    "VISIBILITY_LABELS",
+    "NOTHING_POSTED", "PREVIEW_HASH_SCHEMA", "PREVIEW_TTL_SECONDS", "PUBLISHED_VIA_API", "PUBLISH_PLATFORMS",
+    "READINESS_STATES", "STEP_LABELS", "VISIBILITY_LABELS",
     "AttemptGuard", "CallbackResult", "Clock", "ConnectStart", "HumanConfirmation", "InstagramPreviewOptions",
     "LinkedInPreviewOptions", "Outcome", "PlatformId", "PreviewDraft", "PreviewOptions", "PreviewResult",
     "Publisher", "Readiness", "ReadinessState", "SendOutcome", "SystemClock", "ValidationIssue",
     "canonical_json", "channel_platform", "confirm_code_hash", "new_confirm_code", "normalize_confirm_code",
-    "parse_preview_options", "payload_hash", "platform_label",
+    "parse_preview_options", "payload_hash", "platform_label", "step_label", "with_nothing_posted",
     "AccountTypeError", "AlreadyPublishedError", "AttemptStateError", "AttemptTakenOverError",
     "ConfirmCodeError", "ConfirmationMismatchError", "ConnectError", "HostingError", "InvalidInputError",
     "InvalidOptionsError", "InvalidTokenError", "ItemLockedError", "NotConfiguredError", "NotConnectedError",

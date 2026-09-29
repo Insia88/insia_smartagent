@@ -5,12 +5,19 @@
 #      INSIA_ACCESS_TOKEN=<python -c "import secrets; print(secrets.token_urlsafe(32))" 로 만든 값>
 #      INSIA_MAX_COST_USD=5
 # 2) Linux라면 처음 한 번: mkdir -p workspace && sudo chown 10001:10001 workspace
+#    (그 뒤 호스트 사용자는 workspace를 읽기만 할 수 있어요. 파일을 넣고 뺄 때는 docker compose cp:
+#     docker compose cp 회사소개서.pdf insia:/tmp/ → docker compose exec insia insia docs add /tmp/회사소개서.pdf)
 # 3) docker compose up -d --build  →  http://127.0.0.1:8765 에서 토큰으로 로그인
 #
-# 매일 아침 초안 만들기(호스트의 cron): docker compose exec -T insia insia run-due --limit 3
-#   (run-due는 초안만 만들고 절대 게시하지 않아요)
+# 매일 아침 초안 만들기(호스트의 cron): docker compose exec -T insia insia run-due --limit 3 >> $HOME/insia-run-due.log 2>&1
+#   (run-due는 초안만 만들고 절대 게시하지 않아요. 로그는 호스트 사용자가 쓸 수 있는 곳에: workspace/logs로 보내면
+#    Linux에서는 로그 파일을 만들지 못해 명령이 아예 돌지 않아요)
 # 백업: docker compose exec insia insia backup --out /data/backups/<날짜>  (API 게시 토큰이 든 credentials/는 빠져요.
 #   /data/credentials는 uid 10001 소유 0700이라 호스트에서 workspace를 통째로 복사하면 권한 오류가 나요)
+#   호스트로 꺼내기: workspace/backups/<날짜>를 복사하거나 docker compose cp insia:/data/backups/<날짜> ./insia-backup-<날짜>
+#   복원(Linux): docker compose stop → sudo rm -f workspace/insia.db-wal workspace/insia.db-shm
+#     → sudo cp -r <백업 폴더>/. workspace/ → sudo chown -R 10001:10001 workspace → docker compose start
+#     (chown을 빼먹으면 컨테이너가 DB에 쓰지 못해요. 자세히: docs/operations.md "6. 백업과 복원")
 #
 # API 게시(선택, LinkedIn·인스타그램): 사람이 대시보드에서 미리보기를 확인하고 누를 때만 한 건씩 올려요.
 #   설정 순서는 docs/operations.md "12. API 게시". 토큰은 /data/credentials/(0600)에만 저장돼요.
@@ -19,6 +26,8 @@
 #   인스타그램(시험 중, 기본 꺼짐): .env에 INSIA_PUBLISH_INSTAGRAM=1, 카드 이미지를 그리려면 INSIA_WITH_RENDER=1로 다시 빌드,
 #     이미지만 공개할 https 주소(INSIA_MEDIA_BASE_URL)와 미디어 포트(INSIA_MEDIA_PORT=8766) + 아래 ports의 8766 줄 주석 해제.
 #     대시보드(8765)는 계속 127.0.0.1에만 두고, 터널·프록시는 8766의 /pub/m/ 경로만 연결해요.
+#     대시보드를 이미 INSIA_PUBLIC_HOSTS 도메인으로 공개했다면(구성 B): INSIA_MEDIA_BASE_URL=https://그-도메인,
+#     INSIA_MEDIA_PORT는 비워 둬요(값이 있으면 대시보드 포트가 이미지를 내주지 않아요).
 #   끄기: INSIA_PUBLISH=0 (게시 기능 전체를 숨겨요)
 services:
   insia:

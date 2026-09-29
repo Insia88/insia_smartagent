@@ -11,7 +11,7 @@ from ..config import KST
 from .compare import render_compare
 
 STATUS_LABELS = {"ok": "완료", "partial": "일부 완료", "error": "실패", "budget_stopped": "예산 상한으로 멈춤",
-                 "timeout": "시간 초과", "skipped": "건너뜀"}
+                 "timeout": "시간 초과", "skipped": "건너뜀", "cancelled": "중단"}
 FAILURE_LABELS = {"budget": "예산", "api": "API 오류", "refusal": "모델 거절", "timeout": "시간 초과",
                   "cancelled": "중단", "harness": "평가 도구 오류"}
 
@@ -68,6 +68,10 @@ def _failures(summary: dict[str, Any]) -> list[str]:
             if channel["status"] not in ("ok", "partial"):
                 lines.append(f"- **{case['id']} · {channel_label(channel['channel'])}** 평가하지 못했어요 "
                              f"({STATUS_LABELS.get(channel['status'], channel['status'])}): {_cell(channel.get('error'), 160)}")
+            elif channel.get("reps_ok", 0) < channel.get("reps", 0):
+                missed = channel["reps"] - channel["reps_ok"]
+                lines.append(f"- **{case['id']} · {channel_label(channel['channel'])}** 반복 {channel['reps']}번 중 {missed}번은 "
+                             f"평가하지 못했어요(실행 문제라 품질 실패로 세지 않아요): {_cell(channel.get('error'), 160)}")
         if case.get("model_mismatch"):
             lines.append(f"- **{case['id']}** 요청한 모델과 다른 모델이 응답했어요: {', '.join(case['model_mismatch'])} "
                          "(서버 측 거절 대체일 수 있어요. 이 케이스 점수는 조심해서 보세요)")
@@ -92,6 +96,9 @@ def render_report(summary: dict[str, Any]) -> str:
         cost += f" + LLM 비교 채점 {_usd(t['judge_cost_usd'])}"
     if t.get("discarded_cost_usd"):
         cost += f" + 다시 돌리느라 버린 이전 시도 {_usd(t['discarded_cost_usd'])}"
+    if t.get("unlisted_cost_usd", 0) >= 0.005:
+        cost += (f" + 요약 밖 {_usd(t['unlisted_cost_usd'])}(중단·시간 초과 뒤 끝난 호출, 요약에 넣지 않은 이전 결과) = "
+                 f"**이 폴더에서 쓴 비용 {_usd(t.get('folder_cost_usd'))}**")
     if t.get("cost_per_case") and t["cost_usd"]:
         c = t["cost_per_case"]
         cost += f" (케이스당 평균 {_usd(c['mean'])}, 최소 {_usd(c['min'])} · 최대 {_usd(c['max'])})"
@@ -102,11 +109,26 @@ def render_report(summary: dict[str, Any]) -> str:
     if summary.get("stopped"):
         out.append(f"- 멈춤: {summary['stopped']}")
     if summary.get("interrupted"):
-        out.append("- 중단: 사용자가 도중에 멈춰서 끝난 케이스까지만 담았어요.")
+        out.append("- 중단: 사용자가 도중에 멈춰서 끝난 실행과 중단한 실행까지만 담았어요. 쓴 비용은 `spend.jsonl`에 모두 있고 "
+                   "`--resume`이 예산에 넣어요.")
+    if t.get("cost_incomplete_runs"):
+        out.append(f"- 비용 일부 빠짐: 실행 {t['cost_incomplete_runs']}번은 멈춘 뒤에도 진행 중이던 호출이 있어서 그 비용이 케이스 "
+                   "비용에 빠져 있어요(평가 중에 끝나면 `spend.jsonl`과 예산에는 들어가요).")
+    carried = (summary.get("carried") or {})
+    if carried.get("cases"):
+        out.append(f"- 이전 결과 그대로: 이번에 돌리지 않은 케이스 {len(carried['cases'])}개({', '.join(carried['cases'])})는 "
+                   "이 폴더의 이전 결과를 같은 설정 그대로 담았어요.")
+    if carried.get("left_out"):
+        out.append(f"- 요약에서 뺀 이전 결과: {', '.join(carried['left_out'])} (모드나 설정이 다르거나 저장된 실행을 다시 채점할 수 없어서요. 비용은 폴더 비용에 들어가요)")
+    if carried.get("dropped_channels"):
+        shown = ", ".join(f"{case_id} {channel_label(channel)}" for case_id, channel in carried["dropped_channels"])
+        out.append(f"- 요약에서 빠진 이전 채널: {shown} (모드·설정·케이스가 달라 이번에 다시 돌리지 않았어요. 비용은 폴더 비용에 들어가요)")
     resumed = summary.get("resumed") or {}
-    if resumed.get("reused_runs"):
-        out.append(f"- 이어서 실행: 이전에 끝난 실행 {resumed['reused_runs']}번을 다시 쓰고, 그때 쓴 비용 "
-                   f"{_usd(resumed.get('prior_cost_usd'))}도 예산에 넣었어요.")
+    if resumed.get("reused_runs") or resumed.get("prior_cost_usd"):
+        regraded = (f" (그중 {resumed['regraded_runs']}번은 채점 코드가 바뀌어 저장된 결과로 다시 채점했어요)"
+                    if resumed.get("regraded_runs") else "")
+        out.append(f"- 이어서 실행: 이전에 끝난 실행 {resumed.get('reused_runs', 0)}번을 다시 쓰고{regraded}, 이 폴더에서 이미 쓴 비용 "
+                   f"{_usd(resumed.get('prior_cost_usd'))}을 먼저 예산에 넣었어요.")
     out.append("")
     if mode == "mock":
         out.append("> **mock 모드 결과예요.** API를 부르지 않아서, 샘플 브리프는 녹화된 실행을, 나머지는 `[데모]` 템플릿을 채점해요. "

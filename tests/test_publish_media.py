@@ -100,6 +100,23 @@ def test_cleanup_removes_finished_expired_and_old_staging(tmp_path):
     assert host.cleanup()["public"] == 1 and not any(host.public_root.iterdir())
 
 
+
+def test_cleanup_leaves_a_public_folder_that_is_still_being_written(tmp_path):
+    """publish() writes the images first and .expires last: a cleanup (server start, 6-hourly job) that runs in
+    between must not delete the images of a send in progress; a stale leftover without .expires still goes."""
+    import os
+
+    clock = {"now": time.time()}
+    host = PublicMediaHost(tmp_path / "publish", now=lambda: clock["now"])
+    rows = host.write_staging(PREVIEW, [b"\xff\xd8a"])
+    token = new_media_token()
+    host.publish(PREVIEW, token, [rows[0]["sha256"]])
+    (host.public_root / token / EXPIRES_FILE).unlink()  # the moment before publish() writes .expires
+    assert host.cleanup()["public"] == 0 and (host.public_root / token).is_dir()
+    old = clock["now"] - 3600
+    os.utime(host.public_root / token, (old, old))  # a crash left it behind an hour ago
+    assert host.cleanup()["public"] == 1 and not (host.public_root / token).exists()
+
 def _get(url, method="GET"):
     request = urllib.request.Request(url, method=method)
     try:

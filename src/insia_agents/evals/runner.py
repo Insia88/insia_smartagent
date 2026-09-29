@@ -10,26 +10,50 @@ Output folder (``--out``, default ``evals/results/<시각>-<mode>``)::
 
     summary.json        totals, per-case/channel results, assertion outcomes (compare reads this)
     report.md           Korean report: failures first, table per case/channel, regressions vs baseline
-    cases/<id>.json     the case, every rep's full grade (final draft, numbers with status, checks, review)
-    runs/<id>/          the pipeline's own run folder (brief, plan, research, drafts, reviews, events.jsonl)
+    cases/<id>.json     the case, the settings it ran with, every rep's full grade (final draft, numbers with
+                        status, checks, review); rewritten after every rep, so a finished rep survives Ctrl+C
+    runs/<id>/          the pipeline's own run folder (brief, plan, research, drafts, reviews, events.jsonl and
+                        result.json, which --resume re-grades when only the grader code changed)
+    spend.jsonl         (live) the folder's spend ledger: one line per billed API response, written the moment
+                        the usage arrives — also for a run that is interrupted or timed out afterwards
 
 Live mode never starts without ``--max-cost-usd``, credentials and a known
 price for the model (an unpriced model is metered at $0, so no cap could
 trip); it prints the planned runs and an estimate first, gives each run the
 remaining budget as its pipeline cap (``Settings.max_cost_usd``) and stops
 the eval once the cap is reached — or as soon as a response comes from a
-model it cannot price. Failures that produced no gradable output (API error,
-refusal, timeout, budget stop) are recorded with a failure class and never
-scored as a quality failure.
+model it cannot price (also a server-side fallback whose declined attempt
+was priced). The remaining budget is always ``--max-cost-usd`` minus the
+ledger total, so a call that finishes after a timeout or an interrupted run
+still counts; a new run never starts while a timed-out run's call is still
+in flight (the eval waits for it up to ``--timeout-s``, then stops rather
+than start with a cap that leaves that call out). Failures that produced no
+gradable output (API error, refusal, timeout, budget stop, Ctrl+C) are
+recorded with a failure class and never scored as a quality failure — with
+``--reps``, a must that some reps could not evaluate is "not evaluated", not
+failed, unless an evaluated rep failed it. Ctrl+C at any point (also while
+the eval waits for a late call at the end) still writes ``summary.json`` and
+``report.md``.
 
 ``--resume`` reuses a finished run only when the case file, the planned
-channels and the mode are unchanged (anything else is run again), and the
-cap covers the whole eval folder: what earlier attempts already spent on the
-planned cases (reused runs and replaced ones) is counted first.
+channels, the mode and the settings (model, max rounds, pass score, effort
+per role, server-side fallback, document and web-search limits, prompt
+files, run code) are unchanged; anything else is run again. When only the
+grader code changed, the saved runs (``runs/<id>/result.json``) are graded
+again for free. A narrower ``--channels`` than the folder ran a case with is
+refused (the other channels' valid results would silently leave the summary
+and any comparison against it). The cap covers the whole eval folder:
+everything in ``spend.jsonl`` (every case, reused runs, replaced ones,
+interrupted ones) is counted first. Cases of the folder that this invocation
+does not plan (``--case`` narrower than before) stay in ``summary.json`` as
+they were when their settings match, and a Ctrl+C mid-resume keeps the
+earlier finished reps it had not reached yet, so the summary — and a
+comparison against it — still covers the whole folder.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import statistics
@@ -57,6 +81,12 @@ DEFAULT_MOCK_TODAY = "2026-09-28"  # mock runs are dated the same way every time
 DEFAULT_TIMEOUT_S = 1800.0
 DEFAULT_MAX_SCORE_DROP = 5.0
 OK_STATUSES = ("ok", "partial")
+SPEND_FILE = "spend.jsonl"
+# After a timeout or Ctrl+C the pipeline is cancelled at its next step, but the API call in flight still finishes (and
+# is billed). Wait this long for it (never longer than --timeout-s) so its cost lands in the record.
+TIMEOUT_GRACE_S = 30.0
+INTERRUPT_GRACE_S = 2.0
+LATE_WAIT_S = 30.0  # at the end of the eval: how long to wait for calls still running after a timeout
 
 Printer = Callable[[str], None]
 
@@ -122,16 +152,78 @@ def plan_cases(cases: Sequence[EvalCase], channels: Sequence[str]) -> tuple[list
 # ---------------------------------------------------------------------------
 
 
+class SpendLedger:
+    """What the eval folder has spent: ``spend.jsonl``, one line per billed response, appended as the usage arrives.
+
+    It is the budget's source of truth. ``cases/<id>.json`` is written only between runs, so a run interrupted with
+    Ctrl+C, or a call that finishes after a timeout, would otherwise vanish from the cap and from ``--resume``.
+    ``path=None`` (mock) keeps the total in memory only. Thread-safe (live channels report from worker threads)."""
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+        self._total = 0.0
+        self._lock = threading.Lock()
+        if path is not None and path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    self._total += max(0.0, float(json.loads(line).get("cost_usd") or 0.0))
+                except (ValueError, TypeError, AttributeError):
+                    continue  # a line cut short by a crash: skip it
+
+    @property
+    def total(self) -> float:
+        with self._lock:
+            return round(self._total, 6)
+
+    def add(self, cost_usd: float, **fields: Any) -> None:
+        cost = max(0.0, float(cost_usd or 0.0))
+        line = json.dumps({"at": _iso_now(), **fields, "cost_usd": round(cost, 8)}, ensure_ascii=False)
+        with self._lock:
+            self._total += cost
+            if self.path is not None:
+                try:
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    with self.path.open("a", encoding="utf-8") as handle:
+                        handle.write(line + "\n")
+                except OSError:
+                    pass  # the in-memory total still guards this invocation's cap
+
+    def seed_from_case_files(self, out_root: Path) -> float:
+        """A folder written before the ledger existed: carry what its case files say was spent (once)."""
+        if self.path is not None and self.path.exists():
+            return 0.0
+        carried = 0.0
+        for path in sorted((out_root / "cases").glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            spent = _case_file_spent(data)
+            if spent:
+                self.add(spent, kind="carried", case=path.stem, note="이전 결과 파일(cases/)에 적힌 비용")
+                carried += spent
+        return carried
+
+
+def _case_file_spent(data: dict[str, Any]) -> float:
+    reps = [r for r in data.get("reps", []) if isinstance(r, dict)]
+    return float(data.get("discarded_cost_usd") or 0.0) + sum(_record_cost(r) for r in reps)
+
+
 class UsageCollector:
     """``backend.on_usage`` target (the pipeline's meter forwards every priced record here).
 
-    With ``prices`` (live), a record with tokens from a model that has no price is noted in ``unpriced``: its cost
-    was metered as $0, so the budget cap cannot see it and the eval stops."""
+    With ``prices`` (live), a record with tokens served by a model that has no price is noted in ``unpriced``: that
+    model's tokens were metered as $0, so the budget cap cannot see them and the eval stops. With ``ledger``, every
+    record is also appended to the folder's spend ledger (tagged with ``tags``) the moment it arrives."""
 
-    def __init__(self, prices: dict[str, Any] | None = None) -> None:
+    def __init__(self, prices: dict[str, Any] | None = None, *, ledger: SpendLedger | None = None,
+                 tags: dict[str, Any] | None = None) -> None:
         self.records: list[UsageRecord] = []
         self.unpriced: set[str] = set()
         self._prices = prices
+        self._ledger = ledger
+        self._tags = dict(tags or {})
         self._lock = threading.Lock()
 
     def __call__(self, record: UsageRecord) -> None:
@@ -140,6 +232,9 @@ class UsageCollector:
             self.records.append(record)
             if unpriced:
                 self.unpriced.add(record.model or "?")
+        if self._ledger is not None:
+            self._ledger.add(float(record.cost_usd or 0.0), **self._tags, model=record.model, agent=record.agent,
+                             task=record.task, input_tokens=record.input_tokens, output_tokens=record.output_tokens)
 
     @property
     def cost(self) -> float:
@@ -161,10 +256,13 @@ class UsageCollector:
 
 
 def _is_unpriced(record: UsageRecord, prices: dict[str, Any]) -> bool:
+    """Tokens served by a model without a price. ``record.model`` is the served model: after a server-side refusal
+    fallback it is the fallback, and the record's cost is not 0 (the declined attempt at the requested, priced model is
+    billed), so the cost cannot tell. The requested model is checked before the eval starts."""
     from ..costs import price_for
 
     tokens = record.input_tokens or record.output_tokens or record.cache_read_tokens or record.cache_write_tokens
-    return bool(tokens) and not float(record.cost_usd or 0.0) and price_for(record.model or "", prices=prices) is None
+    return bool(tokens) and price_for(record.model or "", prices=prices) is None
 
 
 def _live_prices(base: Settings) -> dict[str, Any]:
@@ -237,8 +335,11 @@ def _served_mismatch(requested: str, models: list[str], mode: str) -> list[str]:
 
 def run_case(planned: PlannedCase, rep: int, base: Settings, options: EvalOptions, out_root: Path, *,
              remaining_cap: float | None, client: Any = None, backend_factory: Callable[[Settings], Any] | None = None,
-             printer: Printer | None = None, reps: int = 1) -> dict[str, Any]:
-    """Run one case once and grade every channel. Never raises for a failed run (KeyboardInterrupt excepted)."""
+             printer: Printer | None = None, reps: int = 1, ledger: SpendLedger | None = None) -> dict[str, Any]:
+    """Run one case once and grade every channel. Never raises for a failed run.
+
+    Ctrl+C (``KeyboardInterrupt``) is re-raised after the run is cancelled, with the partial record (what the run
+    spent so far, failure class ``cancelled``) attached as ``exc.eval_record`` so the caller can still write it."""
     from ..db import Workspace
     from ..pipeline import BudgetExceeded, ThreadRunner, build_context, prepare_run, run_pipeline
 
@@ -254,13 +355,17 @@ def run_case(planned: PlannedCase, rep: int, base: Settings, options: EvalOption
     settings = replace(base, home=tmp, out_dir=out_root / "runs", today=today,
                        max_cost_usd=max(0.0, remaining_cap) if remaining_cap is not None else 0.0)
     brief = case.brief.model_copy(update={"channels": list(channels)})
-    collector = UsageCollector(_live_prices(base) if options.mode == "live" else None)
+    collector = UsageCollector(_live_prices(base) if options.mode == "live" else None, ledger=ledger,
+                               tags={"kind": "run", "case": case.id, "rep": rep, "run_id": run_id})
     result: RunResult | None = None
     failure: dict[str, str] | None = None
     context = None
     workspace = None
     bus = None
+    runner = None
+    worker: _Worker | None = None
     thread_alive = False
+    interrupted: KeyboardInterrupt | None = None
     started = time.monotonic()
     try:
         workspace = Workspace(tmp)
@@ -280,26 +385,17 @@ def run_case(planned: PlannedCase, rep: int, base: Settings, options: EvalOption
             box: dict[str, Any] = {}
 
             def work() -> None:
-                try:
-                    box["result"] = run_pipeline(brief, backend, bus, settings, runner=runner, out_dir=settings.out_dir,
-                                                 mode_note=note, workspace=workspace, context=context)
-                except BaseException as exc:  # noqa: BLE001 - handed to the main thread
-                    box["error"] = exc
+                box["result"] = run_pipeline(brief, backend, bus, settings, runner=runner, out_dir=settings.out_dir,
+                                             mode_note=note, workspace=workspace, context=context)
 
-            worker = threading.Thread(target=work, name=f"insia-eval-{case.id}", daemon=True)
-            worker.start()
+            worker = _Worker(work, box, name=f"insia-eval-{case.id}")
             deadline = started + options.timeout_s
-            try:
-                while worker.is_alive() and time.monotonic() < deadline:
-                    worker.join(min(0.5, max(0.01, deadline - time.monotonic())))
-            except BaseException:  # Ctrl+C: stop the channels at their next step
-                runner.cancel()
-                raise
-            if worker.is_alive():
-                runner.cancel()
-                thread_alive = True
-                _reap_later(worker, workspace, tmp)
-                failure = _failure("timeout", f"{options.timeout_s:g}초 안에 끝나지 않아 멈췄어요 (진행 중이던 호출은 끝까지 갈 수 있어요)")
+            while worker.alive and time.monotonic() < deadline:
+                worker.wait(min(0.5, max(0.01, deadline - time.monotonic())))
+            if worker.alive:
+                runner.cancel()  # stop the channels at their next step
+                worker.wait(min(TIMEOUT_GRACE_S, options.timeout_s))  # the call in flight is billed: wait for it
+                failure = _failure("timeout", f"{options.timeout_s:g}초 안에 끝나지 않아 멈췄어요")
             elif "error" in box:
                 raise box["error"]
             else:
@@ -308,52 +404,58 @@ def run_case(planned: PlannedCase, rep: int, base: Settings, options: EvalOption
             result = run_pipeline(brief, backend, bus, settings, out_dir=settings.out_dir, mode_note=note,
                                   workspace=workspace, context=context)
         record["model"] = getattr(backend, "model", record["model"])
-    except KeyboardInterrupt:
-        raise
+    except KeyboardInterrupt as exc:  # Ctrl+C: cancel the run, keep what it spent, re-raise below
+        interrupted = exc
+        result = None
+        if runner is not None:
+            runner.cancel()
+        if worker is not None:
+            worker.wait(min(INTERRUPT_GRACE_S, options.timeout_s))
+        failure = _failure("cancelled", "평가를 도중에 멈췄어요 (Ctrl+C)")
     except BudgetExceeded as exc:
         failure = _classify(exc)
         result = exc.result
     except BaseException as exc:  # noqa: BLE001 - recorded with its failure class
         failure = _classify(exc)
     finally:
-        if workspace is not None and not thread_alive:
-            try:
-                workspace.close()
-            except Exception:  # noqa: BLE001
-                pass
-        if not thread_alive:
+        # A worker still running (after a timeout or Ctrl+C) keeps its workspace until it ends; closing it under the
+        # worker would only turn its last event and usage writes into errors.
+        thread_alive = worker is not None and worker.alive
+        if thread_alive:
+            _reap_later(worker, workspace, tmp)  # type: ignore[arg-type]
+        else:
+            if workspace is not None:
+                try:
+                    workspace.close()
+                except Exception:  # noqa: BLE001
+                    pass
             shutil.rmtree(tmp, ignore_errors=True)
 
     record["wall_s"] = round(time.monotonic() - started, 2)
     record["duration_s"] = round(bus.clock.now(), 1) if bus is not None else record["wall_s"]
-    record["cost_usd"] = collector.cost
-    usage = collector.summary()
-    record["usage"] = usage
-    record["served_models"] = usage["models"]
-    record["model_mismatch"] = _served_mismatch(record["model"] or base.model, usage["models"], options.mode)
-    record["unpriced_models"] = sorted(collector.unpriced)
+    _fill_usage(record, collector, base, options)
     if failure is not None and failure["class"] == "budget" and remaining_cap is not None:
         failure = _failure("budget", f"평가 예산 상한에 닿아 멈췄어요 (이 케이스 몫으로 남은 예산 {_usd(max(0.0, remaining_cap))}, "
                                      f"이 케이스에서 쓴 비용 {_usd(record['cost_usd'])})")
+    if thread_alive and failure is not None:
+        # the call in flight finishes later: its cost reaches the spend ledger (and the budget), not this record yet
+        record["cost_incomplete"] = True
+        record["_late"] = (collector, worker)
+        failure = _failure(failure["class"], failure["message"] + f" · {LATE_COST_NOTE}")
+    elif worker is not None and failure is not None and failure["class"] in ("timeout", "cancelled"):
+        failure = _failure(failure["class"], failure["message"] + " · 진행 중이던 호출 비용까지 넣었어요")
     record["failure"] = failure
 
     errors = _channel_errors(bus) if bus is not None and result is not None else {}
     graded: dict[str, dict[str, Any]] = {}
     if result is not None:
-        evidence = Evidence.build(result.research, profile=case.profile,
-                                  documents=context.documents if context is not None else [], brief=result.brief)
-        for channel_result in result.results:
-            if channel_result.channel not in channels:
-                continue
-            grade = grade_channel(case, channel_result, result.research, evidence)
-            apply_assertions(case, grade, options.mode)
-            graded[channel_result.channel] = grade
+        graded = _grade_result(case, channels, result, context.documents if context is not None else [], options.mode)
     for channel in channels:
         if channel in graded:
             record["channels"].append(graded[channel])
             continue
         if failure is not None:
-            status, reason = ("budget_stopped" if failure["class"] == "budget" else "error"), failure["message"]
+            status, reason = FAILURE_STATUS.get(failure["class"], "error"), failure["message"]
         else:
             status, reason = "error", errors.get(channel) or "채널 결과가 없어요"
         entry = {"channel": channel, "status": status, "error": reason}
@@ -368,7 +470,7 @@ def run_case(planned: PlannedCase, rep: int, base: Settings, options: EvalOption
     elif done:
         record["status"] = "partial"
     else:
-        record["status"] = {"budget": "budget_stopped", "timeout": "timeout"}.get((failure or {}).get("class", ""), "error")
+        record["status"] = RECORD_FAILURE_STATUS.get((failure or {}).get("class", ""), "error")
     for kind in ("must", "should"):
         applicable = [a for a in case.assertions(kind) if a.applies("*", options.mode)]
         if record["status"] in OK_STATUSES:
@@ -376,15 +478,130 @@ def run_case(planned: PlannedCase, rep: int, base: Settings, options: EvalOption
                             for a in applicable]
         else:
             record[kind] = [not_evaluated(a, "실행이 끝나지 않아 평가하지 못했어요") for a in applicable]
+    if interrupted is not None:
+        interrupted.eval_record = record  # type: ignore[attr-defined]
+        raise interrupted
     return record
 
 
-def _reap_later(worker: threading.Thread, workspace: Any, tmp: Path) -> None:
-    """After a timeout the pipeline thread may still finish a call: close its workspace and delete the temporary
-    folder once it ends (a daemon thread, so a finished eval never waits for it)."""
+def _grade_result(case: EvalCase, channels: Sequence[str], result: RunResult, documents: Sequence[Any],
+                  mode: str) -> dict[str, dict[str, Any]]:
+    """Grade every planned channel of a finished run (also used to re-grade a saved run with new grader code)."""
+    evidence = Evidence.build(result.research, profile=case.profile, documents=documents, brief=result.brief)
+    graded: dict[str, dict[str, Any]] = {}
+    for channel_result in result.results:
+        if channel_result.channel not in channels:
+            continue
+        grade = grade_channel(case, channel_result, result.research, evidence)
+        apply_assertions(case, grade, mode)
+        graded[channel_result.channel] = grade
+    return graded
+
+
+LATE_COST_NOTE = "진행 중이던 호출 비용은 이 기록에 빠져 있어요 (평가 중에 끝나면 spend.jsonl과 예산에는 들어가요)"
+# failure class → status of a channel / a record that produced no gradable output
+FAILURE_STATUS = {"budget": "budget_stopped", "timeout": "timeout", "cancelled": "cancelled"}
+RECORD_FAILURE_STATUS = {"budget": "budget_stopped", "timeout": "timeout", "cancelled": "cancelled"}
+
+
+class _Worker:
+    """The pipeline thread of one live run. Liveness is its own ``done`` event, not ``Thread.is_alive()``: a Ctrl+C that
+    interrupts ``Thread.join()`` can leave CPython reporting a still-running thread as finished, and the workspace
+    would then be closed under it."""
+
+    def __init__(self, target: Callable[[], None], box: dict[str, Any], *, name: str) -> None:
+        self._done = threading.Event()
+
+        def run() -> None:
+            try:
+                target()
+            except BaseException as exc:  # noqa: BLE001 - handed to the main thread
+                box["error"] = exc
+            finally:
+                self._done.set()
+
+        threading.Thread(target=run, name=name, daemon=True).start()
+
+    @property
+    def alive(self) -> bool:
+        return not self._done.is_set()
+
+    def wait(self, seconds: float | None = None) -> bool:
+        """Wait up to ``seconds`` (``None``: until it ends); returns True once it has ended."""
+        if seconds is None:
+            return self._done.wait()
+        deadline = time.monotonic() + max(0.0, seconds)
+        while not self._done.is_set() and time.monotonic() < deadline:
+            self._done.wait(min(0.2, max(0.01, deadline - time.monotonic())))
+        return self._done.is_set()
+
+
+def _fill_usage(record: dict[str, Any], collector: UsageCollector, base: Settings, options: EvalOptions) -> None:
+    record["cost_usd"] = collector.cost
+    usage = collector.summary()
+    record["usage"] = usage
+    record["served_models"] = usage["models"]
+    record["model_mismatch"] = _served_mismatch(record["model"] or base.model, usage["models"], options.mode)
+    record["unpriced_models"] = sorted(collector.unpriced)
+
+
+def _late_records(states: list["_CaseRun"]) -> list[tuple["_CaseRun", dict[str, Any]]]:
+    """Records whose run kept a call in flight after a timeout or Ctrl+C (its cost is not in the record yet)."""
+    return [(state, record) for state in states for record in state.records if record.get("_late")]
+
+
+def _late_running(states: list["_CaseRun"]) -> bool:
+    return any(record["_late"][1].alive for _, record in _late_records(states))
+
+
+def _wait_late(states: list["_CaseRun"], wait_s: float) -> bool:
+    """Wait up to ``wait_s`` in total for the calls still in flight; True once none is running."""
+    deadline = time.monotonic() + max(0.0, wait_s)
+    for _, record in _late_records(states):
+        record["_late"][1].wait(max(0.0, deadline - time.monotonic()))
+    return not _late_running(states)
+
+
+def _refresh_late(states: list["_CaseRun"]) -> list["_CaseRun"]:
+    """Refresh the cost of records with a late call from their collectors (a finished call's cost lands in the record
+    and the note says so). Returns the cases whose records changed."""
+    changed: list[_CaseRun] = []
+    for state, record in _late_records(states):
+        collector, worker = record["_late"]
+        before = record["cost_usd"]
+        record["cost_usd"] = collector.cost
+        usage = collector.summary()
+        record["usage"], record["served_models"] = usage, usage["models"]
+        record["unpriced_models"] = sorted(collector.unpriced)
+        if not worker.alive:
+            record.pop("_late", None)
+            record.pop("cost_incomplete", None)
+            _replace_note(record, f" · {LATE_COST_NOTE}", " · 진행 중이던 호출 비용까지 넣었어요")
+        if record["cost_usd"] != before or "_late" not in record:
+            if state not in changed:
+                changed.append(state)
+    return changed
+
+
+def _replace_note(record: dict[str, Any], old: str, new: str) -> None:
+    """Rewrite a note in the record's failure message and everywhere it was copied (channel errors, outcome details)."""
+    if record.get("failure"):
+        record["failure"] = {**record["failure"], "message": record["failure"]["message"].replace(old, new)}
+    for holder in [record, *record.get("channels", [])]:
+        if isinstance(holder.get("error"), str):
+            holder["error"] = holder["error"].replace(old, new)
+        for kind in ("must", "should"):
+            for outcome in holder.get(kind, []):
+                if isinstance(outcome.get("detail"), str):
+                    outcome["detail"] = outcome["detail"].replace(old, new)
+
+
+def _reap_later(worker: _Worker, workspace: Any, tmp: Path) -> None:
+    """After a timeout or Ctrl+C the pipeline thread may still finish a call: close its workspace and delete the
+    temporary folder once it ends (a daemon thread, so a finished eval never waits for it)."""
 
     def reap() -> None:
-        worker.join()
+        worker.wait()
         try:
             if workspace is not None:
                 workspace.close()
@@ -404,6 +621,9 @@ def _live_listener(printer: Printer) -> Callable[[dict[str, Any]], None]:
             printer(f"    · {channel_label(data.get('channel', ''))} {data.get('score')}점 · 수정 {data.get('rounds')}회")
         elif event.get("type") == "run.failed":
             printer(f"    · 실행 멈춤: {data.get('error')}")
+        elif event.get("type") == "log" and data.get("level") in ("warn", "error"):
+            # e.g. a response from a model without a price, a refusal fallback, a retry
+            printer(f"    · {'주의' if data.get('level') == 'warn' else '오류'}: {data.get('message')}")
 
     return listen
 
@@ -414,27 +634,34 @@ def _live_listener(printer: Printer) -> Callable[[dict[str, Any]], None]:
 
 
 def _merge_outcomes(lists: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
-    """Strict per assertion key: passes only when it passed in every rep (an unevaluated rep counts as failed).
+    """Strict per assertion key: passes only when it passed in every rep.
 
-    ``error`` stays true only when no rep could evaluate the assertion (run error, budget stop, timeout)."""
-    merged: dict[str, dict[str, Any]] = {}
+    - an evaluated rep failed → failed (a quality failure), with that rep's detail;
+    - no evaluated rep failed but some rep could not be evaluated (API error, refusal, timeout, budget stop, Ctrl+C)
+      → not passed and ``error`` (an execution problem, counted in ``must_errors`` and never a regression), with
+      ``reps_unevaluated`` and a detail that says how many reps were not evaluated;
+    - otherwise passed."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for outcomes in lists:
         for outcome in outcomes:
-            key = outcome["key"]
-            entry = merged.get(key)
-            if entry is None:
-                entry = merged[key] = {**outcome, "passed": True, "reps": 0, "reps_passed": 0, "error": True}
-            entry["reps"] += 1
-            entry["reps_passed"] += int(bool(outcome["passed"]))
-            if not outcome.get("error"):
-                entry["error"] = False
-            if not outcome["passed"] and entry["passed"]:  # first failure: keep its detail
-                entry.update({k: v for k, v in outcome.items() if k not in ("reps", "reps_passed", "error")})
-            entry["passed"] = entry["passed"] and bool(outcome["passed"])
-    for entry in merged.values():
-        if not entry["error"]:
-            entry.pop("error")
-    return list(merged.values())
+            grouped.setdefault(outcome["key"], []).append(outcome)
+    merged: list[dict[str, Any]] = []
+    for outcomes in grouped.values():
+        unevaluated = [o for o in outcomes if o.get("error")]
+        failed = [o for o in outcomes if not o.get("error") and not o["passed"]]
+        base = failed[0] if failed else (unevaluated[0] if unevaluated else outcomes[0])
+        entry = {k: v for k, v in base.items() if k != "error"}
+        entry.update({"passed": not failed and not unevaluated, "reps": len(outcomes),
+                      "reps_passed": sum(1 for o in outcomes if o["passed"])})
+        if unevaluated:
+            entry["reps_unevaluated"] = len(unevaluated)
+        if unevaluated and not failed:
+            entry["error"] = True
+            if len(unevaluated) < len(outcomes):
+                entry["detail"] = (f"반복 {len(outcomes)}번 중 {len(unevaluated)}번은 평가하지 못했어요 (평가한 반복은 통과) — "
+                                   f"{base.get('detail', '')}")
+        merged.append(entry)
+    return merged
 
 
 def aggregate_channel(channel: str, grades: list[dict[str, Any]]) -> dict[str, Any]:
@@ -506,6 +733,7 @@ def aggregate_case(planned: PlannedCase, records: list[dict[str, Any]]) -> dict[
         "cost_usd": round(sum(r["cost_usd"] for r in records), 6),
         "judge_cost_usd": round(sum(r.get("judge_cost_usd", 0.0) for r in records), 6),
         "discarded_cost_usd": 0.0,
+        "cost_incomplete": any(r.get("cost_incomplete") for r in records),
         "duration_s": round(statistics.fmean(r["duration_s"] for r in records), 1) if records else 0.0,
         "wall_s": round(sum(r["wall_s"] for r in records), 2),
         "usage": _sum_usage([r.get("usage") or {} for r in records]),
@@ -588,14 +816,83 @@ def _write_json(path: Path, data: Any) -> None:
 
 
 def write_case_file(out_root: Path, planned: PlannedCase, records: list[dict[str, Any]], entry: dict[str, Any], *,
-                    mode: str = "", discarded_cost_usd: float = 0.0) -> Path:
-    """``discarded_cost_usd``: what earlier attempts in this folder spent on runs that ``--resume`` replaced."""
+                    mode: str = "", discarded_cost_usd: float = 0.0, settings: dict[str, Any] | None = None,
+                    grader: str = "") -> Path:
+    """``discarded_cost_usd``: what earlier attempts in this folder spent on runs that ``--resume`` replaced.
+    ``settings``: what the runs were made with (``run_settings``); ``--resume`` reuses them only when it matches.
+    ``grader``: the grader code the records were graded with (``grader_fingerprint``); when it differs, ``--resume``
+    grades the saved runs again (free) instead of running them again."""
     path = out_root / "cases" / f"{planned.case.id}.json"
-    _write_json(path, {"schema": SCHEMA_VERSION, "mode": mode, "channels": list(planned.channels),
-                       "case": planned.case.model_dump(mode="json"), "result": entry,
-                       "discarded_cost_usd": round(discarded_cost_usd, 6),
-                       "reps": [{**r, "channels": [public(g) for g in r["channels"]]} for r in records]})
+    _write_json(path, {"schema": SCHEMA_VERSION, "mode": mode, "settings": dict(settings or {}), "grader": grader,
+                       "channels": list(planned.channels), "case": planned.case.model_dump(mode="json"),
+                       "result": entry, "discarded_cost_usd": round(discarded_cost_usd, 6),
+                       "reps": [{**public(r), "channels": [public(g) for g in r["channels"]]} for r in records]})
     return path
+
+
+# Package code that decides what a run produces. Changing it makes --resume run the case again. The eval's own grader
+# code is fingerprinted separately (GRADER_CODE): a change there re-grades the saved runs for free.
+RUN_CODE = ("agents", "backends", "pipeline.py", "channels.py", "prompt_loader.py", "models.py", "schema.py")
+GRADER_CODE = ("evals/grounding.py", "evals/graders.py", "evals/cases.py")
+
+
+def _code_fingerprint(paths: Sequence[str]) -> str:
+    root = Path(__file__).resolve().parent.parent  # the insia_agents package
+    digest = hashlib.sha256()
+    for rel in paths:
+        target = root / rel
+        files = sorted(target.rglob("*.py")) if target.is_dir() else [target]
+        for file in files:
+            try:
+                data = file.read_bytes()
+            except OSError:
+                data = b""
+            digest.update(file.relative_to(root).as_posix().encode("utf-8") + b"\n" + data + b"\n")
+    return digest.hexdigest()[:12]
+
+
+def grader_fingerprint() -> str:
+    """The grader code (grounding, graders, case model) the records of this invocation are graded with."""
+    return _code_fingerprint(GRADER_CODE)
+
+
+def run_settings(base: Settings, options: "EvalOptions") -> dict[str, Any]:
+    """Everything besides the case file, channels and mode that changes what a run produces or how the reviewer judges
+    it: the model, max rounds, pass score, effort per role, server-side fallback, the document and web-search limits,
+    the prompt files (agent prompts + channel guides) and the run code (pipeline, agents, backends, channel rules), each
+    as a fingerprint."""
+    from .. import __version__
+
+    return {"model": base.model if options.mode == "live" else "mock", "max_rounds": base.max_rounds,
+            "pass_score": base.pass_score, "effort": dict(sorted(base.effort.items())), "fallbacks": base.fallbacks,
+            "max_document_chars": base.max_document_chars, "web_search_max_uses": base.web_search_max_uses,
+            "prompts": _prompts_fingerprint(), "code": _code_fingerprint(RUN_CODE), "version": __version__}
+
+
+def _prompts_fingerprint() -> str:
+    from ..prompt_loader import AGENT_PROMPTS, CHANNEL_GUIDES, PromptNotFoundError, load_prompt
+
+    digest = hashlib.sha256()
+    for kind, names in (("agents", AGENT_PROMPTS), ("channels", CHANNEL_GUIDES)):
+        for name in names:
+            try:
+                text = load_prompt(kind, name)
+            except PromptNotFoundError:
+                text = ""
+            digest.update(f"{kind}/{name}\n{text}\n".encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
+SETTING_LABELS = {"model": "모델", "max_rounds": "최대 수정 횟수", "pass_score": "통과 점수",
+                  "effort": "추론 노력(INSIA_EFFORT_*)", "fallbacks": "거절 시 대체 모델(INSIA_FALLBACKS)",
+                  "max_document_chars": "자료 글자 수 상한(INSIA_MAX_DOCUMENT_CHARS)", "web_search_max_uses": "웹 검색 횟수 상한",
+                  "prompts": "프롬프트 파일", "code": "파이프라인 코드", "version": "패키지 버전"}
+
+
+def settings_diff(before: dict[str, Any] | None, now: dict[str, Any]) -> list[str]:
+    """Korean labels of the settings that differ (an old case file without settings differs in everything)."""
+    before = before or {}
+    return [SETTING_LABELS.get(k, k) for k in now if before.get(k) != now[k]]
 
 
 def load_summary(folder: str | Path) -> dict[str, Any]:
@@ -737,9 +1034,15 @@ def _validate(options: EvalOptions) -> None:
 class PriorCase:
     """What an earlier attempt left in ``cases/<id>.json`` (``--resume``)."""
 
-    reusable: dict[int, dict[str, Any]]  # rep → finished record for the same case, channels and mode
+    reusable: dict[int, dict[str, Any]]  # rep → finished record for the same case, channels, mode and settings
     records: dict[int, dict[str, Any]]  # rep → any record (its cost was spent either way)
     discarded_cost_usd: float  # spent on attempts that an earlier resume already replaced
+    changed_settings: list[str] = field(default_factory=list)  # why finished records are not reused (labels)
+    channels: list[str] = field(default_factory=list)  # the channels the folder ran this case with
+    comparable: bool = False  # same case file, mode and settings: its results are valid now (channels aside)
+    grader: str = ""  # the grader code its records were graded with
+    regraded: int = 0  # reusable records graded again with the current grader code
+    regrade_failed: int = 0  # reusable records whose saved run could not be read back (run again)
 
     @property
     def spent(self) -> float:
@@ -750,14 +1053,172 @@ def _record_cost(record: dict[str, Any]) -> float:
     return float(record.get("cost_usd") or 0.0) + float(record.get("judge_cost_usd") or 0.0)
 
 
-def load_prior(out_root: Path, planned: PlannedCase, mode: str) -> PriorCase:
+def load_prior(out_root: Path, planned: PlannedCase, mode: str, settings: dict[str, Any] | None = None) -> PriorCase:
+    """``settings`` (``run_settings``): a record made with another model, pass score, effort, prompt files or run code
+    is never reused (an old case file without settings counts as different)."""
     data = load_case_file(out_root, planned.case.id) or {}
     records = {int(r["rep"]): r for r in data.get("reps", []) if isinstance(r, dict) and isinstance(r.get("rep"), int)}
-    same = (data.get("mode") == mode and data.get("case") == planned.case.model_dump(mode="json")
-            and data.get("channels", []) == list(planned.channels))
+    channels = [str(c) for c in data.get("channels") or []]
+    same_case = bool(data) and data.get("mode") == mode and data.get("case") == planned.case.model_dump(mode="json")
+    changed = settings_diff(data.get("settings"), settings) if settings is not None and same_case else []
+    comparable = same_case and not changed
+    same = comparable and channels == list(planned.channels)
     reusable = {rep: r for rep, r in records.items()
                 if same and r.get("status") == "ok" and [g.get("channel") for g in r.get("channels", [])] == planned.channels}
-    return PriorCase(reusable=reusable, records=records, discarded_cost_usd=float(data.get("discarded_cost_usd") or 0.0))
+    return PriorCase(reusable=reusable, records=records, discarded_cost_usd=float(data.get("discarded_cost_usd") or 0.0),
+                     changed_settings=changed if records else [], channels=channels, comparable=comparable,
+                     grader=str(data.get("grader") or ""))
+
+
+def _case_documents(case: EvalCase) -> list[Any]:
+    """The case's documents as the run saw them (a fresh workspace numbers them u1, u2, …)."""
+    from types import SimpleNamespace
+
+    return [SimpleNamespace(id=f"u{i}", title=doc.title, text=doc.text) for i, doc in enumerate(case.documents, 1)]
+
+
+def regrade_record(case: EvalCase, channels: Sequence[str], record: dict[str, Any], mode: str,
+                   out_root: Path) -> dict[str, Any] | None:
+    """Grade a saved record again with the current grader code, from its saved run (``runs/<id>/result.json``): no API
+    call. The reviewer's score and issues, the judge verdict and the cost stay as they were. A record that produced
+    nothing gradable comes back unchanged; ``None`` when the saved run cannot be read back."""
+    from ..storage import load_result
+
+    if record.get("status") not in OK_STATUSES:
+        return record
+    try:
+        result = load_result(out_root / str(record.get("run_dir") or "-"))
+    except (OSError, ValueError):
+        return None
+    graded = _grade_result(case, channels, result, _case_documents(case), mode)
+    fresh_channels: list[dict[str, Any]] = []
+    for old in record.get("channels", []):
+        if old.get("status") != "ok":
+            fresh_channels.append(old)
+            continue
+        grade = graded.get(old.get("channel"))
+        if grade is None:
+            return None
+        for key in ("judge", "judge_error", "judge_skipped"):
+            if key in old:
+                grade[key] = old[key]
+        fresh_channels.append(grade)
+    fresh = {**record, "channels": fresh_channels, "regraded_at": _iso_now()}
+    for kind in ("must", "should"):
+        fresh[kind] = [evaluate_case_level(a, cost_usd=record.get("cost_usd") or 0.0,
+                                           duration_s=record.get("duration_s") or 0.0)
+                       for a in case.assertions(kind) if a.applies("*", mode)]
+    return fresh
+
+
+def _regrade_prior(prior: PriorCase, planned: PlannedCase, mode: str, out_root: Path, grader: str) -> None:
+    """Reusable records graded by other grader code are graded again (free); one that cannot be is run again."""
+    if not prior.reusable or prior.grader == grader:
+        return
+    for rep, record in list(prior.reusable.items()):
+        fresh = regrade_record(planned.case, planned.channels, record, mode, out_root)
+        if fresh is None:
+            del prior.reusable[rep]
+            prior.regrade_failed += 1
+        else:
+            prior.reusable[rep] = prior.records[rep] = fresh
+            prior.regraded += 1
+
+
+@dataclass
+class _CaseRun:
+    """One planned case while it runs: its records so far and the entry last written to ``cases/<id>.json``."""
+
+    planned: PlannedCase
+    records: list[dict[str, Any]]
+    prior: PriorCase | None = None
+    entry: dict[str, Any] | None = None
+    done: bool = False
+    kept: bool = False  # not reached before a Ctrl+C: only its earlier finished runs are in the summary
+
+    def file_records(self, reps: int) -> tuple[list[dict[str, Any]], float]:
+        """(records, discarded cost) for ``cases/<id>.json``: this attempt's records, plus the earlier reusable records
+        of reps this attempt has not reached yet (so a Ctrl+C or crash mid-case never throws a finished run away).
+        Every other earlier record's cost moves to the discarded cost, so each cent is in the file exactly once."""
+        records = list(self.records)
+        if self.prior is None:
+            return records, 0.0
+        discarded = self.prior.discarded_cost_usd
+        reached = {r.get("rep") for r in records}
+        for rep, old in sorted(self.prior.records.items()):
+            if any(r is old for r in records):
+                continue  # reused as is
+            if rep not in reached and rep <= reps and self.prior.reusable.get(rep) is old:
+                records.append(old)
+                continue
+            discarded += _record_cost(old)
+        return sorted(records, key=lambda r: r.get("rep") or 0), discarded
+
+
+def _carried_results(out_root: Path, planned: list[PlannedCase], mode: str, settings: dict[str, Any],
+                     grader: str) -> tuple[list[tuple[dict[str, Any], list[str]]], list[str]]:
+    """``--resume`` with fewer cases than the folder has: the other cases' saved results (same mode and settings) stay in
+    the summary — graded again from their saved runs when the grader code changed. Returns ([(entry, channels)], ids
+    left out because their mode or settings differ or their saved runs cannot be graded again)."""
+    planned_ids = {p.case.id for p in planned}
+    carried: list[tuple[dict[str, Any], list[str]]] = []
+    left_out: list[str] = []
+    for path in sorted((out_root / "cases").glob("*.json")):
+        if path.stem in planned_ids:
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            left_out.append(path.stem)
+            continue
+        result = data.get("result") if isinstance(data, dict) else None
+        if not (isinstance(result, dict) and data.get("mode") == mode and data.get("settings") == settings):
+            left_out.append(path.stem)
+            continue
+        channels = [str(c) for c in data.get("channels") or [c.get("channel") for c in result.get("channels", [])]]
+        if data.get("grader") != grader:
+            try:
+                other = PlannedCase(EvalCase.model_validate(data["case"]), channels)
+            except Exception:  # noqa: BLE001 - an unreadable old case file is simply left out
+                left_out.append(path.stem)
+                continue
+            records = [regrade_record(other.case, channels, r, mode, out_root) for r in data.get("reps", [])
+                       if isinstance(r, dict)]
+            if not records or any(r is None for r in records):
+                left_out.append(path.stem)
+                continue
+            discarded = float(data.get("discarded_cost_usd") or 0.0)
+            result = aggregate_case(other, records)  # type: ignore[arg-type]
+            result["discarded_cost_usd"] = round(discarded, 6)
+            write_case_file(out_root, other, records, result, mode=mode, discarded_cost_usd=discarded,  # type: ignore[arg-type]
+                            settings=settings, grader=grader)
+        carried.append(({**result, "carried": True}, channels))
+    return carried, left_out
+
+
+def _dropped_channels(planned: list[PlannedCase], priors: dict[str, PriorCase]) -> list[tuple[PlannedCase, PriorCase, list[str]]]:
+    """Planned cases whose earlier run in this folder covered channels this ``--resume`` leaves out."""
+    dropped = []
+    for p in planned:
+        prior = priors.get(p.case.id)
+        if prior is None or not prior.records:
+            continue
+        missing = [c for c in prior.channels if c not in p.channels]
+        if missing:
+            dropped.append((p, prior, missing))
+    return dropped
+
+
+def _refuse_narrower_channels(dropped: list[tuple[PlannedCase, PriorCase, list[str]]]) -> None:
+    """A narrower ``--channels`` on resume would re-run the case without those channels and silently drop their valid
+    results from the summary (and from a comparison against it): refuse, before anything runs."""
+    valid = [(p, prior, missing) for p, prior, missing in dropped if prior.comparable]
+    if not valid:
+        return
+    cases = "; ".join(f"{p.case.id} (이전 {', '.join(prior.channels)} → 이번 {', '.join(p.channels)}, 빠지는 채널 "
+                      f"{', '.join(missing)})" for p, prior, missing in valid)
+    raise UsageError(f"--resume에서 채널을 줄이면 이 폴더에 있는 그 채널의 결과가 요약과 기준 비교에서 빠져요: {cases}. "
+                     "이전과 같은 --channels로 이어서 하거나(끝난 실행은 다시 돌리지 않아요) 새 --out 폴더를 쓰세요.")
 
 
 def run_eval(options: EvalOptions, *, printer: Printer = print, confirm: Callable[[str], bool] | None = None,
@@ -784,6 +1245,11 @@ def run_eval(options: EvalOptions, *, printer: Printer = print, confirm: Callabl
     out_root = Path(options.out_dir) if options.out_dir else default_out_dir(cases_dir, options.mode)
     if not options.dry_run and out_root.exists() and any(out_root.iterdir()) and not options.resume:
         raise UsageError(f"결과 폴더가 이미 있어요: {out_root} (다른 --out을 쓰거나, 이어서 하려면 --resume)")
+    settings_now = run_settings(base, options)
+    grader_now = grader_fingerprint()
+    priors = {p.case.id: load_prior(out_root, p, options.mode, settings_now) for p in planned} if options.resume else {}
+    dropped = _dropped_channels(planned, priors)
+    _refuse_narrower_channels(dropped)  # before anything is printed, asked or spent
     for case_id in skipped:
         printer(f"건너뜀: {case_id} (고른 채널이 이 케이스에 없어요)")
     plan_info = print_plan(planned, base, options, printer)
@@ -798,9 +1264,13 @@ def run_eval(options: EvalOptions, *, printer: Printer = print, confirm: Callabl
 
     out_root.mkdir(parents=True, exist_ok=True)
     printer(f"결과 폴더: {out_root}")
+    # the folder's spend ledger: the cap is always --max-cost-usd minus everything this folder has spent
+    ledger = SpendLedger(out_root / SPEND_FILE if options.mode == "live" else None)
+    if options.resume:
+        ledger.seed_from_case_files(out_root)
 
     judge_backend = None
-    judge_collector = UsageCollector()
+    judge_collector = UsageCollector(ledger=ledger, tags={"kind": "judge"})
     if options.judge:
         from ..backends.anthropic_backend import AnthropicBackend
         from .judge import DEFAULT_JUDGE_MODEL
@@ -811,58 +1281,135 @@ def run_eval(options: EvalOptions, *, printer: Printer = print, confirm: Callabl
         printer(f"LLM 비교 채점(돈이 들어요): {judge_backend.model}가 이번 결과와 기준 결과의 최종본을 비교해요.")
 
     started_at = _iso_now()
-    entries: list[dict[str, Any]] = []
-    priors = {p.case.id: load_prior(out_root, p, options.mode) for p in planned} if options.resume else {}
-    prior_cost = round(sum(prior.spent for prior in priors.values()), 6)
+    for p in planned:  # finished runs graded by other grader code: grade their saved runs again (no API call)
+        if p.case.id in priors:
+            _regrade_prior(priors[p.case.id], p, options.mode, out_root, grader_now)
+    prior_cost = ledger.total if options.resume else 0.0
     reused_runs = sum(1 for p in planned for rep in range(1, options.reps + 1)
                       if rep in priors.get(p.case.id, PriorCase({}, {}, 0.0)).reusable)
+    carried, left_out = _carried_results(out_root, planned, options.mode, settings_now, grader_now) \
+        if options.resume else ([], [])
     if options.resume:
         printer(f"이어서 실행: 끝난 실행 {reused_runs}번을 다시 써요" +
                 (f" · 이 폴더에서 이미 쓴 비용 {_usd(prior_cost)}을 예산에 넣어요" if prior_cost else ""))
-    spent = prior_cost  # the cap covers the whole eval folder, earlier attempts included
+        for p in planned:
+            prior = priors[p.case.id]
+            if prior.changed_settings:
+                printer(f"  다시 돌려요: {p.case.id} — 이전 실행과 달라진 설정: {', '.join(prior.changed_settings)}")
+            if prior.regraded:
+                printer(f"  다시 채점해요: {p.case.id} — 채점 코드가 바뀌어서 끝난 실행 {prior.regraded}번을 저장된 결과로 "
+                        "다시 채점해요 (API 호출 없음)")
+            if prior.regrade_failed:
+                printer(f"  다시 돌려요: {p.case.id} — 저장된 실행 결과(runs/)를 읽지 못해 새 채점 코드로 채점할 수 없어요")
+        for p, _prior, missing in dropped:  # (with the same settings this was refused above)
+            printer(f"  요약에서 빠지는 이전 채널: {p.case.id}의 {', '.join(missing)} (모드·설정·케이스가 달라 다시 돌리지 않아요)")
+        if carried:
+            printer(f"  이번에 고르지 않은 케이스 {len(carried)}개는 이전 결과를 요약에 그대로 넣어요: "
+                    + ", ".join(e["id"] for e, _ in carried))
+        if left_out:
+            printer(f"  모드·설정이 다르거나 저장된 실행을 다시 채점할 수 없어 요약에 넣지 않은 이전 결과 {len(left_out)}개: "
+                    f"{', '.join(left_out)} (쓴 비용은 예산에 넣었어요)")
+    if carried:
+        plan_info["scope"] = list(plan_info.get("scope", [])) + [[e["id"], ch] for e, channels in carried for ch in channels]
+        plan_info["carried_cases"] = [e["id"] for e, _ in carried]
+
+    def save(state: _CaseRun) -> None:
+        records, discarded = state.file_records(options.reps)
+        if not records:
+            return  # nothing to write yet (an earlier attempt's file, if any, stays as it was)
+        entry = aggregate_case(state.planned, records)
+        entry["discarded_cost_usd"] = round(discarded, 6)
+        if state.kept:
+            entry["carried"] = True
+        write_case_file(out_root, state.planned, records, entry, mode=options.mode, discarded_cost_usd=discarded,
+                        settings=settings_now, grader=grader_now)
+        state.entry = entry
+
+    def await_late_calls() -> str:
+        """Before a new live run: a timed-out run's call still in flight will be billed, and the next run's cap cannot
+        include what it does not know. Wait for it (up to --timeout-s); if it is still running, stop the eval."""
+        printer(f"  시간 초과로 멈춘 실행의 마지막 호출이 끝나기를 최대 {options.timeout_s:g}초 기다려요 — 그 비용을 모른 채 "
+                "다음 실행을 시작하면 예산 상한을 넘을 수 있어요.")
+        finished = _wait_late(states, options.timeout_s)
+        for changed_state in _refresh_late(states):
+            save(changed_state)
+        if finished:
+            return ""
+        return ("시간 초과로 멈춘 실행의 마지막 호출이 끝나지 않아 쓴 비용을 알 수 없어서, 예산 상한을 지키려고 남은 케이스를 "
+                "건너뛰었어요. 잠시 뒤 --resume으로 이어서 하세요")
+
+    states: list[_CaseRun] = []
+    state: _CaseRun | None = None
     stop_reason = ""
     interrupted = False
     total = len(planned)
     try:
         for index, p in enumerate(planned, 1):
-            records: list[dict[str, Any]] = []
             prior = priors.get(p.case.id)
-            discarded = prior.discarded_cost_usd if prior else 0.0
+            state = _CaseRun(p, [], prior=prior)
+            states.append(state)
             for rep in range(1, options.reps + 1):
                 reused = prior.reusable.get(rep) if prior else None
                 if reused is not None:
-                    records.append(reused)
+                    state.records.append(reused)
                     continue
-                if prior and rep in prior.records:
-                    discarded += _record_cost(prior.records[rep])  # replaced below; its cost stays in the ledger
                 cap = None
                 if options.mode == "live" and options.max_cost_usd:
-                    cap = options.max_cost_usd - spent - judge_collector.cost
+                    if not stop_reason and _late_running(states):
+                        stop_reason = await_late_calls()
+                    cap = options.max_cost_usd - ledger.total  # late calls of timed-out runs included
                     if cap <= 0 or stop_reason:
                         stop_reason = stop_reason or f"예산 상한 {_usd(options.max_cost_usd)}에 닿아 남은 케이스를 건너뛰었어요"
-                        records.append(_skipped_record(p, rep, options, stop_reason))
+                        state.records.append(_skipped_record(p, rep, options, stop_reason))
                         continue
                 label = f"[{index}/{total}] {p.case.id}" + (f" (반복 {rep}/{options.reps})" if options.reps > 1 else "")
                 printer(f"{label} · {p.case.title}")
                 record = run_case(p, rep, base, options, out_root, remaining_cap=cap, client=client,
-                                  backend_factory=backend_factory, printer=printer, reps=options.reps)
-                spent += record["cost_usd"]
+                                  backend_factory=backend_factory, printer=printer, reps=options.reps, ledger=ledger)
+                state.records.append(record)  # before the judge: a Ctrl+C during the judge still keeps this run
                 if judge_backend is not None and record["status"] in OK_STATUSES:
-                    _judge_record(judge_backend, judge_collector, p, record, options, spent, out_root)
-                records.append(record)
+                    _judge_record(judge_backend, judge_collector, p, record, options, ledger, out_root)
                 printer("  " + _record_line(record))
                 if record["status"] == "budget_stopped":
                     stop_reason = f"예산 상한 {_usd(options.max_cost_usd or 0)}에 닿아 멈췄어요"
                 if record.get("unpriced_models") and options.mode == "live":
                     stop_reason = (f"가격을 모르는 모델({', '.join(record['unpriced_models'])})이 응답해서 비용을 셀 수 없어 "
                                    "멈췄어요. prices.json이나 INSIA_PRICE_*로 가격을 넣은 뒤 --resume으로 이어서 하세요")
-            entry = aggregate_case(p, records)
-            entry["discarded_cost_usd"] = round(discarded, 6)
-            entries.append(entry)
-            write_case_file(out_root, p, records, entry, mode=options.mode, discarded_cost_usd=discarded)
+                save(state)  # after every rep: a finished rep survives a Ctrl+C during the next one
+            save(state)
+            state.done = True
+    except KeyboardInterrupt as exc:
+        interrupted = True
+        partial = getattr(exc, "eval_record", None)
+        if state is not None and not state.done:
+            if partial is not None and not any(r is partial for r in state.records):
+                state.records.append(partial)
+                printer("  " + _record_line(partial))
+            save(state)  # also keeps the earlier finished reps this attempt had not reached
+        printer("\n평가를 중단했어요. 끝난 실행과 중단한 실행까지 결과를 저장해요 (쓴 비용은 spend.jsonl에 모두 남아요).")
+        started = {s.planned.case.id for s in states}
+        for p in planned:  # cases not reached: their earlier finished runs stay in the summary
+            prior = priors.get(p.case.id)
+            if p.case.id not in started and prior is not None and prior.reusable:
+                kept = _CaseRun(p, [], prior=prior, kept=True)
+                save(kept)
+                if kept.entry is not None:
+                    states.append(kept)
+
+    # calls still in flight after a timeout: wait a little so their cost lands in the records (a Ctrl+C during this
+    # wait stops waiting — the summary and report are still written)
+    wait_s = 0.0 if interrupted else min(LATE_WAIT_S, options.timeout_s)
+    try:
+        if wait_s > 0 and _late_running(states):
+            printer(f"시간 초과로 멈춘 실행의 마지막 호출이 끝나기를 최대 {wait_s:g}초 기다려요 (그 비용까지 기록하려고요).")
+            _wait_late(states, wait_s)
     except KeyboardInterrupt:
         interrupted = True
-        printer("\n평가를 중단했어요. 끝난 케이스까지 결과를 저장해요.")
+        printer("\n기다리지 않고 멈췄어요. 끝나지 않은 호출 비용은 기록에 빠져 있어요. 결과는 저장해요.")
+    for changed_state in _refresh_late(states):
+        save(changed_state)
+    entries = [s.entry for s in states if s.entry is not None] + [entry for entry, _ in carried]
+    kept_ids = [s.planned.case.id for s in states if s.kept and s.entry is not None]
 
     meta = {
         "created_at": started_at,
@@ -873,7 +1420,7 @@ def run_eval(options: EvalOptions, *, printer: Printer = print, confirm: Callabl
         "out_dir": str(out_root),
         "reps": options.reps,
         "channels_filter": list(options.channels),
-        "settings": {"max_rounds": base.max_rounds, "pass_score": base.pass_score,
+        "settings": {**{k: v for k, v in settings_now.items() if k != "model"}, "grader": grader_now,
                      "max_cost_usd": options.max_cost_usd or 0.0, "timeout_s": options.timeout_s},
         "plan": plan_info,
         "stopped": stop_reason,
@@ -881,21 +1428,34 @@ def run_eval(options: EvalOptions, *, printer: Printer = print, confirm: Callabl
     }
     if options.resume:
         meta["resumed"] = {"reused_runs": reused_runs, "prior_cost_usd": prior_cost}
+        regraded = sum(prior.regraded for prior in priors.values())
+        if regraded:
+            meta["resumed"]["regraded_runs"] = regraded
+    if carried or left_out or kept_ids or dropped:
+        meta["carried"] = {"cases": [e["id"] for e, _ in carried] + kept_ids, "left_out": left_out}
+        if dropped:
+            meta["carried"]["dropped_channels"] = [[p.case.id, c] for p, _prior, missing in dropped for c in missing]
     summary = build_summary(entries, meta)
-    summary["totals"]["judge_cost_usd"] = judge_collector.cost
+    t = summary["totals"]
+    # everything this folder has spent (spend.jsonl): also calls that finished after a timeout or Ctrl+C, and earlier
+    # results this summary does not list
+    t["folder_cost_usd"] = ledger.total
+    t["unlisted_cost_usd"] = round(max(0.0, ledger.total - t["cost_usd"] - t["judge_cost_usd"] - t["discarded_cost_usd"]), 6)
+    t["cost_incomplete_runs"] = sum(1 for s in states for r in s.records if r.get("cost_incomplete"))
     comparison = None
     if baseline is not None:
         comparison = compare_summaries(baseline, summary, max_score_drop=options.max_score_drop,
                                        baseline_dir=str(options.baseline), current_dir=str(out_root))
         summary["baseline"] = comparison
-    failed = summary["totals"]["must_failed"] or summary["totals"]["must_errors"] or summary["totals"]["error_channels"]
+    failed = t["must_failed"] or t["must_errors"] or t["error_channels"]
     regressed = comparison is not None and comparison["exit_code"] != 0
     summary["exit_code"] = 1 if (failed or regressed or interrupted or stop_reason) else 0
     _write_json(out_root / "summary.json", summary)
     (out_root / "report.md").write_text(render_report(summary), encoding="utf-8")
-    t = summary["totals"]
+    listed = t["cost_usd"] + t["judge_cost_usd"]
+    folder = f" (이 폴더 전체 {_usd(t['folder_cost_usd'])})" if t["folder_cost_usd"] > listed + 0.005 else ""
     printer(f"\n필수 조건 {t['must_passed']}/{t['must_total']} 통과 · 권장 목표 {t['should_passed']}/{t['should_total']} · "
-            f"오류 채널 {t['error_channels']}개 · 비용 {_usd(t['cost_usd'] + t['judge_cost_usd'])}")
+            f"오류 채널 {t['error_channels']}개 · 비용 {_usd(listed)}{folder}")
     if comparison is not None:
         printer(f"기준 대비: {comparison['headline']}")
     printer(f"보고서: {out_root / 'report.md'}")
@@ -920,8 +1480,8 @@ def _skipped_record(p: PlannedCase, rep: int, options: EvalOptions, reason: str)
 
 
 def _judge_record(backend: Any, collector: UsageCollector, p: PlannedCase, record: dict[str, Any], options: EvalOptions,
-                  spent: float, out_root: Path) -> None:
-    """Optional paid pairwise judge against the baseline's final drafts (live only)."""
+                  ledger: SpendLedger, out_root: Path) -> None:
+    """Optional paid pairwise judge against the baseline's final drafts (live only; its usage goes to ``ledger`` too)."""
     from ..models import Draft, ResearchPack
     from .judge import pairwise
 
@@ -943,7 +1503,7 @@ def _judge_record(backend: Any, collector: UsageCollector, p: PlannedCase, recor
     for grade in record["channels"]:
         if grade.get("status") != "ok" or grade["channel"] not in base_drafts:
             continue
-        if options.max_cost_usd and spent + collector.cost >= options.max_cost_usd:
+        if options.max_cost_usd and ledger.total >= options.max_cost_usd:
             grade["judge_skipped"] = "예산 상한에 닿아 LLM 비교 채점을 건너뛰었어요"
             continue
         try:
@@ -963,23 +1523,28 @@ def _record_line(record: dict[str, Any]) -> str:
     for g in record["channels"]:
         name = channel_label(g["channel"])
         if g.get("status") != "ok":
-            parts.append(f"{name} 오류")
+            parts.append(f"{name} {'중단' if g.get('status') == 'cancelled' else '오류'}")
             continue
         musts = g.get("must", [])
         ok = sum(1 for o in musts if o["passed"])
         parts.append(f"{name} {g['score']}점{' 통과' if g['passed'] else ' 미통과'} 필수 {ok}/{len(musts)}")
     head = {"ok": "완료", "partial": "일부 완료", "budget_stopped": "예산 상한으로 멈춤", "timeout": "시간 초과",
-            "error": "실패", "skipped": "건너뜀"}.get(record["status"], record["status"])
+            "error": "실패", "skipped": "건너뜀", "cancelled": "중단"}.get(record["status"], record["status"])
     tail = f" · 비용 {_usd(record['cost_usd'])}" if record["cost_usd"] else ""
     reason = f" ({record['failure']['message']})" if record.get("failure") else ""
     return f"{head}{reason} · " + " · ".join(parts) + tail
 
 
 def ask_yes_no(prompt: str) -> bool:
-    """Interactive confirmation (only on a terminal)."""
+    """Interactive confirmation (only on a terminal).
+
+    The question goes to stderr, like the progress lines under ``--json``: with ``--json > out.json`` it is still on the
+    screen, and stdout stays pure JSON (``input(prompt)`` would write it to stdout)."""
     if not sys.stdin.isatty():
         return True
     try:
-        return input(prompt).strip().lower() in ("y", "yes", "예", "네", "ㅇ")
+        sys.stderr.write(prompt)
+        sys.stderr.flush()
+        return input().strip().lower() in ("y", "yes", "예", "네", "ㅇ")
     except EOFError:
         return False

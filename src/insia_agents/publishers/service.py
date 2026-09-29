@@ -93,6 +93,7 @@ from .base import (
     parse_preview_options,
     payload_hash,
     platform_label,
+    step_label,
 )
 from .http import INSTAGRAM_HOSTS, LINKEDIN_HOSTS, FakePlatformTransport, TransportError, UrllibTransport
 from .instagram import (
@@ -164,6 +165,8 @@ BLOCKED_MESSAGES = {
     "archived": "보관한 콘텐츠는 API로 게시하지 않아요. 먼저 복원해 주세요.",
     "agent_job": "에이전트가 이 콘텐츠를 수정하는 중이에요.",
     "published_attempt": "게시는 됐지만 보관함 상태를 바꾸지 못했어요. ‘게시 완료 표시’를 눌러 주세요.",
+    "already_published": ("이 버전은 이미 API로 게시했어요. 게시 완료로 다시 표시하려면 ‘게시 완료 표시’를 눌러 주세요. "
+                          "다시 올리려면 내용을 고쳐 새 버전으로 승인해 주세요."),
 }
 STATE_SUMMARY = {"connected": "연결됨", "expiring": "곧 만료", "not_connected": "연결 안 됨",
                  "needs_reconnect": "다시 연결 필요", "unavailable": "지금 쓸 수 없음"}
@@ -332,6 +335,10 @@ class _Heartbeat:
             self.thread.join(timeout=2.0)
 
 
+INSTAGRAM_OFF_REFRESH_NOTE = ("(인스타그램 API 게시가 꺼져 있어요. 저장된 토큰은 계속 연장하고, 게시하려면 "
+                              "INSIA_PUBLISH_INSTAGRAM=1을 저장해 주세요.)")
+
+
 class PublishService:
     """Status, connections, previews, confirmed sends (worker thread + heartbeat), attempt records, recovery.
 
@@ -375,7 +382,7 @@ class PublishService:
         self._bg_stop = threading.Event()
         self._render_checked: bool | None = None
         for secret in (settings.linkedin_client_secret, settings.ig_app_secret):
-            register_secret(secret)
+            register_secret(secret, pin=True)
 
     @classmethod
     def from_env(cls, workspace: Workspace, *, env: Mapping[str, str] | None = None,
@@ -747,9 +754,9 @@ class PublishService:
 
     def item_block(self, item: ContentItem, *, agent_job: bool = False) -> dict[str, Any] | None:
         """The ``publish`` block of ``GET /api/items/<id>`` (DESIGN.md 6-2); ``None`` when publishing is disabled
-        or not ``configured()``."""
+        or not ``configured()`` — unless an attempt of the item is still ``sending``/``unknown`` (``_locked_block``)."""
         if not self.settings.enabled or not self.configured():
-            return None
+            return self._locked_block(item)
         platform = CHANNEL_PLATFORM.get(item.channel)
         block: dict[str, Any] = {"platform": platform, "available": False, "state": "", "reason": "",
                                  "blocked_by": "", "active_attempt": None, "last_attempt": None}
@@ -764,13 +771,13 @@ class PublishService:
             block["active_attempt"] = self.attempt_json(active)
         if attempts:
             block["last_attempt"] = self.attempt_json(attempts[0])
-        blocked = ""
-        if agent_job:
-            blocked = "agent_job"
-        elif item.status != "published" and self._published_attempt(item, platform) is not None:
-            blocked = "published_attempt"
-        else:
-            blocked = self._blocked_by(item)
+        blocked = "agent_job" if agent_job else self._blocked_by(item)
+        if not blocked:
+            done = self._published_attempt(item, platform)
+            if done is not None:
+                # 'published_attempt' only when recording the item really failed; an item a person moved back
+                # (보관 → 복원 → 승인) after an API post of this same version is simply already published
+                blocked = "published_attempt" if (done.state or {}).get("item_update_error") else "already_published"
         block["blocked_by"] = blocked
         if blocked:
             block["reason"] = self._blocked_message(blocked, item)
@@ -780,6 +787,23 @@ class PublishService:
             block["reason"] = ready.reason
         block["available"] = bool(ready.ready and not blocked and active is None)
         return block
+
+    def _locked_block(self, item: ContentItem) -> dict[str, Any] | None:
+        """Publishing is off (``INSIA_PUBLISH=0``) or no longer set up, but an attempt of this item is still
+        ``sending``/``unknown``: the item stays locked, so the dashboard still gets a minimal block (the lock
+        text, the 결과 불명 card, the history). Answering it needs no platform call (resolve, permalink and the
+        attempt routes work while publishing is off); ``state`` ``disabled`` hides everything that would call a
+        platform (the button, Instagram's re-check). ``None`` when nothing is live."""
+        active = self.workspace.active_publish_attempt(item.id)
+        if active is None:
+            return None
+        platform = active.platform
+        attempts = [a for a in self.workspace.list_publish_attempts(item_id=item.id, limit=20) if a.platform == platform]
+        state = "disabled" if not self.settings.enabled else self.readiness(platform).state
+        return {"platform": platform, "available": False, "state": state,
+                "reason": ItemLockedError(status=active.status).args[0], "blocked_by": "", "blockers": [],
+                "active_attempt": self.attempt_json(active),
+                "last_attempt": self.attempt_json(attempts[0]) if attempts else None}
 
     def summary_line(self) -> str:
         """One Korean line for ``serve`` output; ``""`` when not configured (then ``serve`` prints nothing)."""
@@ -907,9 +931,24 @@ class PublishService:
                 if why:
                     raise InvalidInputError(why, platform="linkedin")
             values["redirect_uri"] = value or None
+        elif values and not self.settings.linkedin_redirect_uri and not self._secrets("linkedin").get("redirect_uri"):
+            # the address shown with the form is the one to register with LinkedIn: keep it, so a CLI command (or a
+            # server on another port) later sends exactly the same redirect_uri instead of deriving its own default
+            values["redirect_uri"] = self.settings.linkedin_redirect_uri_default
         if values:
             self.store.set_many("linkedin", values)
         return self.platform_status("linkedin")
+
+    def _pin_linkedin_redirect(self, redirect: str) -> None:
+        """Store the redirect URI a connection is about to send when nothing pinned it yet (not from the environment,
+        nothing saved): every later process — the CLI, a server on another port — then uses this same value."""
+        if self.settings.linkedin_redirect_uri or not redirect:
+            return
+        try:
+            if not self._secrets("linkedin").get("redirect_uri"):
+                self.store.set_many("linkedin", {"redirect_uri": redirect})
+        except CredentialStoreError as exc:
+            log.warning("LinkedIn Redirect URI를 저장하지 못했어요: %s", exc)
 
     def linkedin_connect(self, *, request_origin: str = "") -> ConnectStart:
         """``POST /api/publish/linkedin/connect``: a one-time state (10 min), the authorize URL and the mode —
@@ -922,6 +961,7 @@ class PublishService:
         why = check_redirect_uri(redirect)
         if why:
             raise InvalidInputError(f"LinkedIn Redirect URI를 확인해 주세요: {why}", platform="linkedin")
+        self._pin_linkedin_redirect(redirect)
         state = self.oauth_states.issue()
         url = authorize_url(LINKEDIN, app["client_id"], redirect, state)
         target = _origin(redirect)
@@ -938,14 +978,18 @@ class PublishService:
         return ConnectStart(mode="paste", authorize_url=url, redirect_uri=redirect, open_url=open_url)
 
     def linkedin_callback(self, *, code: str = "", state: str = "", error: str = "", cookie: str = "") -> CallbackResult:
-        """``GET /oauth/linkedin/callback``: one of ``CALLBACK_RESULTS`` (never raises for these outcomes)."""
-        register_secret(code)
-        register_secret(state)
+        """``GET /oauth/linkedin/callback``: one of ``CALLBACK_RESULTS`` (never raises for these outcomes).
+
+        The route needs no access token, so nothing from the query is registered with ``redact`` before it checks
+        out: the state only once it is one this process issued, the code only once the state was used up by the
+        browser that asked for it (a string an outsider sends would otherwise be masked in every later log line;
+        the access log drops the whole ``/oauth/`` query anyway)."""
         if not self.settings.enabled or not state:
             return "invalid"
         check = self.oauth_states.check(state)
         if check in ("unknown", "used"):
             return "invalid"
+        register_secret(state)  # issued here (already registered by ``issue``; this keeps it recent)
         if not self.oauth_states.cookie_matches(state, cookie):
             return "invalid"  # not the browser that asked (login CSRF); the state stays usable for it
         used = self.oauth_states.consume(state)
@@ -957,6 +1001,7 @@ class PublishService:
             return "cancelled" if error in CANCEL_ERRORS else "exchange_failed"
         if not code:
             return "invalid"
+        register_secret(code)
         try:
             self._finish_linkedin_connect(code)
         except (OAuthExchangeError, ConnectError, PlatformError, NotConfiguredError, TransportError) as exc:
@@ -1469,7 +1514,8 @@ class PublishService:
 
     def attempt_json(self, attempt: PublishAttempt) -> dict[str, Any]:
         """The attempt JSON of DESIGN.md 6-2 (the model's fields without ``state``) plus ``"progress": {"done",
-        "total"}`` and a few safe state notes (``item_update_error``, ``permalink_missing`` …)."""
+        "total"}``, ``step_label`` (the step in Korean, ``base.STEP_LABELS``) and a few safe state notes
+        (``item_update_error``, ``permalink_missing`` …)."""
         data = attempt.model_dump(mode="json", exclude={"state"})
         state = attempt.state or {}
         if attempt.platform == "instagram":
@@ -1488,6 +1534,7 @@ class PublishService:
         else:
             total, done = 1, 1 if attempt.status == "published" else 0
         data["progress"] = {"done": min(done, total), "total": total}
+        data["step_label"] = step_label(attempt.step)
         for key in ATTEMPT_JSON_STATE:
             if key in state:
                 data[key] = state[key]
@@ -1496,15 +1543,21 @@ class PublishService:
 
     def set_permalink(self, attempt_id: str, url: str, *, by: str) -> PublishAttempt:
         """A person fills in the post URL of a ``published`` attempt that has none (also the item's
-        ``published_url``). ``InvalidInputError`` for a URL off the platform's hosts, ``AttemptStateError`` otherwise."""
+        ``published_url``). When the URL is one of the attempt's Instagram ``candidates`` (the recent posts a
+        re-check found, DESIGN.md 4-2-7), that post's media id becomes the attempt's (and the item's) external id.
+        ``InvalidInputError`` for a URL off the platform's hosts, ``AttemptStateError`` otherwise."""
         attempt = self.get_attempt(attempt_id)
         value = (url or "").strip()
         if not self.permalink_ok(attempt.platform, value):
             example = ("LinkedIn 게시물 주소(https://www.linkedin.com/…)" if attempt.platform == "linkedin"
                        else "인스타그램 게시물 주소(https://www.instagram.com/p/…)")
             raise InvalidInputError(f"{example}를 넣어 주세요.", platform=attempt.platform)
+        picked = [str(c.get("id") or "") for c in (attempt.state or {}).get("candidates") or []
+                  if isinstance(c, Mapping) and str(c.get("permalink") or "") == value]
+        external_id = picked[0] if len(picked) == 1 else ""
         try:
-            return self.workspace.set_publish_permalink(attempt_id, value, by=by, now=self._now())
+            return self.workspace.set_publish_permalink(attempt_id, value, by=by, external_id=external_id,
+                                                        now=self._now())
         except PublishStateError as exc:
             raise AttemptStateError(str(exc), platform=attempt.platform) from None
 
@@ -1580,9 +1633,9 @@ class PublishService:
         except CredentialStoreError:
             pass
 
-    def _refresh_instagram(self) -> dict[str, Any]:
+    def _refresh_instagram(self, *, gated: bool = True) -> dict[str, Any]:
         result: dict[str, Any] = {"refreshed": False, "expires_at": "", "estimated": False, "message": ""}
-        if not self.settings.instagram_enabled:
+        if gated and not self.settings.instagram_enabled:
             result["message"] = "인스타그램 API 게시가 꺼져 있어요."
             return result
         with self._refresh_lock:
@@ -1638,12 +1691,20 @@ class PublishService:
                            "message": f"인스타그램 토큰을 갱신했어요 ({days}일 남음)."})
             return result
 
-    def refresh_tokens(self) -> dict[str, dict[str, Any]]:
+    def refresh_tokens(self, *, stored_when_off: bool = False) -> dict[str, dict[str, Any]]:
         """Refresh due Instagram tokens (``insia publish refresh``, the 6-hour job, before previews/sends).
-        Never needs a ``HumanConfirmation`` and shares no code path with sending."""
+        Never needs a ``HumanConfirmation`` and shares no code path with sending.
+
+        ``stored_when_off`` (``insia publish refresh`` only): keep a stored Instagram token alive even while
+        ``INSIA_PUBLISH_INSTAGRAM`` is off in this environment. A refresh never publishes, and a weekly cron whose
+        environment lacks the switch must not let the 60-day token lapse silently."""
         if not self.settings.enabled:
             return {"instagram": {"refreshed": False, "expires_at": "", "estimated": False,
                                   "message": self.settings.disabled_reason or "API 게시가 꺼져 있어요."}}
+        if stored_when_off and not self.settings.instagram_enabled and self._secrets("instagram").get("access_token"):
+            result = self._refresh_instagram(gated=False)
+            result["message"] = " ".join(part for part in (result["message"], INSTAGRAM_OFF_REFRESH_NOTE) if part)
+            return {"instagram": result}
         return {"instagram": self._refresh_instagram()}
 
     def _after_recovery(self, attempt_ids: list[str]) -> None:

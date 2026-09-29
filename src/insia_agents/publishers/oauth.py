@@ -12,7 +12,8 @@
   (when possible) ``::1`` on the same port, Host must be a loopback name with that port, fixed ``text/plain``
   answers with ``Content-Security-Policy: default-src 'none'``; closes after the first valid callback.
 
-Codes and states are registered with ``redact`` as soon as they arrive and are never logged.
+Codes and states are never logged. They are registered with ``redact`` only once they check out (a state this
+process issued, a code whose state was just used up): a string from a stranger's request never joins the register.
 """
 
 from __future__ import annotations
@@ -115,7 +116,6 @@ class OAuthStateStore:
 
     def consume(self, state: str) -> StateCheck:
         """Use a state once: ``ok`` the first time within 10 minutes, else ``unknown``/``expired``/``used``."""
-        register_secret(state)
         if not state:
             return "unknown"
         digest = _digest(state)
@@ -123,6 +123,7 @@ class OAuthStateStore:
             entry = self._states.get(digest)
             if entry is None:
                 return "unknown"
+            register_secret(state)  # one this process issued (never a stranger's string)
             created, used = entry
             if used:
                 return "used"
@@ -145,7 +146,7 @@ def exchange_code(transport: Transport, provider: OAuthProvider, *, code: str, c
     """``POST`` the authorization code (form-encoded, LI §3.3). Returns ``{"access_token", "expires_in", "scope"}``.
     ``OAuthExchangeError`` (502) for any failure; the platform's body is never included."""
     register_secret(code)
-    register_secret(client_secret)
+    register_secret(client_secret, pin=True)
     try:
         response = transport.request("POST", provider.token_url, form={
             "grant_type": "authorization_code", "code": code, "client_id": client_id, "client_secret": client_secret,
@@ -160,7 +161,7 @@ def exchange_code(transport: Transport, provider: OAuthProvider, *, code: str, c
         log.warning("%s 코드 교환 실패: HTTP %s %s", provider.name, response.status, str(code_name or "")[:40])
         raise OAuthExchangeError(platform=provider.name)
     token = str(body["access_token"])
-    register_secret(token)
+    register_secret(token, pin=True)
     try:
         expires_in = int(body.get("expires_in") or 0)
     except (TypeError, ValueError):
@@ -197,8 +198,7 @@ def parse_pasted_callback(text: str, redirect_uri: str) -> dict[str, str]:
         query = value.lstrip("?")
     params = urllib.parse.parse_qs(query, keep_blank_values=False)
     out = {key: (params.get(key) or [""])[0] for key in ("code", "state", "error")}
-    register_secret(out["code"])
-    register_secret(out["state"])
+    # nothing is registered yet: ``check_callback`` registers the state and code once the state checks out
     if not out["state"] or (not out["code"] and not out["error"]):
         raise InvalidInputError("주소에 연결 정보(code·state)가 없어요. 동의한 뒤 이동한 페이지의 주소창 주소 전체를 붙여 넣어 주세요.")
     return out
@@ -207,7 +207,7 @@ def parse_pasted_callback(text: str, redirect_uri: str) -> dict[str, str]:
 def check_callback(states: OAuthStateStore, *, state: str, code: str, error: str, platform: str = "linkedin") -> None:
     """Validate a pasted/CLI callback (no cookie): state issued here, unused, ≤ 10 min; then the ``error`` param.
     Raises ``OAuthStateError`` / ``OAuthCancelledError`` / ``OAuthExchangeError``."""
-    result = states.consume(state)
+    result = states.consume(state)  # registers the state only when this process issued it
     if result != "ok":
         raise OAuthStateError(platform=platform)
     if error:
@@ -216,6 +216,7 @@ def check_callback(states: OAuthStateStore, *, state: str, code: str, error: str
         raise OAuthExchangeError(platform=platform)
     if not code:
         raise OAuthStateError(platform=platform)
+    register_secret(code)
 
 
 # ---------------------------------------------------------------------------
@@ -254,11 +255,11 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             return
         params = urllib.parse.parse_qs(parts.query)
         got = {key: (params.get(key) or [""])[0] for key in ("code", "state", "error")}
+        if not got["state"] or (owner.state_ok is not None and not owner.state_ok(got["state"])):
+            self._answer(400, LISTENER_BAD_TEXT)  # a stranger's values are never registered
+            return
         register_secret(got["code"])
         register_secret(got["state"])
-        if not got["state"] or (owner.state_ok is not None and not owner.state_ok(got["state"])):
-            self._answer(400, LISTENER_BAD_TEXT)
-            return
         owner.deliver(got)
         self._answer(200, LISTENER_OK_TEXT)
 

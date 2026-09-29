@@ -120,17 +120,19 @@ Docker Desktop(Windows·macOS) 또는 Linux의 Docker Engine + Compose가 필요
    docker compose exec insia insia items list
    ```
 
-   데이터는 모두 호스트의 `./workspace` 폴더(컨테이너의 `/data`)에 쌓입니다. 파일을 주고받을 때도 이 폴더를 씁니다.
+   데이터는 모두 호스트의 `./workspace` 폴더(컨테이너의 `/data`)에 쌓여요. Linux에서는 2번에서 이 폴더의 주인을 컨테이너 사용자(10001)로 바꿨기 때문에, 호스트 사용자는 안의 파일을 읽을 수만 있고 **새 파일을 넣거나 고칠 수는 없어요.** 그래서 컨테이너와 파일을 주고받을 때는 `docker compose cp`를 써요(Docker Desktop에서도 똑같이 돼요).
 
    ```bash
-   # 자료 넣기: 호스트의 workspace/ 폴더에 파일을 복사한 뒤
-   docker compose exec insia insia docs add /data/회사소개서.pdf
-   # 프로필 양식: workspace/profile.yaml이 생겨요 → 호스트에서 편집 → 가져오기
-   docker compose exec insia insia profile edit-template
-   docker compose exec insia insia profile import /data/profile.yaml
+   # 자료 넣기: 파일을 컨테이너의 임시 폴더로 복사한 뒤 등록 (원본은 워크스페이스 uploads/에 보관돼요)
+   docker compose cp 회사소개서.pdf insia:/tmp/회사소개서.pdf
+   docker compose exec insia insia docs add /tmp/회사소개서.pdf
+   # 프로필 양식: 호스트의 profile.yaml로 받아 편집 → 컨테이너로 복사 → 가져오기
+   docker compose exec -T insia insia profile edit-template --out - > profile.yaml
+   docker compose cp profile.yaml insia:/tmp/profile.yaml
+   docker compose exec insia insia profile import /tmp/profile.yaml
    ```
 
-   프로필과 자료는 대시보드 **브랜드·자료** 화면에서 넣는 것이 더 편합니다(PDF·Word는 위 명령으로).
+   프로필과 자료는 대시보드 **브랜드·자료** 화면에서 넣는 것이 더 편합니다(PDF·Word는 위 명령으로). `docs add`가 복사한 파일을 읽지 못하면, 호스트에서 `chmod 644 회사소개서.pdf`로 읽기 권한을 준 뒤 다시 복사하세요.
 
 ## 2. API 키 설정
 
@@ -242,7 +244,7 @@ insia review <id>                      # 직접 고친 뒤 다시 채점
 insia items approve <id>
 ```
 
-- id는 길어서 **겹치지 않는 일부만** 적어도 됩니다(예: `items show 0928-1015_linkedin`).
+- id는 길어서 **겹치지 않는 일부만** 적어도 됩니다. `items list`에 보이는 id가 `it_20260928-011039-7073_linkedin`이라면 끝부분만 적어 `items show 7073_linkedin`처럼 쓰면 돼요. id 안의 날짜·시각은 **UTC**(한국 시간보다 9시간 느려요)라서 목록의 수정 시각과 다르니, 시각보다 채널 이름 앞의 네 글자를 쓰는 편이 쉬워요. Claude Code에서 가져온 콘텐츠는 `it_cc-<폴더 이름>_<채널>` 모양이라 폴더 이름 일부를 적으면 돼요.
 - 직접 문장을 고치고 싶으면 대시보드 **보관함 → 편집**이 가장 편합니다. 저장하면 글자 수·형식 검사를 바로 다시 해 줍니다.
 - **에이전트가 아직 그 콘텐츠를 쓰는 동안에는 저장이 거절돼요**(HTTP 409). 그 콘텐츠를 만든 실행이 아직 돌고 있거나, 그 콘텐츠에 재검수·수정 요청이 진행 중일 때예요. 고친 내용은 편집창과 브라우저에 그대로 남으니, 작업이 끝난 뒤 최신 버전을 확인하고 다시 저장하세요(그 사이 새 버전이 생겨도 고치던 내용을 되살려 줘요).
 - 사람이 고친 버전은 에이전트 결과에 **묻히지 않아요.** 멈춘 실행을 고친 뒤 이어서 실행하거나, 터미널에서 돌던 실행(`insia run`·`resume`·`run-due`)이 끝나기 전에 대시보드에서 고쳐도, 에이전트가 그 뒤에 만든 결과는 버전 기록에만 남고 사람이 고친 내용이 현재 버전으로 유지돼요. 승인·게시 예정·게시 완료로 바꿔 둔 콘텐츠도 마찬가지예요. 터미널 실행이 도는 동안 대시보드에서 수정 요청을 보낸 경우에도 수정 결과가 현재 버전으로 남고, 재검수 점수도 그 버전에 붙어서 바로 승인할 수 있어요(터미널 실행의 결과는 기록에만 남아요). 실행 기록에 "사람이 고친 버전이 있어서 … 기록에만 남기고"라는 안내가 남고, 재검수·수정 요청이면 대시보드에 같은 안내가 떠요.
@@ -323,13 +325,26 @@ workspace/
   insia backup --out ~/insia-backups/2026-09-28      # 워크스페이스 밖의 새 폴더
   ```
 
-  Docker는 `docker compose exec insia insia backup --out /data/backups/2026-09-28`로 만들면 호스트의 `workspace/backups/2026-09-28`에 생겨요. 이 폴더를 USB·클라우드 드라이브에 옮겨 두세요.
+  Docker는 `docker compose exec insia insia backup --out /data/backups/2026-09-28`로 만들면 호스트의 `workspace/backups/2026-09-28`에 생겨요. 이 폴더를 USB·클라우드 드라이브에 옮겨 두세요(예: `cp -r workspace/backups/2026-09-28 /media/usb/`). 호스트에서 권한 오류가 나면(예전 버전의 INSIA로 만든 백업 폴더는 컨테이너 사용자만 열 수 있어요) 컨테이너에서 바로 꺼내요.
+
+  ```bash
+  docker compose cp insia:/data/backups/2026-09-28 ./insia-backup-2026-09-28
+  ```
 - **폴더를 직접 복사할 때는 `credentials` 폴더를 빼고** 복사하세요. `insia serve`와 자동 실행을 잠깐 멈춘 뒤 복사해요(Docker는 `docker compose stop` → 복사 → `docker compose start`). `credentials`에는 LinkedIn·인스타그램 게시용 토큰과 LinkedIn Client Secret이 들어 있어서, 클라우드 드라이브에 올라가면 다른 사람이 내 계정으로 글을 올릴 수 있어요. 복사하면 이 폴더의 접근 권한(0600)도 사라져요.
   - macOS·Linux: `rsync -a --exclude credentials --exclude publish workspace/ /Volumes/USB/insia-workspace/`
   - Windows (PowerShell): `robocopy workspace D:\insia-workspace /E /XD credentials publish`
   - Docker: 호스트에서 `workspace`를 통째로 복사하면 `credentials`(컨테이너 사용자 uid 10001 소유, 0700) 때문에 권한 오류가 나요. 위의 `insia backup`을 쓰세요.
 - DB만 따로 복사하고 싶으면 SQLite 도구도 돼요: `sqlite3 workspace/insia.db ".backup 'insia-backup.db'"`.
 - **복원**: 서버를 끄고, 백업한 `insia.db`·`uploads/`·`prices.json`을 워크스페이스에 넣은 뒤 다시 켭니다. 워크스페이스에 예전 `insia.db-wal`·`insia.db-shm` 파일이 남아 있으면 먼저 지우세요(백업의 `insia.db`는 그 자체로 완전해요). 폴더째 백업했다면 워크스페이스 폴더를 백업본으로 바꿔 넣으면 됩니다.
+  - Docker(Linux): 호스트 사용자는 `workspace/`에 파일을 넣을 수 없어서([1-2](#1-2-docker로-설치-늘-켜-두는-서버)의 4번) `sudo`로 넣고, 주인을 컨테이너 사용자(10001)로 되돌려요. 마지막 줄을 빼먹으면 컨테이너가 DB에 쓰지 못해요(`docker compose cp`로 넣은 파일도 호스트 사용자 소유로 남으니 마찬가지예요). Docker Desktop(Windows·macOS)은 `sudo` 없이 호스트에서 바로 넣으면 돼요.
+
+    ```bash
+    docker compose stop
+    sudo rm -f workspace/insia.db-wal workspace/insia.db-shm
+    sudo cp -r insia-backup-2026-09-28/. workspace/     # 백업 폴더 안의 insia.db·uploads/·prices.json
+    sudo chown -R 10001:10001 workspace
+    docker compose start
+    ```
   - API 게시 토큰은 백업에 없으니, 복원한 뒤 **브랜드·자료 → API 게시 연결**에서 다시 연결하면 돼요(LinkedIn은 앱 정보도 다시 넣어요).
 - 프로필만 따로: `insia profile export --out profile.json` / `insia profile import profile.json`.
 - 실행 한 건의 결과 전체(채널 파일·출처 목록·리서치): `insia runs export <실행 id>`.
@@ -351,7 +366,7 @@ workspace/
 - `--limit`으로 하루 최대 개수를, `INSIA_MAX_COST_USD`로 편당 상한을 정해 두세요.
 - 대시보드 서버와 동시에 돌아도 됩니다(같은 슬롯을 두 번 만들지 않아요).
 - 자동 실행은 다른 폴더에서 시작되므로 **`INSIA_HOME`을 절대 경로로** 정하세요.
-- `run-due`는 초안만 만들고 **게시하지 않아요.** API 게시도 자동 실행에서는 절대 돌지 않아요(`insia publish send`는 사람이 터미널에서 확인 코드를 입력할 때만 돌아요). 인스타그램 API 게시를 쓰면서 서버를 늘 켜 두지 않는다면, 토큰 연장만 하는 `insia publish refresh`를 일주일에 한 번 넣어 두세요 → [12-8](#12-8-연결-해제토큰-만료갱신).
+- `run-due`는 초안만 만들고 **게시하지 않아요.** API 게시도 자동 실행에서는 절대 돌지 않아요(`insia publish send`는 사람이 터미널에서 확인 코드를 입력할 때만 돌아요). 인스타그램 API 게시를 쓰면서 서버를 늘 켜 두지 않는다면, 토큰 연장만 하는 `insia publish refresh`를 일주일에 한 번 넣어 두세요. 이때 cron이 읽는 설정에 `INSIA_PUBLISH_INSTAGRAM=1`이 있어야 해요 → [12-8](#12-8-연결-해제토큰-만료갱신).
 
 ### macOS · Linux (cron)
 
@@ -361,7 +376,15 @@ workspace/
    export ANTHROPIC_API_KEY="sk-ant-..."
    export INSIA_HOME="$HOME/Documents/insia/workspace"
    export INSIA_MAX_COST_USD=5
+   # 인스타그램 API 게시를 쓴다면(12-4의 5번) 아래 세 줄의 맨 앞 #을 지우고 주소를 내 것으로 바꿔요.
+   # 없으면 토큰 연장 cron(12-8)과 터미널의 insia publish 명령에서 인스타그램이 꺼진 것으로 보여요.
+   # (구성 A 기준이에요. 대시보드를 공개 도메인으로 쓰는 구성 B는 INSIA_MEDIA_PORT 줄을 그대로 두고 12-5의 값을 더해요.)
+   # export INSIA_PUBLISH_INSTAGRAM=1
+   # export INSIA_MEDIA_PORT=8766
+   # export INSIA_MEDIA_BASE_URL="https://media.example.com"
    ```
+
+   API 키가 든 파일이니 `chmod 600 ~/.insia.env`로 나만 읽게 해 두세요.
 
 2. `crontab -e`로 아래 줄을 넣습니다(평일 아침 7시 50분).
 
@@ -403,13 +426,14 @@ workspace/
 
 ### Docker
 
-호스트의 cron에서 컨테이너 안의 명령을 부릅니다.
+호스트의 cron에서 컨테이너 안의 명령을 불러요. `docker compose`를 쓸 수 있는 사용자(docker 그룹이나 root)의 `crontab -e`에 넣어요.
 
 ```cron
-50 7 * * 1-5 cd /srv/insia && docker compose exec -T insia insia run-due --limit 3 --quiet >> /srv/insia/workspace/logs/run-due.log 2>&1
+50 7 * * 1-5 cd /srv/insia && docker compose exec -T insia insia run-due --limit 3 --quiet >> $HOME/insia-run-due.log 2>&1
 ```
 
-주말에도 올린다면 `1-5`를 `*`로 바꿔 매일 돌게 합니다.
+- 로그(`>>` 뒤)는 **호스트 사용자가 쓸 수 있는 곳**(여기서는 홈 폴더)에 남겨요. Linux에서 `workspace/`는 컨테이너 사용자(10001)의 폴더라 그 안의 `logs/`로 보내면 로그 파일을 만들지 못하고, 그러면 **명령이 아예 돌지 않아요**(cron은 아무것도 알려 주지 않아요). 로그는 `tail $HOME/insia-run-due.log`로 봐요.
+- 주말에도 올린다면 `1-5`를 `*`로 바꿔 매일 돌게 합니다.
 
 ## 9. 보안
 
@@ -447,7 +471,7 @@ workspace/
 - **API 키·토큰**은 `.env`나 환경 변수에만 두고 git·메신저에 올리지 마세요. 새어 나갔다면 Anthropic 콘솔에서 키를 지우고 새로 만드세요.
 - **개인정보**: 팀원 실명은 사업계획서에 쓰지 않도록 검사합니다(블라인드). 고객 개인정보가 든 자료는 넣지 마세요. 자료와 초안은 워크스페이스(내 PC)에 저장되고, live 모드에서 작성에 필요한 부분이 Anthropic API로 전송됩니다.
 - **API 게시 토큰**(LinkedIn·인스타그램)은 워크스페이스의 `credentials/secrets.sqlite`에만 저장해요(폴더 0700, 파일 0600). `insia.db`, 로그, API 응답, 내보내기, `insia backup`에는 들어가지 않아요. Windows는 이런 파일 권한이 없어서 사용자 폴더(예: `문서`) 아래에 워크스페이스를 두세요. 다른 곳에 두려면 `INSIA_CREDENTIALS_DIR`.
-- **인스타그램 이미지 공개**는 이미지 전용 포트(`--media-port`)만 바깥에 연결하는 구성 A를 권해요. 대시보드는 계속 `127.0.0.1`에 둬요 → [12-5](#12-5-이미지만-공개하기-인스타그램).
+- **인스타그램 이미지 공개**는 이미지 전용 포트(`INSIA_MEDIA_PORT`)만 바깥에 연결하는 구성 A를 권해요. 대시보드는 계속 `127.0.0.1`에 둬요 → [12-5](#12-5-이미지만-공개하기-인스타그램).
 - **프록시 접근 로그**: LinkedIn 연결 때 돌아오는 주소(`/oauth/linkedin/callback?code=…&state=…`)의 쿼리를 리버스 프록시가 접근 로그에 남길 수 있어요. INSIA 자신의 로그는 이 쿼리를 잘라 적지만, 프록시 로그에서도 `/oauth/`의 쿼리를 빼거나 LinkedIn 연결은 `http://localhost:8765`로 하세요.
 - 자세한 API와 인증 규칙은 [api.md](api.md)를 보세요.
 
@@ -503,6 +527,7 @@ API 게시를 연결하면 INSIA가 내 LinkedIn·인스타그램 계정으로 �
 | "이 워크스페이스는 더 새 버전의 INSIA로 만들어졌어요" | 옛 버전으로 새 DB를 엶 | [7. 업데이트](#7-업데이트) |
 | Windows에서 한글이 깨져 보여요 | 콘솔 인코딩 | `chcp 65001` 후 다시, 또는 환경 변수 `PYTHONUTF8=1` |
 | Docker: `/data`에 쓸 수 없다는 오류 | 호스트 폴더 권한 (Linux) | `sudo chown -R 10001:10001 workspace` |
+| Docker(Linux): 호스트에서 `workspace/`에 파일을 넣거나 고칠 때 `Permission denied` · cron 로그 파일을 만들지 못해 `run-due`가 돌지 않음 | `workspace`의 주인이 컨테이너 사용자(10001)라 호스트 사용자는 읽기만 돼요 | 파일은 `docker compose cp`로 주고받기([1-2](#1-2-docker로-설치-늘-켜-두는-서버)의 4번), cron 로그는 홈 폴더로(`>> $HOME/insia-run-due.log`, [8](#docker)), 백업 꺼내기는 [6](#6-백업과-복원)의 `docker compose cp`, 복원은 [6](#6-백업과-복원)의 `sudo cp` → `sudo chown -R 10001:10001 workspace` |
 | API 게시(LinkedIn·인스타그램) 관련 메시지 | 연결·공개 주소·토큰 문제 | [12-9. API 게시 문제 해결](#12-9-api-게시-문제-해결) |
 | 예상하지 못한 오류 | 버그일 수 있어요 | `INSIA_DEBUG=1`을 설정하고 다시 실행해 자세한 내용을 개발자에게 전달 |
 
@@ -513,7 +538,7 @@ API 게시를 연결하면 INSIA가 내 LinkedIn·인스타그램 계정으로 �
 | 명령 | 하는 일 |
 |---|---|
 | `insia doctor` | 설치·설정 점검 |
-| `insia serve` | 대시보드 (`--host`, `--port`, `--token`, `--public-host`, `--trust-proxy`; 바깥·프록시에 열면 토큰 필수. 인스타그램 API 게시용 `--media-port`, `--media-base-url`) |
+| `insia serve` | 대시보드 (`--host`, `--port`, `--token`, `--public-host`, `--trust-proxy`; 바깥·프록시에 열면 토큰 필수. 인스타그램 API 게시용 `--media-port`, `--media-base-url`은 그 서버에만 적용되니, 터미널의 `insia publish`도 쓰면 [12-4의 5번](#12-4-인스타그램-연결하기-시험-중)처럼 환경 변수로 저장) |
 | `insia profile show / edit-template / import <파일> / export` | 회사 프로필 |
 | `insia docs add <파일> / list / show <id> / rm <id>` | 참고 자료 |
 | `insia plan-week --theme … [--start] [--days] [--blog N --linkedin N --instagram N] [--weekend 채널] [--replace]` | 한 주 계획 (기본 평일만, `--weekend`로 채널별 주말 허용) |
@@ -531,7 +556,7 @@ API 게시를 연결하면 INSIA가 내 LinkedIn·인스타그램 계정으로 �
 | `insia backup --out <새 폴더>` | 안전한 백업 (`credentials/`·`publish/`·`logs/`·`exports/`는 빼요) |
 | `insia publish status [--check] / setup linkedin / connect linkedin\|instagram / disconnect <플랫폼> [--forget-app]` | API 게시 연결 (선택, [12](#12-api-게시-선택)) |
 | `insia publish preview <id> / send <id> [--visibility] [--ai-label yes\|no]` | 미리보기 · 사람이 확인 코드를 입력해 한 건 게시 (터미널에서만) |
-| `insia publish attempts [<id>] / resolve <기록 id> (--published [--url] \| --not-published \| --check) / refresh` | 게시 기록 · 결과 불명 정리 · 인스타그램 토큰 연장(게시 안 함) |
+| `insia publish attempts [<id>] / resolve <기록 id> (--published [--url] \| --not-published \| --check \| --permalink 주소) / refresh` | 게시 기록 · 결과 불명 정리(`--check`는 인스타그램에서 다시 확인하고, 주소를 하나로 못 정하면 최근 게시물 후보를 보여 줘요) · 비어 있는 게시물 주소 채우기 · 인스타그램 토큰 연장(게시 안 함) |
 
 종료 코드: `0` 성공 · `1` 작업 실패 · `2` 명령을 잘못 씀 · `130` 중단(Ctrl+C).
 
@@ -592,6 +617,8 @@ LinkedIn·인스타그램은 파일을 받아 직접 올리는 대신, **내 개
 7. **60일마다 다시 연결**해야 해요(LinkedIn이 이런 앱에는 갱신 토큰을 주지 않아요). 끝나기 10일 전부터 화면에 "N일 뒤 연결이 끝나요"가 나오고, LinkedIn에 로그인돼 있고 토큰이 살아 있으면 **다시 연결**은 클릭 한 번이에요.
 8. Client Secret이 새어 나갔다면 Auth 탭에서 **Generate a New Client Secret**을 누르고 INSIA에 새 값을 넣어요. 옛 Secret은 보조(Secondary)로 남으니 바꾼 뒤 지워요.
 
+Redirect URL은 앱 정보를 저장하거나 처음 연결할 때 그 주소로 **고정**돼요(LinkedIn에 등록한 주소가 저절로 바뀌면 연결이 깨지기 때문이에요). 나중에 포트나 도메인을 바꿨다면 연결 카드의 **다른 주소 쓰기**나 `insia publish setup linkedin`으로 새 주소를 정하고, 개발자 앱 Auth 탭에도 같은 주소를 넣어요.
+
 INSIA가 저장하는 것: 게시용 토큰, 만료일, 권한 범위, 계정 id(워크스페이스 `credentials/`). **LinkedIn 이름은 저장하지 않아요.** 화면의 이름은 그때그때 LinkedIn에서 받아 와요.
 
 ### 12-4. 인스타그램 연결하기 (시험 중)
@@ -608,18 +635,52 @@ INSIA가 저장하는 것: 게시용 토큰, 만료일, 권한 범위, 계정 id
 2. <https://developers.facebook.com>에서 개발자 계정을 만들고 **Create App**(앱 만들기) → 사용 사례 **Other**(기타) → 앱 유형 **Business**(비즈니스)를 골라 앱을 만들어요.
 3. 앱 대시보드에서 **Instagram** 제품을 추가하고 **API setup with Instagram login**을 골라요.
 4. **Generate access tokens**에서 **Add account**를 눌러 내 인스타그램 계정으로 로그인한 뒤, 계정 옆 **Generate token**을 눌러 토큰을 복사해요. 60일 동안 유효하고, INSIA가 자동으로 연장해요.
-5. INSIA를 인스타그램 게시가 켜진 상태로 다시 시작해요.
+5. 인스타그램 게시 설정을 **늘 적용되게 저장**하고 INSIA를 다시 시작해요. 대시보드 서버뿐 아니라 터미널의 `insia publish …` 명령과 토큰 연장 cron([12-8](#12-8-연결-해제토큰-만료갱신))도 저장한 환경 변수만 읽고, `insia serve`에 준 옵션은 모르거든요.
+   - `INSIA_PUBLISH_INSTAGRAM=1`을 `insia serve` 한 줄 앞에만 붙이면, 새 터미널에서는 인스타그램이 **꺼짐**으로 보이고 `insia publish connect instagram`도 안 돼요. 토큰 연장 cron도 아무것도 연장하지 않아요.
+   - 미디어 설정을 `serve`의 `--media-port`·`--media-base-url` 옵션으로만 주면 서버는 되지만, 터미널의 `insia publish status`에는 '이미지 공개 주소:' 줄에 "미디어 공개 주소(…)가 없어요"가 나오고(계정을 연결한 뒤에는 인스타그램이 **지금 쓸 수 없음**), `publish preview`·`send`는 "공개 HTTPS 주소에서 가져가요" 오류로 멈춰요. 토큰 연장은 미디어 설정 없이도 돼요.
+
+   아래 표와 예시는 권하는 **구성 A**(이미지 전용 포트, [12-5](#12-5-이미지만-공개하기-인스타그램))의 값이에요. 대시보드를 이미 공개 도메인으로 쓰는 **구성 B**라면 `INSIA_MEDIA_PORT`는 **넣지 말고** [12-5](#12-5-이미지만-공개하기-인스타그램)의 구성 B 값을 저장해요. `INSIA_MEDIA_PORT`가 있으면 INSIA가 구성 A로 알아듣고, 대시보드 포트는 이미지를 내주지 않아요.
+
+   | 설정 | 예 | 뜻 |
+   |---|---|---|
+   | `INSIA_PUBLISH_INSTAGRAM` | `1` | 인스타그램 API 게시 켜기 (시험 중) |
+   | `INSIA_MEDIA_PORT` | `8766` | 이미지 전용 포트 ([12-5](#12-5-이미지만-공개하기-인스타그램)의 구성 A) |
+   | `INSIA_MEDIA_BASE_URL` | `https://media.example.com` | 인스타그램이 이미지를 가져갈 공개 주소 (내 도메인으로 바꿔요) |
+
+   macOS·Linux: [8. 자동 실행](#macos--linux-cron)의 `~/.insia.env`에 세 줄을 넣고, 새 터미널이 열릴 때마다 이 파일을 불러오게 해요(처음 한 번만).
 
    ```bash
-   INSIA_PUBLISH_INSTAGRAM=1 insia serve --media-port 8766 --media-base-url https://media.example.com
+   cat >> ~/.insia.env <<'EOF'
+   export INSIA_PUBLISH_INSTAGRAM=1
+   export INSIA_MEDIA_PORT=8766
+   export INSIA_MEDIA_BASE_URL="https://media.example.com"
+   EOF
+   echo '. "$HOME/.insia.env"' >> ~/.zshrc     # Linux의 bash는 ~/.bashrc
    ```
 
-   Windows는 `setx INSIA_PUBLISH_INSTAGRAM 1` 후 새 터미널에서, Docker는 `.env`에 `INSIA_PUBLISH_INSTAGRAM=1`을 적어요.
+   Windows (PowerShell, 새로 연 터미널부터 적용돼요):
+
+   ```powershell
+   setx INSIA_PUBLISH_INSTAGRAM 1
+   setx INSIA_MEDIA_PORT 8766
+   setx INSIA_MEDIA_BASE_URL "https://media.example.com"
+   ```
+
+   Docker: `.env`에 같은 세 줄(`INSIA_PUBLISH_INSTAGRAM=1`, `INSIA_MEDIA_PORT=8766`, `INSIA_MEDIA_BASE_URL=https://media.example.com`)을 적고 `docker compose up -d`로 다시 켜요. `docker compose exec`로 부르는 명령도 이 값을 받아요.
+
+   그다음 **새 터미널**에서 서버를 켜고, 다른 터미널에서 설정이 들어갔는지 확인해요.
+
+   ```bash
+   insia serve                 # 옵션 없이: 저장한 INSIA_MEDIA_PORT로 이미지 전용 포트도 함께 열려요
+   insia publish status        # '인스타그램:' 줄이 '꺼짐'이 아니고, '이미지 공개 주소:' 줄에 내 주소가 보이면 돼요
+   ```
+
+   LinkedIn 앱 정보(`INSIA_LINKEDIN_CLIENT_ID` …)나 `INSIA_LINKEDIN_HASHTAGS`를 환경 변수로 정할 때도 같은 방법으로 저장해요. 터미널 명령은 저장한 환경 변수만 읽어요.
 6. **브랜드·자료 → API 게시 연결 → 인스타그램**에 토큰을 붙여 넣고 **연결**을 눌러요. 토큰은 화면에 보이지 않고, 저장한 뒤 다시 보여 주지 않아요.
-   - 터미널: `insia publish connect instagram`(입력이 화면에 보이지 않아요).
+   - 터미널: 5번의 설정을 저장한 새 터미널에서 `insia publish connect instagram`(입력이 화면에 보이지 않아요).
    - Docker: `docker compose exec -T insia insia publish connect instagram --token-stdin < token.txt` (다 쓴 뒤 `token.txt`는 지워요).
 7. 앱 검수(App Review)는 내 계정에만 올릴 때는 필요 없어요. 앱은 개발 모드 그대로 둬요.
-8. 서버가 켜져 있으면 INSIA가 토큰을 자동으로 연장해요. 서버를 늘 켜 두지 않는다면 [12-8](#12-8-연결-해제토큰-만료갱신)의 `insia publish refresh`를 일주일에 한 번 돌려 주세요. 60일 동안 한 번도 연장하지 못하면 새 토큰을 만들어 붙여 넣어야 해요.
+8. 서버가 켜져 있으면 INSIA가 토큰을 자동으로 연장해요. 서버를 늘 켜 두지 않는다면 [12-8](#12-8-연결-해제토큰-만료갱신)의 `insia publish refresh`를 일주일에 한 번 돌려 주세요(cron이 읽는 `~/.insia.env`에 5번의 `INSIA_PUBLISH_INSTAGRAM=1`이 있어야 해요). 60일 동안 한 번도 연장하지 못하면 새 토큰을 만들어 붙여 넣어야 해요.
 
 INSIA가 저장하는 것: 게시용 토큰, 만료일, 계정 id, @핸들.
 
@@ -629,9 +690,13 @@ INSIA가 저장하는 것: 게시용 토큰, 만료일, 계정 id, @핸들.
 
 **구성 A (권장): 이미지 전용 포트 하나만 바깥에 연결**
 
+[12-4의 5번](#12-4-인스타그램-연결하기-시험-중)처럼 `INSIA_MEDIA_PORT=8766`과 `INSIA_MEDIA_BASE_URL=https://media.example.com`을 저장해 두고 그냥 켜요.
+
 ```bash
-insia serve --media-port 8766 --media-base-url https://media.example.com   # 대시보드는 http://127.0.0.1:8765 그대로
+insia serve      # 8766에 이미지 전용 포트를 함께 열어요. 대시보드는 http://127.0.0.1:8765 그대로
 ```
+
+- `insia serve --media-port 8766 --media-base-url https://media.example.com`처럼 옵션으로 줘도 서버는 똑같이 열리지만, 옵션은 그 서버에만 적용돼요. 터미널의 `insia publish preview`·`send`·`refresh`는 환경 변수만 읽으니 저장해 두는 방법을 권해요.
 
 - 8766 포트는 `/pub/m/<무작위 32자>/01.jpg` 같은 게시용 이미지 말고는 아무것도 보여 주지 않아요(다른 주소는 모두 404). 대시보드 코드도 로그인 쿠키도 없어서, 설정을 잘못해 이 포트 전체가 열려도 보관함이 새지 않아요.
 - 이미지 이름은 추측할 수 없는 무작위 값이고, 게시가 끝나면 바로, 늦어도 24시간 안에 지워요.
@@ -666,11 +731,29 @@ ingress:
 - 프록시에 비밀번호(`basicauth`)나 Cloudflare 봇 차단·Access 로그인을 걸었다면 `/pub/m/`에서는 꺼 주세요. 인스타그램(Meta)의 이미지 수집기는 로그인 없이 와요.
 - INSIA는 인스타그램에 요청하기 전에 공개 주소로 이미지를 직접 열어 보고(리다이렉트도 실패로 봐요), 안 열리면 아무것도 만들지 않고 멈춰요. 같은 서버에서 자기 도메인으로 나갔다 들어오는 요청이 막힌 환경이면 `INSIA_PUBLISH_SKIP_SELF_CHECK=1`로 이 점검을 건너뛸 수 있어요.
 - Docker: `.env`에 `INSIA_MEDIA_PORT=8766`, `INSIA_MEDIA_BASE_URL=https://media.example.com`을 적고, `docker-compose.yml`의 `"127.0.0.1:8766:8766"` 줄 주석을 풀어요. 이 포트도 `127.0.0.1`에만 열어요.
-- 터미널에서만 게시할 때(`insia publish send`)는 서버가 꺼져 있어도, 보내는 동안만 INSIA가 같은 포트에 이미지 리스너를 잠깐 열어요. 터널·프록시는 켜져 있어야 해요.
+- 터미널에서만 게시할 때(`insia publish send`)는 서버가 꺼져 있어도, 보내는 동안만 INSIA가 `INSIA_MEDIA_PORT`(예: 8766)에 이미지 리스너를 잠깐 열어요. 이 포트와 공개 주소는 환경 변수에서만 읽으니 [12-4의 5번](#12-4-인스타그램-연결하기-시험-중)처럼 저장해 두세요. 터널·프록시는 켜져 있어야 해요.
 
 **구성 B: 이미 대시보드를 공개 도메인으로 쓰는 서버**
 
-[9. 보안](#9-보안)대로 HTTPS 프록시 + `--public-host` + 접근 토큰으로 대시보드를 이미 공개했다면, 그 도메인을 미디어 주소로 써도 돼요(`--media-base-url https://insia.example.com`, 미디어 포트 없이). 그러면 대시보드 포트가 `/pub/m/` 이미지도 내줘요. 새로 여는 분에게는 구성 A를 권해요.
+[9. 보안](#9-보안)대로 HTTPS 프록시 + 도메인 + 접근 토큰으로 대시보드를 이미 공개했다면, 그 도메인을 미디어 주소로 써도 돼요. 그러면 대시보드 포트가 `/pub/m/` 이미지도 내줘요. 새로 여는 분에게는 구성 A를 권해요.
+
+- 구성 A처럼 설정을 **늘 적용되게 저장**해요. 이때 `serve`의 `--public-host`·`--trust-proxy` 옵션 대신 같은 뜻의 환경 변수(`INSIA_PUBLIC_HOSTS`·`INSIA_TRUST_PROXY`)를 저장해야 터미널 명령도 구성 B로 알아들어요. **`INSIA_MEDIA_PORT`는 넣지 마세요.** 있으면 구성 A로 바뀌어 대시보드 포트가 이미지를 내주지 않아요.
+
+  macOS·Linux는 `~/.insia.env`에 넣어요([12-4의 5번](#12-4-인스타그램-연결하기-시험-중)처럼 새 터미널에서 불러와요). 도메인과 토큰은 내 것으로 바꿔요.
+
+  ```bash
+  cat >> ~/.insia.env <<'EOF'
+  export INSIA_ACCESS_TOKEN="만든-토큰"
+  export INSIA_PUBLIC_HOSTS=insia.example.com
+  export INSIA_TRUST_PROXY=1
+  export INSIA_PUBLISH_INSTAGRAM=1
+  export INSIA_MEDIA_BASE_URL="https://insia.example.com"
+  EOF
+  ```
+
+  Windows는 같은 다섯 값을 `setx`로 저장해요. Docker는 `.env`에 `INSIA_PUBLIC_HOSTS=insia.example.com`, `INSIA_TRUST_PROXY=1`과 함께 `INSIA_PUBLISH_INSTAGRAM=1`, `INSIA_MEDIA_BASE_URL=https://insia.example.com`을 적어요. `INSIA_MEDIA_PORT`는 비워 두고 `docker-compose.yml`의 8766 줄도 주석 그대로 둬요.
+- 그다음 옵션 없이 `insia serve`로 켜요. 다른 터미널의 `insia publish status`에서 '이미지 공개 주소:' 줄이 `https://insia.example.com (대시보드 포트)`이면 돼요.
+- 구성 B에서는 대시보드 포트가 이미지를 내주니, 터미널에서 게시할 때(`insia publish send`)도 `insia serve`가 켜져 있어야 해요.
 
 둘 다 하지 않으면 인스타그램 API 게시 버튼은 꺼진 채 이유를 보여 주고, 지금처럼 카드 묶음(zip)을 받아 앱에서 올린 뒤 **게시 완료 표시**를 누르면 돼요.
 
@@ -708,7 +791,9 @@ insia publish send <콘텐츠 id> --ai-label no       # 인스타그램은 --ai-
 - LinkedIn: LinkedIn의 내 활동에서 글이 있는지 본 뒤 **올라갔어요 — 주소 넣기(선택)** 또는 **안 올라갔어요**를 눌러요. "안 올라갔어요"는 두 번 올라가는 일을 막으려고 한 번 더 물어요.
 - 인스타그램: 먼저 **인스타그램에서 다시 확인**을 누르면 INSIA가 확인해 정리해요(읽기만 하고 게시하지 않아요). 그래도 모르면 앱에서 확인하고 같은 두 버튼으로 정리해요.
 - 정리하기 전에는 그 콘텐츠를 편집·재검수·보관하거나 상태를 바꿀 수 없어요.
-- 터미널: `insia publish attempts`로 기록을 보고, `insia publish resolve <기록 id> --published [--url 주소]` / `--not-published` / `--check`(인스타그램 다시 확인).
+- 터미널: `insia publish attempts`로 기록을 보고, `insia publish resolve <기록 id> --published [--url 주소]` / `--not-published` / `--check`(인스타그램 다시 확인, 후보가 여러 개면 목록을 보여 줘요).
+- 게시는 됐는데 주소가 비어 있으면(인스타그램이 주소를 하나로 정하지 못했을 때) 대시보드에서 후보 중 **이 게시물이에요**를 누르거나 주소를 넣고, 터미널에서는 `insia publish resolve <기록 id> --permalink 주소`.
+- API 게시 기능을 꺼 둔 상태(`INSIA_PUBLISH=0`)에서도 기록 보기와 정리(올라갔어요·안 올라갔어요·주소 넣기)는 돼요. 새로 보내기와 인스타그램 다시 확인만 막혀요.
 
 ### 12-8. 연결 해제·토큰 만료·갱신
 
@@ -720,8 +805,10 @@ insia publish send <콘텐츠 id> --ai-label no       # 인스타그램은 --ai-
   0 9 * * 1 . $HOME/.insia.env; $HOME/Documents/insia/.venv/bin/insia publish refresh >> $HOME/Documents/insia/workspace/logs/publish-refresh.log 2>&1
   ```
 
-  Docker: `0 9 * * 1 cd /srv/insia && docker compose exec -T insia insia publish refresh`
-- **기능 끄기**: `INSIA_PUBLISH=0`이면 API 게시 기능 전체가 숨겨지고(연결 카드도 없어요) 모든 게시 경로가 막혀요.
+  cron이 불러오는 `~/.insia.env`에 `export INSIA_PUBLISH_INSTAGRAM=1`을 넣어 두세요([12-4의 5번](#12-4-인스타그램-연결하기-시험-중)). 없어도 저장된 토큰은 연장하지만, 로그에 "인스타그램 API 게시가 꺼져 있어요"가 함께 남고 그 환경의 터미널 명령에서는 인스타그램이 꺼진 것으로 보여요. 넣은 뒤 터미널에서 `. ~/.insia.env; insia publish refresh`를 한 번 돌려 "갱신했어요"가 나오는지 확인해요.
+
+  Docker(`.env`에 `INSIA_PUBLISH_INSTAGRAM=1`이 있으면 돼요): `0 9 * * 1 cd /srv/insia && docker compose exec -T insia insia publish refresh >> $HOME/insia-publish-refresh.log 2>&1`
+- **기능 끄기**: `INSIA_PUBLISH=0`이면 API 게시 기능이 숨겨지고(연결 카드도 없어요) 새로 보내는 경로가 모두 막혀요. 이미 있는 게시 기록을 보고 정리하는 것은 그대로 돼요([12-7](#12-7-결과를-모를-때-정리하기)).
 
 ### 12-9. API 게시 문제 해결
 
@@ -736,8 +823,9 @@ insia publish send <콘텐츠 id> --ai-label no       # 인스타그램은 --ai-
 | "LinkedIn 연결이 끝났거나 해제됐어요" | 60일 만료 또는 LinkedIn에서 권한을 거둠 | **다시 연결** |
 | "LinkedIn 하루 한도에 걸렸어요" | 하루 게시 한도 | 한국 시간 오전 9시(UTC 자정) 이후 다시 |
 | "LinkedIn API 버전 …이 …에 끝나요" | INSIA가 오래됨 | [7. 업데이트](#7-업데이트) |
-| 인스타그램 버튼이 꺼져 있고 "공개 HTTPS 주소에서 가져가요" | 미디어 주소가 없음 | [12-5](#12-5-이미지만-공개하기-인스타그램) |
-| "인스타그램이 이미지를 가져갈 공개 주소 …에 바깥에서 접속되지 않아요" | 터널·프록시가 꺼짐, 8766이 아닌 포트를 가리킴, 비밀번호·봇 차단 | 터널·프록시를 켜고 `/pub/m/` 예외 확인 |
+| 인스타그램 버튼이 꺼져 있거나 터미널에서 "공개 HTTPS 주소에서 가져가요" · `publish status`에 "미디어 공개 주소(…)가 없어요" 또는 "미디어 전용 포트(…)를 함께 정해 주세요" | 미디어 설정이 없거나 모자람. 터미널 명령은 `serve`의 `--media-port`·`--media-base-url`·`--public-host`를 모르고 환경 변수만 읽어요 | 구성 A는 `INSIA_MEDIA_PORT`·`INSIA_MEDIA_BASE_URL`을, 구성 B는 `INSIA_MEDIA_BASE_URL`·`INSIA_PUBLIC_HOSTS`를(`INSIA_MEDIA_PORT` 없이) 늘 적용되게 저장([12-4](#12-4-인스타그램-연결하기-시험-중)의 5번, [12-5](#12-5-이미지만-공개하기-인스타그램)) |
+| 터미널에서 "인스타그램 API 게시는 아직 시험 중이라 꺼져 있어요" · `publish refresh` 로그에 "인스타그램 API 게시가 꺼져 있어요"(토큰은 연장돼요) · `publish status`에 `인스타그램: 꺼짐` | `INSIA_PUBLISH_INSTAGRAM=1`을 `insia serve` 한 줄에만 붙였거나, cron이 읽는 `~/.insia.env`에 없음 | [12-4](#12-4-인스타그램-연결하기-시험-중)의 5번처럼 늘 적용되게 저장하고 새 터미널에서 다시 |
+| "인스타그램이 이미지를 가져갈 공개 주소 …에 바깥에서 접속되지 않아요" | 터널·프록시가 꺼짐, 8766이 아닌 포트를 가리킴, 비밀번호·봇 차단 · 구성 B인데 `insia serve`가 꺼져 있거나 `INSIA_MEDIA_PORT`도 저장함(`publish status`에 "이미지 전용 포트"로 나와요) | 터널·프록시를 켜고 `/pub/m/` 예외 확인 · 구성 B는 `insia serve`를 켜 두고 `INSIA_MEDIA_PORT`를 지우기 |
 | "인스타그램 프로페셔널 계정(비즈니스·크리에이터)만 연결할 수 있어요" | 개인 계정 | 앱에서 프로페셔널 계정으로 바꾸기 |
 | "토큰이 맞지 않거나 만료됐어요" · "새 토큰을 붙여 넣어 주세요" | 잘못 복사했거나 60일이 지남 | Meta 앱의 **Generate token**으로 새로 만들어 붙여 넣기 |
 | "오늘 인스타그램 API 게시 한도(…)를 다 썼어요" | 24시간 게시 한도 | 내일 다시, 또는 앱에서 직접 |

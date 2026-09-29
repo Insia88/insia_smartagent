@@ -855,6 +855,48 @@ def test_doctor(capsys):
     assert code == 0 and report["ok"] is True and any(c["label"] == "워크스페이스" for c in report["checks"])
 
 
+def test_doctor_render_line_checks_the_browser_and_knows_the_docker_image(tmp_path, capsys, monkeypatch):
+    """Final review F1-15: in the Docker image a pip install cannot give card rendering (the fix is a rebuild with
+    INSIA_WITH_RENDER=1), and the playwright package without a Chromium is not "설치됨"."""
+    import importlib.util
+
+    real_find_spec = importlib.util.find_spec
+    playwright_installed = {"on": True}
+
+    def find_spec(name, *args):
+        if name.split(".")[0] == "playwright":
+            return real_find_spec("json") if playwright_installed["on"] else None  # any spec stands for "installed"
+        return real_find_spec(name, *args)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    monkeypatch.delenv("INSIA_CHROMIUM", raising=False)
+
+    def render_line() -> dict:
+        code, out, _ = run(capsys, "doctor", "--json")
+        return next(c for c in json.loads(out)["checks"] if "playwright" in c["label"])
+
+    browsers = tmp_path / "pw-browsers"
+    browsers.mkdir()
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(browsers))
+    line = render_line()
+    assert line["level"] == "warn" and "python -m playwright install chromium" in line["message"]  # package, no browser
+    (browsers / "chromium_headless_shell-1243").mkdir()
+    assert render_line() == {"level": "ok", "label": "카드뉴스 PNG (playwright)", "message": "설치됨"}
+    monkeypatch.setenv("INSIA_CHROMIUM", str(tmp_path / "no-such-chrome"))
+    assert render_line()["level"] == "warn"
+    monkeypatch.delenv("INSIA_CHROMIUM")
+    playwright_installed["on"] = False
+    assert 'pip install "insia-smartagent[render]"' in render_line()["message"]
+    # the image (its Dockerfile sets PLAYWRIGHT_BROWSERS_PATH=/opt/playwright): rebuild, never pip
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/playwright")
+    line = render_line()
+    assert "INSIA_WITH_RENDER=1" in line["message"] and "docker compose up -d --build" in line["message"]
+    assert "pip install" not in line["message"]
+    playwright_installed["on"] = True  # pip put the package in ~/.local, but the image has no browser
+    line = render_line()
+    assert line["level"] == "warn" and "INSIA_WITH_RENDER=1" in line["message"] and "pip install" not in line["message"]
+
+
 def test_run_budget_stop_prints_resume_hint(capsys, monkeypatch):
     from insia_agents import pipeline
 
@@ -981,6 +1023,14 @@ def test_runs_list_filters_by_content_item(env, capsys):
     assert code == 0 and rows[0]["run_id"] in out and run_id not in out
     code, out, _ = run(capsys, "runs", "list", "--item", other_id)
     assert code == 0 and "돌린 작업" in out and other_id in out
+    # a shortened id works like in every other command; an unknown one is an error, not "no jobs" (final review F1-11)
+    short = item_id.split("-", 2)[-1]
+    code, out, _ = run(capsys, "runs", "list", "--item", short, "--json")
+    assert code == 0 and [r["run_id"] for r in json.loads(out)] == [rows[0]["run_id"]]
+    code, out, _ = run(capsys, "runs", "list", "--item", other_id.split("-", 2)[-1])
+    assert code == 0 and f"콘텐츠 {other_id}에 돌린 작업" in out  # the resolved full id
+    code, out, err = run(capsys, "runs", "list", "--item", "it_nope_linkedin")
+    assert code == 1 and "찾을 수 없어요" in err and out == ""
     code, out, _ = run(capsys, "runs", "list", "-h")
     assert "--item" in out
 

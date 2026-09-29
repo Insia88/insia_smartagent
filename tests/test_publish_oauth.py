@@ -205,3 +205,97 @@ def test_secret_filter_masks_codes_states_and_tokens(publish_kit, caplog):
     for secret in ("code-value-777", state, TOKEN):
         assert secret not in text
     assert "***" in text
+
+
+@pytest.fixture
+def empty_register(monkeypatch):
+    """A private, empty secret register for one test (the process-wide one comes back afterwards)."""
+    from collections import OrderedDict
+
+    from insia_agents.publishers import redact as redact_module
+
+    monkeypatch.setattr(redact_module, "_PINNED", set())
+    monkeypatch.setattr(redact_module, "_TRANSIENT", OrderedDict())
+    monkeypatch.setattr(redact_module, "_ORDERED", ())
+    monkeypatch.setattr(redact_module, "_DIRTY", False)
+    return redact_module
+
+
+def test_unchecked_callback_values_never_join_the_secret_register(publish_kit, empty_register):
+    """Final review F1-0: the callback needs no access token, so a stranger's code/state must not be registered
+    (they would blank that text out of every later log line and grow the register without limit)."""
+    from insia_agents.server_publish import log_requestline
+
+    service, fake = _service(publish_kit)
+    before = empty_register.registered_count()
+    access_line = "GET /api/health HTTP/1.1"
+    big = "A" * 1900
+    for code, state in (("HTTP/1.1", "/api/health"), (big + "c", big + "s"), ("insia_agents", "Traceback")):
+        assert service.linkedin_callback(code=code, state=state, cookie="") == "invalid"
+        with pytest.raises(OAuthStateError):
+            service.linkedin_complete(f"code={urllib.parse.quote(code)}&state={urllib.parse.quote(state)}")
+    listener = OneShotCallbackListener(0, state_ok=lambda s: s == "good-state")
+    port = listener.start()
+    try:
+        status, _, _ = _raw_get(port, "/oauth/linkedin/callback?code=listener-stranger&state=bad-state-xyz",
+                                f"127.0.0.1:{port}")
+        assert status == 400
+    finally:
+        listener.close()
+    assert empty_register.registered_count() == before
+    assert log_requestline(access_line) == access_line
+    assert empty_register.redact("Traceback in insia_agents") == "Traceback in insia_agents"
+    # a real flow still masks the state it issued and the code it exchanged
+    start = service.linkedin_connect(request_origin="http://localhost:8765")
+    state = _state(start)
+    assert service.linkedin_callback(code="real-code-4567", state=state, cookie="forged") == "invalid"
+    assert empty_register.redact("real-code-4567") == "real-code-4567"  # not exchanged: not registered
+    _script_exchange(fake)
+    assert service.linkedin_callback(code="real-code-4567", state=state, cookie=start.cookie_value) == "ok"
+    assert empty_register.redact(f"x real-code-4567 {state} {TOKEN}") == "x *** *** ***"
+
+
+def test_secret_register_is_bounded_and_keeps_pinned_credentials(empty_register):
+    reg = empty_register
+    reg.register_secret("pinned-token-value-001", pin=True)
+    reg.register_secret("x" * (reg.MAX_SECRET_LENGTH + 1))  # longer than any credential INSIA holds: ignored
+    first = "transient-00000"
+    for n in range(reg.MAX_TRANSIENT_SECRETS + 50):
+        reg.register_secret(f"transient-{n:05d}")
+    assert reg.registered_count() == reg.MAX_TRANSIENT_SECRETS + 1
+    assert reg.redact("pinned-token-value-001") == "***"
+    assert reg.redact(first) == first  # the oldest one-off value was forgotten
+    assert reg.redact(f"transient-{reg.MAX_TRANSIENT_SECRETS + 49:05d}") == "***"
+    reg.register_secret("pinned-token-value-001")  # registering a pinned value again never unpins it
+    for n in range(reg.MAX_TRANSIENT_SECRETS + 1):
+        reg.register_secret(f"later-{n:05d}")
+    assert reg.redact("pinned-token-value-001") == "***"
+
+
+def test_the_redirect_uri_a_person_registered_is_kept_for_every_later_process(publish_kit):
+    """Final review F1-5: the dashboard on ``serve --port 9119`` shows (and the person registers) the :9119 address;
+    a later ``insia publish connect linkedin`` (a process that would derive :8765) must send that same address."""
+    dashboard = publish_kit.service(server_port=9119)
+    block = dashboard.save_linkedin_app(client_id="86clientid", client_secret="li-app-secret-xyz")
+    registered = "http://localhost:9119/oauth/linkedin/callback"
+    assert block["app"]["redirect_uri"] == registered and block["app"]["redirect_uri_source"] == "workspace"
+    cli_like = publish_kit.service(server_port=8765)
+    assert cli_like.platform_status("linkedin")["app"]["redirect_uri"] == registered
+    start = cli_like.linkedin_connect()
+    assert urllib.parse.parse_qs(urllib.parse.urlsplit(start.authorize_url).query)["redirect_uri"] == [registered]
+    # a person's own choice replaces it; "" goes back to the default of the process that saves next
+    cli_like.save_linkedin_app(redirect_uri="http://localhost:8766/oauth/linkedin/callback")
+    assert dashboard.platform_status("linkedin")["app"]["redirect_uri"].endswith(":8766/oauth/linkedin/callback")
+
+
+def test_a_first_connection_pins_the_redirect_uri_it_sent(publish_kit):
+    env = {"INSIA_LINKEDIN_CLIENT_ID": "86clientid", "INSIA_LINKEDIN_CLIENT_SECRET": "li-app-secret-xyz"}
+    first = publish_kit.service(env, server_port=9119)  # app info from the environment: nothing was saved
+    assert first.platform_status("linkedin")["app"]["redirect_uri_source"] == "default"
+    first.linkedin_connect()
+    assert publish_kit.service(env, server_port=8765).platform_status("linkedin")["app"]["redirect_uri"] == \
+        "http://localhost:9119/oauth/linkedin/callback"
+    fixed = {**env, "INSIA_LINKEDIN_REDIRECT_URI": "https://insia.example.com/oauth/linkedin/callback"}
+    service = publish_kit.service(fixed)
+    service.linkedin_connect()  # an environment value is never copied into the workspace
+    assert service.platform_status("linkedin")["app"]["redirect_uri_source"] == "env"

@@ -7,7 +7,7 @@
   one transaction (``set_many``), so the worker's "account unchanged" check before sending reads a consistent pair.
 * Nothing is created until something is saved: reading a store that does not exist returns empty values (a user who
   never set publishing up gets no ``credentials/`` folder).
-* Every secret value read or written is registered with ``redact.register_secret`` (logs never show it).
+* Every secret value read or written is registered (pinned) with ``redact.register_secret`` (logs never show it).
 * A connection per operation (journal mode ``DELETE``, busy timeout): the server and a CLI command may use the
   same store at the same time.
 
@@ -124,7 +124,7 @@ class CredentialStore:
                 conn.close()
         values = {str(k): str(v) for k, v in rows}
         for key in SECRET_KEYS & values.keys():
-            register_secret(values[key])
+            register_secret(values[key], pin=True)
         return values
 
     def value(self, platform: str, key: str) -> str:
@@ -144,7 +144,7 @@ class CredentialStore:
     def set_many(self, platform: str, values: Mapping[str, str | None], *, delete: Iterable[str] = ()) -> None:
         """Write ``values`` (``None`` deletes that key) and delete ``delete`` keys, all in one transaction."""
         for key in SECRET_KEYS & set(values):
-            register_secret(values[key])
+            register_secret(values[key], pin=True)
         now = _now()
         with _LOCK:
             conn = self._connect(create=True)

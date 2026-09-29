@@ -633,7 +633,10 @@ class InstagramPublisher:
 
     def _find_media(self, token: str, ig_id: str, since: str) -> tuple[str, str, list[dict[str, str]]]:
         """The media a ``PUBLISHED`` container became: ``(id, permalink, candidates)``; id/permalink only when exactly
-        one recent post is newer than the attempt (else a person picks from ``candidates``)."""
+        one recent post is newer than the attempt (else a person picks from ``candidates``, DESIGN.md 4-2-7: the
+        dashboard lists them, ``insia publish resolve --check`` prints them). Posts other INSIA attempts already
+        recorded are not candidates; a candidate's permalink is kept only on Instagram's own hosts and its time is
+        ISO 8601 UTC."""
         try:
             response = self.client.recent_media(token, ig_id)
         except TransportError:
@@ -642,17 +645,29 @@ class InstagramPublisher:
         rows = body.get("data") if isinstance(body, dict) else None
         start = _parse(since) or datetime.min.replace(tzinfo=timezone.utc)
         start -= timedelta(seconds=60)  # clock skew between this machine and Instagram
+        known = self._recorded_media_ids()
         candidates = []
         for row in rows if isinstance(rows, list) else []:
-            if not isinstance(row, dict) or not row.get("id"):
+            if not isinstance(row, dict) or not row.get("id") or str(row["id"]) in known:
                 continue
             stamp = _parse(str(row.get("timestamp") or ""))
             if stamp is not None and stamp >= start:
-                candidates.append({"id": str(row["id"]), "permalink": str(row.get("permalink") or ""),
-                                   "timestamp": str(row.get("timestamp") or "")})
+                candidates.append({"id": str(row["id"])[:100],
+                                   "permalink": self.service.checked_permalink("instagram", str(row.get("permalink") or "")),
+                                   "timestamp": _fmt(stamp)})
+            if len(candidates) >= 10:
+                break
         if len(candidates) == 1:
-            return candidates[0]["id"], self.service.checked_permalink("instagram", candidates[0]["permalink"]), candidates
+            return candidates[0]["id"], candidates[0]["permalink"], candidates
         return "", "", candidates
+
+    def _recorded_media_ids(self) -> set[str]:
+        """Instagram media ids INSIA already recorded for other published attempts (they are not this attempt's post)."""
+        try:
+            attempts = self.service.workspace.list_publish_attempts(status="published", limit=200)
+        except Exception:  # noqa: BLE001 - only narrows the candidates
+            return set()
+        return {a.external_id for a in attempts if a.platform == "instagram" and a.external_id}
 
     def _permalink(self, token: str, media_id: str) -> str:
         try:

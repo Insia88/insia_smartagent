@@ -38,8 +38,8 @@ from .backends import create_backend
 from .backends.base import Backend, BackendError, RunContext
 from .channels import check_format
 from .config import Settings, resolve_mode
-from .db import (NotFoundError, RunTakenOverError, Workspace, WorkspaceError, normalize_hashtags, pipeline_item_id,
-                 profile_is_empty)
+from .db import (ItemLockedError, NotFoundError, RunTakenOverError, Workspace, WorkspaceError, normalize_hashtags,
+                 pipeline_item_id, profile_is_empty)
 from .events import EventBus, RealClock, SimClock
 from .models import (Brief, CalendarSlot, ContentItem, ContentItemDetail, Draft, DraftVersion, FormatCheck, Plan, Profile,
                      ResearchPack, ResearchQuestion, Review, RunResult)
@@ -100,6 +100,14 @@ def _require_item(workspace: Workspace, item_id: str) -> ContentItemDetail:
     if detail is None:
         raise NotFoundError(f"콘텐츠 {item_id}를 찾을 수 없어요")
     return detail
+
+
+def _require_unlocked(workspace: Workspace, item_id: str) -> None:
+    """Refuse a paid job before it starts when an API publish attempt holds the item ('sending' or 'unknown'):
+    its result could never be stored (the item lock), so the agent calls would be wasted."""
+    attempt = workspace.active_publish_attempt(item_id)
+    if attempt is not None:
+        raise ItemLockedError(attempt_id=attempt.id, platform=attempt.platform, status=attempt.status)
 
 
 def _latest(detail: ContentItemDetail, what: str) -> DraftVersion:
@@ -310,6 +318,7 @@ def review_item(workspace: Workspace, item_id: str, *, settings: Settings | None
     """
     settings = settings or Settings.from_env()
     detail = _require_item(workspace, item_id)
+    _require_unlocked(workspace, item_id)
     latest = _latest(detail, "검수할")
     brief = _item_brief(detail)
     research = workspace.item_research(item_id) or _empty_research()
@@ -358,6 +367,7 @@ def revise_item(workspace: Workspace, item_id: str, instructions: str = "", *, s
     if len(instructions) > MAX_INSTRUCTIONS_CHARS:
         raise WorkspaceError(f"수정 지시가 너무 길어요 ({len(instructions):,}자). {MAX_INSTRUCTIONS_CHARS:,}자 이하로 줄여 주세요.")
     detail = _require_item(workspace, item_id)
+    _require_unlocked(workspace, item_id)
     latest = _latest(detail, "수정할")
     brief = _item_brief(detail)
     plan = workspace.item_plan(item_id) or _empty_plan(brief)

@@ -789,11 +789,16 @@ def test_no_secret_in_any_publishing_answer(srv):
         _no_secrets("\n".join(v for _, v in resp.getheaders()))
 
 
+# The record-only routes never call a platform: they keep answering while publishing is off, so an attempt left
+# 'unknown' before INSIA_PUBLISH=0 can still be answered and its item unlocked (final review F1-1).
+RECORD_ONLY_ROUTES = {"publish_item_attempts", "publish_attempt", "publish_permalink", "publish_resolve"}
+
+
 def test_disabled_publishing_answers_409_everywhere(srv, tmp_path):
     stub = _fresh(srv, env={"INSIA_PUBLISH": "0"}).publish
     item = make_item(srv.manager.workspace)
     sample = {"<id>": item.id, r"(linkedin|instagram)": "linkedin", r"(\d{1,2})\.jpg": "1.jpg"}
-    for method, pattern, _handler, _auth in PUBLISH_ROUTES:
+    for method, pattern, handler, _auth in PUBLISH_ROUTES:
         path = pattern
         for key, value in sample.items():
             path = path.replace(key, value)
@@ -801,6 +806,9 @@ def test_disabled_publishing_answers_409_everywhere(srv, tmp_path):
         if (method, path) == ("GET", "/api/publish"):  # the status route says "off" so the dashboard draws nothing
             assert resp.status == 200 and body["enabled"] is False and body["platforms"] == {}
             assert body["configured"] is False and body["reason"] == "API 게시가 꺼져 있어요 (INSIA_PUBLISH=0)."
+            continue
+        if handler in RECORD_ONLY_ROUTES:
+            assert (body or {}).get("code") != "disabled", (method, path)
             continue
         assert (resp.status, body["code"]) == (409, "disabled"), (method, path)
         assert body["error"] == "API 게시가 꺼져 있어요 (INSIA_PUBLISH=0)."
@@ -1191,6 +1199,52 @@ def test_real_service_switches_and_the_ai_label(real, tmp_path):
     assert call(real, "GET", "/api/publish")[1]["enabled"] is False
     assert call(real, "POST", f"/api/items/{item.id}/publish/preview", {"options": {"is_ai_generated": False}})[1][
         "code"] == "disabled"
+
+
+def _unknown_attempt(ws: Workspace, item: ContentItem, platform: str = "linkedin") -> PublishAttempt:
+    """An attempt whose platform answer was lost after the write step (the item is locked until a person answers)."""
+    from insia_agents.models import PublishConnection
+
+    ws.save_publish_connection(PublishConnection(platform=platform, account_id="sub-1", status="connected"))
+    digest = "sha256:" + "b" * 64
+    preview = ws.create_publish_preview(item.id, item.version, platform, "sub-1", {"schema": 1}, digest,
+                                        created_via="dashboard", requested_by="dashboard@test")
+    attempt, owner = ws.begin_publish_attempt(preview.id, digest, via="dashboard", requested_by="dashboard@test")
+    ws.claim_publish_write(attempt.id, owner)
+    return ws.finish_publish_failure(attempt.id, owner, status="unknown", error_code="server_error", error="LinkedIn 500")
+
+
+@real_only
+def test_real_service_switched_off_still_answers_an_unknown_attempt(real):
+    """INSIA_PUBLISH=0 after an 'unknown' attempt: the item stays locked, but its lock shows, its history loads and a
+    person can still say what happened (final review F1-1); only what would call a platform stays refused."""
+    from insia_agents.publishers import PublishService
+
+    ws = real.manager.workspace
+    port = real.server_address[1]
+    item = make_item(ws)
+    attempt = _unknown_attempt(ws, item)
+    real.publish.shutdown(timeout=1.0)
+    real.publish = PublishService.from_env(ws, env={"INSIA_PUBLISH": "0"}, server_port=port)
+    block = call(real, "GET", f"/api/items/{item.id}")[1]["publish"]
+    assert block["platform"] == "linkedin" and block["state"] == "disabled" and block["available"] is False
+    assert block["active_attempt"]["id"] == attempt.id and block["active_attempt"]["status"] == "unknown"
+    assert block["reason"] == ItemLockedError.UNKNOWN_MESSAGE
+    resp, body, _ = call(real, "PUT", f"/api/items/{item.id}/draft", {"title": "t", "content": "고친 본문"})
+    assert resp.status == 409 and body["code"] == "item_locked"
+    resp, body, _ = call(real, "GET", f"/api/items/{item.id}/publish")
+    assert resp.status == 200 and [a["id"] for a in body["attempts"]] == [attempt.id]
+    assert call(real, "GET", f"/api/publish/attempts/{attempt.id}")[1]["attempt"]["status"] == "unknown"
+    resp, body, _ = call(real, "POST", f"/api/publish/attempts/{attempt.id}/check", {})
+    assert resp.status == 409 and body["code"] == "disabled"  # a platform call: still off
+    resp, body, _ = call(real, "POST", f"/api/publish/attempts/{attempt.id}/resolve", {"outcome": "not_published"})
+    assert resp.status == 403  # still a person's answer only
+    resp, body, _ = call(real, "POST", f"/api/publish/attempts/{attempt.id}/resolve", {"outcome": "not_published"},
+                         human=True)
+    assert resp.status == 200 and body["attempt"]["status"] == "abandoned"
+    assert call(real, "GET", f"/api/items/{item.id}")[1]["publish"] is None  # nothing live: nothing drawn
+    resp, _, _ = call(real, "POST", f"/api/items/{item.id}/status", {"status": "archived"})
+    assert resp.status == 200
 
 
 DOCS = Path(__file__).resolve().parents[1] / "docs" / "api.md"

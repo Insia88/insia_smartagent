@@ -820,12 +820,24 @@ def _job_mode(settings: Settings) -> str:
     return resolve_mode(settings.mode)[0]
 
 
+def _refuse_locked_item(ws: "Workspace", item_id: str) -> None:
+    """Stop before any (paid) agent call when an API publish attempt of the item is ``sending``/``unknown``: the
+    item is frozen until it is settled, so the job could only fail at its first write (the server checks the same
+    before it starts a job, ``RunManager._check_not_publishing``)."""
+    from .db import ItemLockedError
+
+    attempt = ws.active_publish_attempt(item_id)
+    if attempt is not None:
+        raise ItemLockedError(attempt_id=attempt.id, platform=attempt.platform, status=attempt.status)
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     from .actions import review_item
 
     settings = _settings_from_args(args, **_fast(args))
     with open_workspace(settings) as ws:
         item_id = _item_id(ws, args.item_id)
+        _refuse_locked_item(ws, item_id)
         job = review_item(ws, item_id, settings=settings, listener=ProgressPrinter(quiet=args.quiet))
         cost = ws.run_cost(job.run_id)
     review = job.review
@@ -851,6 +863,7 @@ def cmd_revise(args: argparse.Namespace) -> int:
         instructions = read_text_file(Path(args.instructions_file), "수정 지시 파일").strip()
     with open_workspace(settings) as ws:
         item_id = _item_id(ws, args.item_id)
+        _refuse_locked_item(ws, item_id)
         job = revise_item(ws, item_id, instructions, settings=settings, listener=ProgressPrinter(quiet=args.quiet))
         cost = ws.run_cost(job.run_id)
     label = channel_label(job.item.channel) if job.item else ""
@@ -960,6 +973,46 @@ def cmd_items_show(args: argparse.Namespace) -> int:
     return 0
 
 
+# Mirror of the switches in publishers/settings.py (``_flag``: on/off words, anything else keeps the default), for
+# commands that must not load the publishing package (tests/test_no_autopublish_surface.py). tests/test_cli_publish.py
+# checks it against PublishSettings.from_env, so flipping INSTAGRAM_DEFAULT_ENABLED there fails until this follows.
+_SWITCH_ON = frozenset({"1", "true", "yes", "on"})
+_SWITCH_OFF = frozenset({"0", "false", "no", "off"})
+_INSTAGRAM_SWITCH_DEFAULT = False  # publishers.settings.INSTAGRAM_DEFAULT_ENABLED (Instagram is a beta, off by default)
+
+
+def _env_switch(name: str, default: bool) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    return True if raw in _SWITCH_ON else False if raw in _SWITCH_OFF else default
+
+
+def _api_publishing_switched_on(platform: str) -> bool:
+    """Whether API publishing to this platform is switched on in the environment: ``INSIA_PUBLISH`` (default on)
+    and, for Instagram, ``INSIA_PUBLISH_INSTAGRAM`` (default off). The fake platform mode (``INSIA_PUBLISH_FAKE``)
+    counts as off here — the service refuses it outside a temporary workspace, which only it can tell — so a hint
+    that depends on this is left out rather than pointing to a button or command that is refused."""
+    if platform not in ("linkedin", "instagram") or not _env_switch("INSIA_PUBLISH", True):
+        return False
+    if _env_switch("INSIA_PUBLISH_FAKE", False):
+        return False
+    return platform != "instagram" or _env_switch("INSIA_PUBLISH_INSTAGRAM", _INSTAGRAM_SWITCH_DEFAULT)
+
+
+def _api_publish_offered(ws: "Workspace", channel: str) -> bool:
+    """Whether the dashboard offers ‘API로 게시’ for this channel right now: LinkedIn/Instagram only, API publishing
+    to that platform switched on (``_api_publishing_switched_on``: Instagram needs ``INSIA_PUBLISH_INSTAGRAM=1``)
+    and that platform's account connected in this workspace. Read from the environment and the workspace only — the
+    item commands never load the publishing package (tests/test_no_autopublish_surface.py); a failure just leaves
+    the hint out."""
+    platform = channel if channel in ("linkedin", "instagram") else ""
+    if not _api_publishing_switched_on(platform):
+        return False
+    try:
+        return any(connection.platform == platform for connection in ws.list_publish_connections())
+    except Exception:  # noqa: BLE001 - only a hint
+        return False
+
+
 def cmd_items_approve(args: argparse.Namespace) -> int:
     from .db import ApprovalBlockedError
 
@@ -971,12 +1024,13 @@ def cmd_items_approve(args: argparse.Namespace) -> int:
         except ApprovalBlockedError as exc:
             message = str(exc).replace("'그래도 승인'을 눌러 주세요", "--force를 붙여 주세요")
             raise CommandError(f"{message}\n  그래도 승인: insia items approve {item_id} --force") from None
+        api_offered = _api_publish_offered(ws, item.channel)
     print(f"승인했어요: {channel_label(item.channel)} v{item.version} · {item.title}")
     if item.approval_forced:
         score = f"{item.approved_score}점" if item.approved_score is not None else "검수 전"
         print(f"  강제 승인으로 기록했어요: 검수를 통과하지 않은 v{item.approved_version}({score})을 사람이 직접 확인하고 승인했어요.")
     print(f"다음: insia items export {item_id}  →  직접 게시  →  insia items publish {item_id} --url <게시 주소>")
-    if item.channel in ("linkedin", "instagram"):
+    if api_offered:
         print("  또는 대시보드의 ‘API로 게시’ (터미널에서는 insia publish send "
               f"{item_id}{' --ai-label yes|no' if item.channel == 'instagram' else ''})")
     return 0
@@ -988,10 +1042,14 @@ def cmd_items_schedule(args: argparse.Namespace) -> int:
     with open_workspace(settings) as ws:
         item_id = _item_id(ws, args.item_id)
         item = ws.set_item_status(item_id, "scheduled", scheduled_at=day)
+        api_offered = _api_publish_offered(ws, item.channel)
     print(f"게시 예정으로 표시했어요: {item.scheduled_at}({_weekday(item.scheduled_at[:10])}) · "
           f"{channel_label(item.channel)} · {item.title}")
-    print("INSIA는 예정일에 자동으로 게시하지 않아요. 그날 직접 올리거나 대시보드의 ‘API로 게시’를 눌러 주세요. "
-          "직접 올렸다면 'insia items publish'로 표시해 주세요.")
+    if api_offered:
+        print("INSIA는 예정일에 자동으로 게시하지 않아요. 그날 직접 올리거나 대시보드의 ‘API로 게시’를 눌러 주세요. "
+              "직접 올렸다면 'insia items publish'로 표시해 주세요.")
+    else:
+        print("INSIA는 예정일에 자동으로 게시하지 않아요. 그날 직접 올린 뒤 'insia items publish'로 표시해 주세요.")
     return 0
 
 
@@ -1062,8 +1120,9 @@ def cmd_items_export(args: argparse.Namespace) -> int:
 
 def cmd_runs_list(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
-    item_id = (args.item or "").strip() or None
     with open_workspace(settings) as ws:
+        # a shortened id works like everywhere else; an unknown one is an error, not "no jobs"
+        item_id = _item_id(ws, args.item) if (args.item or "").strip() else None
         runs = ws.list_runs(limit=args.limit, kind=args.kind, status=args.status, parent_item_id=item_id)
         home = _home(settings)
         # 'running' rows whose process is gone (killed, crashed): resume/run-due/serve close them
@@ -1827,14 +1886,12 @@ def cmd_eval_compare(args: argparse.Namespace) -> int:
 PUBLISH_NOT_TTY_MESSAGE = ("insia publish send는 사람이 터미널에서 직접 확인할 때만 돌아요. 예약·스크립트·cron에서는 쓸 수 없어요 "
                            "(LinkedIn API 약관이 자동 게시를 금지해요).")
 PUBLISH_RESOLVE_NOT_TTY_MESSAGE = ("insia publish resolve --published/--not-published는 사람이 터미널에서 직접 확인할 때만 돌아요. "
-                                   "(--check는 스크립트에서도 돼요)")
+                                   "(--check·--permalink는 스크립트에서도 돼요)")
 PUBLISH_STATE_LABELS = {"disabled": "꺼짐", "not_configured": "설정 안 함", "not_connected": "연결 안 됨",
                         "connected": "연결됨", "expiring": "곧 만료", "needs_reconnect": "다시 연결 필요",
                         "unavailable": "지금 쓸 수 없음"}
 PUBLISH_ATTEMPT_LABELS = {"sending": "게시 중", "published": "게시됨", "failed": "실패", "unknown": "확인 필요",
                           "abandoned": "안 올라감(정리)"}
-PUBLISH_STEP_LABELS = {"check": "연결 확인", "polling": "인스타그램이 이미지를 처리하는 중", "carousel": "캐러셀 만들기",
-                       "write": "게시 요청 보내는 중", "permalink": "게시물 주소 받는 중"}
 PUBLISH_CALLBACK_TIMEOUT = 600.0  # the one-time LinkedIn callback listener waits 10 minutes (the state's lifetime)
 
 
@@ -1934,14 +1991,18 @@ def _publish_is_tty() -> bool:
 
 
 @contextmanager
-def _publish_session(args: argparse.Namespace, *, recover: bool = True) -> Iterator[tuple[Settings, "Workspace", Any]]:
+def _publish_session(args: argparse.Namespace, *, recover: bool = True,
+                     allow_disabled: bool = False) -> Iterator[tuple[Settings, "Workspace", Any]]:
     """Workspace + service for one ``publish`` command: refuses when publishing is off (exit 1) and first closes
-    attempts a dead process left ``sending`` (the server does this every minute; the CLI at each command)."""
+    attempts a dead process left ``sending`` (the server does this every minute; the CLI at each command).
+    ``allow_disabled`` — the record-only commands (``attempts``, ``resolve --published/--not-published``) never call
+    a platform, so they keep working while publishing is off: an attempt left ``unknown`` before
+    ``INSIA_PUBLISH=0`` must stay answerable (it locks its item until then)."""
     settings = _settings_from_args(args)
     with open_workspace(settings) as ws:
         service = _publish_service(settings, ws)
         try:
-            if not service.settings.enabled:
+            if not service.settings.enabled and not allow_disabled:
                 raise CommandError(service.settings.disabled_reason or "API 게시가 꺼져 있어요 (INSIA_PUBLISH=0).")
             if recover:
                 recovered = service.recover()
@@ -2028,11 +2089,13 @@ def _publish_print_preview(result: Any) -> None:
 
 
 def _publish_step_printer(platform: str) -> Any:
+    """Progress lines in the dashboard's words (``publishers.base.STEP_LABELS``); a step without words is skipped."""
+    from .publishers.base import step_label
+
     def on_step(step: str) -> None:
-        text = str(step or "")
-        match = re.match(r"^children (\d+)/(\d+)$", text)
-        shown = f"이미지 등록 {match.group(1)}/{match.group(2)}" if match else PUBLISH_STEP_LABELS.get(text, text)
-        print(f"  · {shown}", flush=True)
+        shown = step_label(step)
+        if shown:
+            print(f"  · {shown}", flush=True)
 
     return on_step
 
@@ -2045,7 +2108,8 @@ def _publish_print_outcome(attempt: Any, label: str, *, first_comment_link: str 
             if attempt.platform == "linkedin":
                 print("  (링크가 열리지 않으면 LinkedIn 내 활동에서 확인해 주세요)")
         else:
-            print("게시했어요. 게시물 주소를 받지 못했어요. 게시물 주소를 알면 대시보드의 게시 기록에서 넣어 주세요(선택).")
+            print("게시했어요. 게시물 주소를 받지 못했어요. 게시물 주소를 알면 대시보드의 게시 기록에서 넣거나 "
+                  f"insia publish resolve {attempt.id} --permalink <주소>로 넣어 주세요(선택).")
         problem = (attempt.state or {}).get("item_update_error")
         if problem:
             print(f"  {problem}")
@@ -2059,9 +2123,9 @@ def _publish_print_outcome(attempt: Any, label: str, *, first_comment_link: str 
               f"--not-published{extra}", file=sys.stderr)
         return 1
     if attempt.status == "failed":
-        reason = attempt.error or "이유를 받지 못했어요."
-        tail = "" if "올라가지 않았" in reason or "올리지 않았" in reason else " 아무것도 올라가지 않았어요."
-        print(f"게시하지 못했어요: {reason}{tail}", file=sys.stderr)
+        from .publishers.base import with_nothing_posted
+
+        print(f"게시하지 못했어요: {with_nothing_posted(attempt.error)}", file=sys.stderr)
         return 1
     print(f"게시 기록 {attempt.id}: {PUBLISH_ATTEMPT_LABELS.get(attempt.status, attempt.status)} "
           "(insia publish attempts로 확인해 주세요)", file=sys.stderr)
@@ -2144,9 +2208,12 @@ def _publish_connect_linkedin(args: argparse.Namespace, service: Any) -> dict[st
     from .publishers.oauth import OneShotCallbackListener
 
     start = service.linkedin_connect(request_origin="")
+    redirect_note = (f"   돌아올 주소(Redirect URI): {start.redirect_uri} — LinkedIn 개발자 앱 Auth 탭에 등록한 주소와 같아야 해요. "
+                     "다르면 insia publish setup linkedin에서 고쳐 주세요.")
     if args.paste:
         print("1) 아래 주소를 브라우저에서 열어 LinkedIn에 로그인하고 동의해 주세요.")
         print(f"   {start.authorize_url}")
+        print(redirect_note)
         print("2) 동의하면 브라우저가 다른 주소로 이동해요. '연결할 수 없음'이 떠도 괜찮아요.")
         print("   그 탭의 주소창 주소 전체를 복사해 아래에 붙여 넣어 주세요 (10분 안에).")
         try:
@@ -2177,6 +2244,7 @@ def _publish_connect_linkedin(args: argparse.Namespace, service: Any) -> dict[st
     try:
         print("브라우저에서 LinkedIn에 로그인하고 동의해 주세요 (10분 안에, 그만두려면 Ctrl+C):")
         print(f"  {start.authorize_url}")
+        print(redirect_note)
         if not args.no_browser:
             try:
                 webbrowser.open(start.authorize_url)
@@ -2366,9 +2434,9 @@ def _publish_report_interrupted(attempt: Any, label: str, *, looked_up: bool) ->
         print(f"\n중단했어요. 게시 요청을 보낸 뒤라 올라갔을 수도 있어요. {label}에서 확인한 뒤 정리해 주세요: "
               f"insia publish resolve {attempt.id} --published [--url 주소] 또는 --not-published", file=sys.stderr)
     elif attempt.status == "failed":
-        reason = attempt.error or "이유를 받지 못했어요."
-        tail = "" if "올라가지 않았" in reason or "올리지 않았" in reason else " 아무것도 올라가지 않았어요."
-        print(f"\n중단했어요. 게시하지 못했어요: {reason}{tail}", file=sys.stderr)
+        from .publishers.base import with_nothing_posted
+
+        print(f"\n중단했어요. 게시하지 못했어요: {with_nothing_posted(attempt.error)}", file=sys.stderr)
     elif attempt.status == "sending":
         print(f"\n중단했어요. 게시 기록 {attempt.id}이(가) 아직 '게시 중'이라 올라갔는지 확인하지 못했어요. "
               "insia publish attempts로 확인해 주세요 (다음 publish 명령이 주인 없는 기록을 정리해요).", file=sys.stderr)
@@ -2384,7 +2452,7 @@ def _publish_attempt_id(service: Any, text: str) -> str:
 
 @_publish_errors
 def cmd_publish_attempts(args: argparse.Namespace) -> int:
-    with _publish_session(args) as (_settings, ws, service):
+    with _publish_session(args, allow_disabled=True) as (_settings, ws, service):
         item_id = _item_id(ws, args.item_id) if args.item_id else None
         rows = [service.attempt_json(a) for a in service.list_attempts(item_id=item_id, limit=args.limit)]
     if args.json:
@@ -2395,28 +2463,81 @@ def cmd_publish_attempts(args: argparse.Namespace) -> int:
         return 0
     table = [[r.get("id", ""), _kst(r.get("created_at")), _publish_label(r.get("platform", "")),
               PUBLISH_ATTEMPT_LABELS.get(r.get("status", ""), r.get("status", "")), r.get("item_id", ""),
-              r.get("permalink") or r.get("error") or r.get("step") or ""] for r in rows]
-    print_table(["id", "시각", "플랫폼", "상태", "콘텐츠", "주소·오류"], table, max_widths=[30, 11, 10, 14, 40, 60])
+              _publish_attempt_note(r)] for r in rows]
+    print_table(["id", "시각", "플랫폼", "상태", "콘텐츠", "주소·진행·오류"], table, max_widths=[30, 11, 10, 14, 40, 60])
+    missing = [r for r in rows if r.get("status") == "published" and not r.get("permalink")]
+    for row in missing:  # how to fill in the address (with the Instagram candidates to pick from)
+        print()
+        _publish_print_missing_address(str(row.get("id") or ""), row.get("candidates"), named=True)
     return 0
+
+
+def _publish_attempt_note(row: dict[str, Any]) -> str:
+    """The last column of ``insia publish attempts`` for one attempt JSON: the post address, a missing one (and how
+    many Instagram candidates were found), what an attempt still in flight is doing — the step in words
+    (``step_label``, publishers/base.py), never the worker's step name — or the error."""
+    from .publishers.base import step_label
+
+    status = str(row.get("status") or "")
+    if row.get("permalink"):
+        return str(row["permalink"])
+    if status == "published":
+        count = len(_publish_candidate_list(row.get("candidates")))
+        return "게시물 주소 없음" + (f" (후보 {count}개)" if count else "")
+    if status == "sending":
+        label = str(row.get("step_label") or "") or step_label(row.get("step"))
+        return f"단계: {label}" if label else ""
+    return str(row.get("error") or "")
+
+
+def _publish_candidate_list(candidates: Any) -> list[dict[str, Any]]:
+    return [c for c in candidates or [] if isinstance(c, dict) and c.get("permalink")]
+
+
+def _publish_print_candidates(attempt: Any) -> None:
+    """A published attempt without a post address: the recent posts an Instagram re-check found (DESIGN.md 4-2-7) —
+    a person picks the right one — and how to record it."""
+    if attempt.status != "published" or attempt.permalink:
+        return
+    _publish_print_missing_address(attempt.id, (attempt.state or {}).get("candidates"))
+
+
+def _publish_print_missing_address(attempt_id: str, candidates: Any, *, named: bool = False) -> None:
+    listed = _publish_candidate_list(candidates)
+    who = f"{attempt_id}: " if named else ""
+    if listed:
+        print(f"  {who}게시물 주소를 하나로 정하지 못했어요. 이 게시 시도 뒤에 올라온 게시물이에요:")
+        for number, candidate in enumerate(listed, 1):
+            print(f"    {number}. {_kst(candidate.get('timestamp'), '%Y-%m-%d %H:%M')}  {candidate['permalink']}")
+        print(f"  인스타그램 앱에서 맞는 게시물을 확인하고 넣어 주세요: insia publish resolve {attempt_id} --permalink <주소>")
+    else:
+        print(f"  {who}게시물 주소를 받지 못했어요. 알면 넣어 주세요(선택): insia publish resolve {attempt_id} --permalink <주소>")
 
 
 @_publish_errors
 def cmd_publish_resolve(args: argparse.Namespace) -> int:
-    """Close an ``unknown`` attempt after checking the platform by hand (TTY + y/N), or re-check Instagram."""
+    """Close an ``unknown`` attempt after checking the platform by hand (TTY + y/N), re-check Instagram, or fill in
+    the post address of a published attempt that has none (``--permalink``, record only)."""
     from .publishers import HumanConfirmation
 
     if args.url and not args.published:
         raise UsageError("--url은 --published와 함께만 써요.")
-    if not args.check and not _publish_is_tty():
+    record_only = bool(args.check or args.permalink)
+    if not record_only and not _publish_is_tty():
         print(f"오류: {PUBLISH_RESOLVE_NOT_TTY_MESSAGE}", file=sys.stderr)
         return 2
-    with _publish_session(args) as (_settings, _ws, service):
+    with _publish_session(args, allow_disabled=not args.check) as (_settings, _ws, service):
         attempt_id = _publish_attempt_id(service, args.attempt_id)
         if args.check:
             attempt = service.check_attempt(attempt_id)
             print(f"다시 확인했어요: {PUBLISH_ATTEMPT_LABELS.get(attempt.status, attempt.status)}"
                   + (f" · {attempt.permalink}" if attempt.permalink else "")
                   + (f" · {attempt.error}" if attempt.error and attempt.status != "published" else ""))
+            _publish_print_candidates(attempt)
+            return 0
+        if args.permalink:
+            attempt = service.set_permalink(attempt_id, args.permalink.strip(), by=_publish_requester())
+            print(f"게시물 주소를 넣었어요: {attempt.permalink}")
             return 0
         attempt = service.get_attempt(attempt_id)
         label = _publish_label(attempt.platform)
@@ -2447,7 +2568,7 @@ def cmd_publish_resolve(args: argparse.Namespace) -> int:
 def cmd_publish_refresh(args: argparse.Namespace) -> int:
     """Refresh due Instagram tokens only — never publishes (cron: ``0 9 * * 1 insia publish refresh``)."""
     with _publish_session(args) as (_settings, _ws, service):
-        result = service.refresh_tokens()
+        result = service.refresh_tokens(stored_when_off=True)  # a cron without INSIA_PUBLISH_INSTAGRAM still refreshes
     if args.json:
         _print_json(result)
         return 0
@@ -2513,7 +2634,10 @@ def cmd_backup(args: argparse.Namespace) -> int:
         raise UsageError(f"백업 폴더로 {out}은(는) 쓸 수 없어요. 워크스페이스 밖이나 새 폴더(예: backups/날짜)를 정해 주세요.")
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise CommandError(f"백업 폴더가 비어 있지 않아요: {out}. 새 폴더 이름을 정해 주세요.")
-    out.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Default mode (umask), like the workspace folder and the files copied into it: the backup holds no tokens
+    # (credentials/ stays out), and an owner-only folder would lock out the host user who has to carry a Docker
+    # backup (written by the container's uid 10001 into the bind mount) to USB or cloud storage.
+    out.mkdir(parents=True, exist_ok=True)
     target = out / DB_NAME
     src = sqlite3.connect(str(source), timeout=30)
     try:
@@ -2545,7 +2669,8 @@ def cmd_backup(args: argparse.Namespace) -> int:
     print(f"  넣은 것: {', '.join(copied)} (DB 점검: {'정상' if ok else check})")
     if skipped:
         print(f"  뺀 것: {', '.join(skipped)} — API 게시 토큰(credentials/)은 백업하지 않아요.")
-    print("  복원: 워크스페이스 폴더에 이 파일들을 넣은 뒤, API 게시를 쓴다면 브랜드·자료 → API 게시 연결에서 다시 연결해 주세요.")
+    print("  복원: 서버를 끄고 워크스페이스 폴더에 이 파일들을 넣은 뒤(Docker는 운영 안내 '6. 백업과 복원'의 순서대로), "
+          "API 게시를 쓴다면 브랜드·자료 → API 게시 연결에서 다시 연결해 주세요.")
     return 0 if ok else 1
 
 
@@ -2684,6 +2809,40 @@ def cmd_healthcheck(args: argparse.Namespace) -> int:
     return 1
 
 
+DOCKER_RENDER_HINT = ".env에 INSIA_WITH_RENDER=1을 넣고 docker compose up -d --build로 다시 빌드해 주세요"
+
+
+def _in_docker_image() -> bool:
+    """Running in the INSIA Docker image (its Dockerfile sets these): a pip install or a browser download inside the
+    container does not work there (read-only site-packages and /opt/playwright, gone on the next build), so
+    rendering comes from the ``WITH_RENDER=1`` build (docs/operations.md 1-2)."""
+    return (os.environ.get("INSIA_WEB_DIR") == "/app/web"
+            or os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == "/opt/playwright")
+
+
+def _chromium_found() -> bool:
+    """Whether a Chromium for Playwright is on this machine — ``INSIA_CHROMIUM``, else Playwright's browser folder —
+    without starting a browser (the package alone cannot render anything)."""
+    executable = (os.environ.get("INSIA_CHROMIUM") or "").strip()
+    if executable:
+        return Path(executable).exists()
+    base = (os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "").strip()
+    if base == "0":
+        return True  # browsers inside the package folder: trust the install
+    if base:
+        root = Path(base)
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Caches" / "ms-playwright"
+    elif os.name == "nt":
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "ms-playwright"
+    else:
+        root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ms-playwright"
+    try:
+        return any(entry.name.startswith("chromium") for entry in root.iterdir())
+    except OSError:
+        return False
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     import importlib.util
 
@@ -2721,9 +2880,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         add("error", "워크스페이스", f"{_home(settings)}를 열 수 없어요: {_error_text(exc)}")
     extras = (("docx", "Word 내보내기·읽기 (python-docx)", '[export]'), ("pypdf", "PDF 자료 읽기 (pypdf)", "[docs]"),
               ("yaml", "YAML 프로필 (PyYAML)", "[docs]"), ("playwright", "카드뉴스 PNG (playwright)", "[render]"))
+    in_image = _in_docker_image()
     for module, label, extra in extras:
-        if importlib.util.find_spec(module) is not None:
+        found = importlib.util.find_spec(module) is not None
+        if found and module == "playwright" and not _chromium_found():
+            add("warn", label, "패키지는 있지만 브라우저(Chromium)를 못 찾았어요 → " + (
+                DOCKER_RENDER_HINT if in_image else "python -m playwright install chromium (또는 INSIA_CHROMIUM에 브라우저 경로)"))
+        elif found:
             add("ok", label, "설치됨")
+        elif module == "playwright" and in_image:
+            add("info", label, f"선택 사항, 없어요 → {DOCKER_RENDER_HINT}")
         else:
             add("info", label, f"선택 사항, 없어요 → pip install \"insia-smartagent{extra}\"")
     web = settings.web_dir
@@ -3074,7 +3240,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout-s", dest="timeout_s", type=float, metavar="초",
                    help="live 실행 1번의 최대 시간 (기본 1800초, 넘으면 멈추고 '시간 초과'로 기록)")
     p.add_argument("--resume", action="store_true",
-                   help="--out 폴더에서 이어서 해요 (케이스·채널·모드가 그대로인 끝난 실행은 다시 쓰고, 이미 쓴 비용도 예산 상한에 넣어요)")
+                   help="--out 폴더에서 이어서 해요 (케이스·채널·모드와 설정(모델·통과 점수·수정 횟수·추론 노력·프롬프트·코드)이 "
+                        "그대로인 끝난 실행은 다시 쓰고(채점 코드만 바뀌었으면 무료로 다시 채점), 이 폴더에서 이미 쓴 비용 "
+                        "전체(spend.jsonl)를 예산 상한에 넣어요. 처음보다 적은 --channels로는 이어서 할 수 없어요)")
     p.add_argument("--dry-run", dest="dry_run", action="store_true", help="돌리지 않고 계획과 (live) 예상 비용만 보여 줘요")
     p.add_argument("--estimate-from", dest="estimate_from", metavar="폴더",
                    help="예상 비용을 지난 live 평가의 실측 비용으로 계산해요")
@@ -3164,6 +3332,8 @@ def build_parser() -> argparse.ArgumentParser:
     how.add_argument("--published", action="store_true", help="올라갔어요")
     how.add_argument("--not-published", dest="not_published", action="store_true", help="안 올라갔어요")
     how.add_argument("--check", action="store_true", help="인스타그램에서 다시 확인해요 (읽기만, 게시하지 않아요)")
+    how.add_argument("--permalink", metavar="주소",
+                     help="게시는 됐는데 주소가 비어 있는 기록에 게시물 주소를 넣어요 (기록만 바꿔요)")
     p.add_argument("--url", help="--published일 때 게시물 주소 (선택)")
     p.set_defaults(func=cmd_publish_resolve)
     p = pub_sub.add_parser("refresh", parents=[ws, js], help="인스타그램 토큰만 갱신해요 (게시하지 않아요, cron용)")
@@ -3197,11 +3367,32 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
+LOCKED_PLATFORM_LABELS = {"linkedin": "LinkedIn", "instagram": "인스타그램"}
+
+
+def locked_item_hint(exc: Any) -> str:
+    """The next step for an item an API publish attempt locks (``db.ItemLockedError``): how to answer an
+    ``unknown`` attempt, or to wait for a ``sending`` one. Works while publishing is off too; Instagram's re-check
+    (``resolve --check`` asks the platform) is offered only while Instagram API publishing is switched on."""
+    attempt_id = str(getattr(exc, "attempt_id", "") or "")
+    platform = str(getattr(exc, "platform", "") or "")
+    label = LOCKED_PLATFORM_LABELS.get(platform, "플랫폼")
+    if getattr(exc, "status", "") == "unknown" and attempt_id:
+        check = (f" (인스타그램에서 다시 확인: insia publish resolve {attempt_id} --check)"
+                 if platform == "instagram" and _api_publishing_switched_on("instagram") else "")
+        return (f"  {label}에서 올라갔는지 확인한 뒤 정리해 주세요: insia publish resolve {attempt_id} --published "
+                f"[--url 주소] 또는 --not-published{check}\n  기록 보기: insia publish attempts")
+    return "  게시가 끝난 뒤 다시 해 주세요. 진행 상황: insia publish attempts"
+
+
 def _report_error(exc: BaseException) -> int:
-    from .db import WorkspaceError
+    from .db import ItemLockedError, WorkspaceError
 
     if isinstance(exc, CommandError):
         print(f"오류: {exc}", file=sys.stderr)
+        return 1
+    if isinstance(exc, ItemLockedError):
+        print(f"오류: {exc}\n{locked_item_hint(exc)}", file=sys.stderr)
         return 1
     if isinstance(exc, (WorkspaceError, BackendError)):
         prefix = "실행하지 못했어요: " if isinstance(exc, BackendError) else "오류: "

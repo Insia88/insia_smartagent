@@ -16,9 +16,14 @@ baseline passes when nothing it covered got worse. A planned channel that
 produced no gradable output (error, budget stop, timeout) still counts as
 missing.
 
+A planned channel where only some ``--reps`` could be evaluated is listed
+separately ("일부 반복을 평가하지 못한 채널") and also fails the comparison;
+its unevaluated musts are never counted as regressions.
+
 ``should`` changes, check pass rates, unsupported numbers and cost are
 reported but never fail the comparison. Results from different modes (mock
-vs live) are compared with a warning: their scores do not mean the same thing.
+vs live), models, pass scores or max rounds are compared with a warning:
+their scores and pass/fail do not mean the same thing.
 """
 
 from __future__ import annotations
@@ -83,6 +88,7 @@ def compare_summaries(baseline: dict[str, Any], current: dict[str, Any], *, max_
     new_failures: list[dict[str, Any]] = []
     should_regressions: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
+    partial: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
     pairs: list[tuple[float, float]] = []
 
@@ -94,13 +100,17 @@ def compare_summaries(baseline: dict[str, Any], current: dict[str, Any], *, max_
             missing.append({"case": case_id, "channel": channel, "reason": reason})
         if cur is None:
             continue
+        if channel != "*" and _ok(base) and _ok(cur) and cur.get("reps_ok", 0) < cur.get("reps", 0):
+            partial.append({"case": case_id, "channel": channel,
+                            "reason": f"반복 {cur['reps']}번 중 {cur['reps'] - cur['reps_ok']}번은 평가하지 못했어요 "
+                                      f"({cur.get('error') or cur.get('status')})"})
         base_must, cur_must = _outcomes(base, "must"), _outcomes(cur, "must")
         for mkey, outcome in cur_must.items():
             before = base_must.get(mkey)
             item = {"case": case_id, "channel": channel, "key": mkey, "label": outcome.get("label", mkey),
                     "detail": outcome.get("detail", "")}
             if outcome.get("error"):
-                continue  # counted as missing above
+                continue  # not evaluated (in some or all reps): counted as missing / partial above
             if before is None or before.get("error"):
                 if not outcome["passed"]:
                     new_failures.append(item)
@@ -146,12 +156,24 @@ def compare_summaries(baseline: dict[str, Any], current: dict[str, Any], *, max_
         reasons.append(f"기준에서 통과하던 필수 조건 {len(regressions)}개가 이번에 실패했어요")
     if missing:
         reasons.append(f"기준에서 평가한 채널 {len(missing)}개를 이번에 평가하지 못했어요")
+    if partial:
+        reasons.append(f"기준에서 평가한 채널 {len(partial)}개를 이번에 일부 반복에서 평가하지 못했어요")
     if exceeded:
         reasons.append(f"평균 검수 점수가 {drop:g}점 떨어졌어요 (허용 {max_score_drop:g}점)")
     mode_before, mode_now = baseline.get("mode"), current.get("mode")
     warnings: list[str] = []
     if mode_before != mode_now:
         warnings.append(f"모드가 달라요 (기준 {mode_before}, 이번 {mode_now}). mock 점수는 녹화·템플릿 점수라 live와 비교할 수 없어요.")
+    elif baseline.get("model") != current.get("model"):
+        warnings.append(f"모델이 달라요 (기준 {baseline.get('model')}, 이번 {current.get('model')}). 모델을 비교하려던 게 아니면 "
+                        "--model을 확인하세요.")
+    settings_before, settings_now = baseline.get("settings") or {}, current.get("settings") or {}
+    changed = [label for key, label in (("pass_score", "통과 점수"), ("max_rounds", "최대 수정 횟수"))
+               if key in settings_before and key in settings_now and settings_before[key] != settings_now[key]]
+    if changed:
+        shown = ", ".join(f"{label} {settings_before[key]} → {settings_now[key]}"
+                          for key, label in (("pass_score", "통과 점수"), ("max_rounds", "최대 수정 횟수")) if label in changed)
+        warnings.append(f"설정이 달라요 ({shown}). 검수 통과 여부와 수정 횟수를 그대로 비교하기 어려워요.")
     if new_failures:
         warnings.append(f"기준에는 없던(또는 평가 못 한) 필수 조건 {len(new_failures)}개가 이번에 실패했어요")
     if out_of_scope:
@@ -172,7 +194,7 @@ def compare_summaries(baseline: dict[str, Any], current: dict[str, Any], *, max_
                        "pairs": len(pairs)},
         "cost": {"before": round(cost_before, 6), "now": round(cost_now, 6), "delta": round(cost_now - cost_before, 6)},
         "regressions": regressions, "fixed": fixed, "still_failing": still_failing, "new_failures": new_failures,
-        "should_regressions": should_regressions, "missing": missing, "added": added, "rows": rows,
+        "should_regressions": should_regressions, "missing": missing, "partial": partial, "added": added, "rows": rows,
         "out_of_scope": out_of_scope,
         "score_drop_exceeded": exceeded, "reasons": reasons, "warnings": warnings,
         "exit_code": exit_code, "headline": headline,
@@ -225,6 +247,8 @@ def render_compare(cmp: dict[str, Any], *, markdown: bool = True) -> str:
     block("회귀: 기준에서 통과 → 이번에 실패한 필수 조건", cmp["regressions"],
           lambda i: f"{_label(i['case'], i['channel'])} — {i['label']} (`{i['key']}`): {i['detail']}")
     block("평가하지 못한 채널", cmp["missing"], lambda i: f"{_label(i['case'], i['channel'])} — {i['reason']}")
+    block("일부 반복을 평가하지 못한 채널 (실행 문제, 품질 회귀 아님)", cmp.get("partial", []),
+          lambda i: f"{_label(i['case'], i['channel'])} — {i['reason']}")
     block("새로 실패한 필수 조건 (기준에 없던 조건)", cmp["new_failures"],
           lambda i: f"{_label(i['case'], i['channel'])} — {i['label']}: {i['detail']}")
     block("고쳐진 필수 조건", cmp["fixed"], lambda i: f"{_label(i['case'], i['channel'])} — {i['label']}")

@@ -1182,3 +1182,103 @@ def test_19_publish_card_instagram_choice_and_retry_after_a_failure(e2e, page):
     assert seen["retry"] == {"open": True, "calls": ["publish/preview"], "text": True, "checked": False, "send": True}
     assert page.evaluate("!document.getElementById('pubDialog') || !document.getElementById('pubDialog').open")
     no_js_errors(page)
+
+
+# publish.js's record-only views (final review F1-1/3/4/6), drawn from made-up item blocks on this loaded page with its
+# request layer answered in place. Returns what it saw; the assertions are in Python.
+_PUBLISH_RECORDS = r"""async () => {
+  const I = window.INSIA, ws = I.ws, pub = I.publish, real = { get: ws.get, put: ws.put };
+  const out = {}, puts = [];
+  const settle = () => new Promise(r => setTimeout(r, 0));
+  const history = [
+    { id: 'pa-h1', platform: 'instagram', version: 1, status: 'published', requested_by: 'dashboard@127.0.0.1', resolved_by: 'instagram_check', created_at: '2026-09-28T03:00:00Z' },
+    { id: 'pa-h2', platform: 'instagram', version: 1, status: 'published', requested_by: 'cli:me@host', resolved_by: 'system:late_answer', created_at: '2026-09-28T02:00:00Z' }
+  ];
+  ws.get = function (path) {
+    if (path === '/api/items/c-hist/publish') return Promise.resolve({ item_id: 'c-hist', attempts: history });
+    if (path === '/api/publish') return Promise.resolve({ enabled: false, configured: false, fake: false, media: {}, platforms: {} });
+    if (path.indexOf('/api/publish/attempts/') === 0) return new Promise(() => {});  // a poll that never answers
+    return real.get.apply(ws, arguments);
+  };
+  ws.put = function (path, body) { puts.push([path, body]); return Promise.resolve({ attempt: {} }); };
+  const ctxFor = (id, platform, block, item) => {
+    const ctx = {
+      item: Object.assign({ id: id, status: 'approved', channel: platform, published_via: '', published_url: '' }, item || {}),
+      busy: false, editing: false, job: false, panel: '', refreshed: 0,
+      detail: { publish: Object.assign({ platform: platform, state: 'connected', available: false, reason: '', blocked_by: '',
+                                         blockers: [], active_attempt: null, last_attempt: null }, block) },
+      getPanel: () => ctx.panel, setPanel: k => { ctx.panel = k; }, rerender: () => {},
+      refresh: () => { ctx.refreshed++; return Promise.resolve(); }, edit: () => {}
+    };
+    return ctx;
+  };
+  const text = n => (n ? n.textContent : '');
+  try {
+    // switched off (INSIA_PUBLISH=0) with an unknown Instagram attempt: the lock and the 결과 불명 card, no re-check
+    const unknown = { id: 'pa-u', platform: 'instagram', status: 'unknown', error: '인스타그램 응답이 끊겼어요.' };
+    const offCtx = ctxFor('c-off', 'instagram', { state: 'disabled', active_attempt: unknown, last_attempt: unknown });
+    const off = pub.section(offCtx);
+    out.off = { lock: pub.lock(offCtx), button: pub.button(offCtx), card: !!(off && off.querySelector('[data-key="api-unknown"]')),
+                check: !!(off && off.querySelector('[data-key="api-check"]')),
+                resolve: !!(off && off.querySelector('[data-key="api-resolve-published"]')) };
+    out.onCheck = !!pub.section(ctxFor('c-on', 'instagram', { active_attempt: unknown })).querySelector('[data-key="api-check"]');
+    // step words: the server's step_label, else the fallback table (never 'media' / 'self_check')
+    const sending = (step, extra) => Object.assign({ id: 'pa-s-' + step, platform: 'instagram', status: 'sending', step: step, progress: { done: 0, total: 10 } }, extra || {});
+    out.steps = ['media', 'self_check', 'mystery_step'].map(s => text(pub.section(ctxFor('c-s-' + s, 'instagram', { active_attempt: sending(s) })).querySelector('[data-key="api-progress"]')));
+    out.stepLabel = text(pub.section(ctxFor('c-s-label', 'instagram', { active_attempt: sending('children 2/7', { step_label: '이미지 등록 2/7' }) })).querySelector('[data-key="api-progress"]'));
+    // a failure the platform message already explains: "nothing was posted" once
+    const failed = { id: 'pa-f', platform: 'instagram', status: 'failed', created_at: '2026-09-28T03:00:00Z',
+                     error: '인스타그램에서 오류가 났어요(코드 100). 아무것도 게시되지 않았어요.' };
+    out.failedNote = text(pub.section(ctxFor('c-f', 'instagram', { last_attempt: failed })));
+    // moved back after an API post of this version: already published, not "the status update failed"
+    out.already = text(pub.section(ctxFor('c-a', 'linkedin', { blocked_by: 'already_published',
+      reason: '이 버전은 이미 API로 게시했어요. 게시 완료로 다시 표시하려면 ‘게시 완료 표시’를 눌러 주세요. 다시 올리려면 내용을 고쳐 새 버전으로 승인해 주세요.' })));
+    // 게시 기록: who settled an attempt, in words
+    const hctx = ctxFor('c-hist', 'instagram', { last_attempt: history[0] }, { status: 'published', published_via: 'instagram_api', published_url: 'https://www.instagram.com/p/X/' });
+    hctx.panel = 'api_attempts';
+    pub.panel('api_attempts', hctx);
+    await settle(); await settle();
+    out.history = text(pub.panel('api_attempts', hctx));
+    // an Instagram re-check that found several recent posts: pick one → PUT its address
+    const found = { id: 'pa-c', platform: 'instagram', status: 'published', permalink: '', permalink_missing: true, candidates: [
+      { id: '18000000000000002', permalink: 'https://www.instagram.com/p/MANUAL/', timestamp: '2026-09-28T03:04:00Z' },
+      { id: '18000000000000001', permalink: 'https://www.instagram.com/p/APIPOST/', timestamp: '2026-09-28T03:00:20Z' },
+      { id: '18000000000000009', permalink: '', timestamp: '2026-09-28T03:02:00Z' }] };
+    const cctx = ctxFor('c-cand', 'instagram', { last_attempt: found }, { status: 'published', published_via: 'instagram_api' });
+    const cs = pub.section(cctx);
+    const picks = cs ? [...cs.querySelectorAll('[data-key="api-candidate-pick"]')] : [];
+    out.cand = { count: picks.length, text: text(cs && cs.querySelector('[data-key="api-candidates"]')) };
+    if (picks[1]) picks[1].click();
+    await settle(); await settle();
+    out.cand.puts = puts.slice();
+    out.cand.refreshed = cctx.refreshed;
+  } finally {
+    ws.get = real.get;
+    ws.put = real.put;
+    I.views.publish.reset();
+  }
+  return out;
+}"""
+
+
+def test_20_publish_records_lock_steps_history_and_candidates(e2e, page):
+    need(e2e, "publish_unconfigured")  # this page on the 보관함 screen
+    seen = page.evaluate(_PUBLISH_RECORDS)
+    off = seen["off"]  # INSIA_PUBLISH=0 with an unknown attempt: locked and answerable, nothing that calls the platform
+    assert "게시 결과를 먼저 정리해 주세요" in off["lock"] and off["button"] is None
+    assert off["card"] is True and off["resolve"] is True and off["check"] is False
+    assert seen["onCheck"] is True  # with publishing on, Instagram's re-check is offered
+    media, self_check, mystery = seen["steps"]
+    assert "(이미지 올릴 준비)" in media and "(공개 주소 확인)" in self_check
+    assert not any(raw in " ".join(seen["steps"]) for raw in ("media", "self_check", "mystery_step"))
+    assert "인스타그램에 올리는 중이에요." in mystery  # a step without words is left out
+    assert "(이미지 등록 2/7)" in seen["stepLabel"]
+    assert "아무것도 게시되지 않았어요." in seen["failedNote"] and "아무것도 올라가지 않았어요" not in seen["failedNote"]
+    assert "이미 API로 게시했어요" in seen["already"] and "바꾸지 못했어요" not in seen["already"]
+    assert "인스타그램 재확인" in seen["history"] and "늦게 도착한 응답(자동)" in seen["history"]
+    assert "instagram_check" not in seen["history"] and "system:late_answer" not in seen["history"]
+    cand = seen["cand"]
+    assert cand["count"] == 2 and "MANUAL" in cand["text"] and "APIPOST" in cand["text"]
+    assert cand["puts"] == [["/api/publish/attempts/pa-c/permalink", {"permalink": "https://www.instagram.com/p/APIPOST/"}]]
+    assert cand["refreshed"] >= 1
+    no_js_errors(page)

@@ -265,6 +265,34 @@ def test_refresh_tokens_saves_atomically_and_auth_errors_need_a_reconnect(publis
     assert service.readiness("instagram").state == "needs_reconnect"
 
 
+
+def test_publish_refresh_keeps_a_stored_token_alive_while_the_instagram_switch_is_off(publish_kit):
+    """Final review #7: the weekly ``insia publish refresh`` cron whose environment lacks INSIA_PUBLISH_INSTAGRAM=1
+    used to log "꺼져 있어요" and exit 0 while the 60-day token ran out. The explicit command now refreshes a stored
+    token anyway (a refresh never publishes); the server's 6-hour job and every other path keep the switch."""
+    fake = FakeTransport()
+    publish_kit.connect_instagram(publish_kit.service(transport=fake, instagram=True), issued_hours_ago=50 * 24, days=10)
+    off = publish_kit.service(transport=fake)  # INSIA_PUBLISH_INSTAGRAM not set
+    assert not off.settings.instagram_enabled
+    before = off.store.get("instagram")["expires_at"]
+    # the maintenance job (and previews/status) stay gated: nothing is sent while the switch is off
+    assert off.refresh_tokens()["instagram"] == {"refreshed": False, "expires_at": "", "estimated": False,
+                                                 "message": "인스타그램 API 게시가 꺼져 있어요."}
+    assert fake.requests == []
+    fake.add("GET", r"/refresh_access_token$", json_response(200, {"access_token": "IGAA-new-token-abcdef",
+                                                                   "expires_in": 5184000}))
+    result = off.refresh_tokens(stored_when_off=True)["instagram"]
+    values = off.store.get("instagram")
+    assert result["refreshed"] is True and values["access_token"] == "IGAA-new-token-abcdef"
+    assert values["expires_at"] > before and result["expires_at"] == values["expires_at"]
+    assert "인스타그램 API 게시가 꺼져 있어요" in result["message"] and "INSIA_PUBLISH_INSTAGRAM=1" in result["message"]
+    # not due again: still reported, still no publish path
+    again = off.refresh_tokens(stored_when_off=True)["instagram"]
+    assert again["refreshed"] is False and "아직 갱신할 때가 아니에요" in again["message"]
+    # no stored token: nothing to refresh, same message as before
+    off.store.set_many("instagram", {"access_token": None})
+    assert off.refresh_tokens(stored_when_off=True)["instagram"]["message"] == "인스타그램 API 게시가 꺼져 있어요."
+
 def test_quota_is_read_from_the_answer_and_blocks_when_used_up(publish_kit):
     service, _ = _setup(publish_kit, quota=(100, 100))
     _, result = _preview(publish_kit, service)

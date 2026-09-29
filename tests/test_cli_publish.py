@@ -40,7 +40,8 @@ from insia_agents.publishers import (
     PreviewResult,
     parse_preview_options,
 )
-from insia_agents.publishers.base import confirm_code_hash, new_confirm_code, payload_hash
+from insia_agents.publishers.base import confirm_code_hash, new_confirm_code, payload_hash, step_label
+from insia_agents.publishers.service import ATTEMPT_JSON_STATE
 from insia_agents.publishers.settings import PUBLISH_ENV_VARS, PublishSettings
 
 pytestmark = pytest.mark.usefixtures("no_network")  # loopback only (tests/conftest.py)
@@ -219,6 +220,8 @@ class CliStub:
     def attempt_json(self, attempt: PublishAttempt) -> dict[str, Any]:
         data = attempt.model_dump(mode="json", exclude={"state"})
         data["progress"] = {"done": 1 if attempt.status == "published" else 0, "total": 1}
+        data["step_label"] = step_label(attempt.step)  # the service's contract: the step in words, safe state notes
+        data.update({key: value for key, value in (attempt.state or {}).items() if key in ATTEMPT_JSON_STATE})
         return data
 
     def resolve(self, confirmation, outcome, *, url: str = ""):
@@ -235,9 +238,15 @@ class CliStub:
         self._call("check_attempt", attempt_id=attempt_id)
         return self.attempts[attempt_id]
 
+    def set_permalink(self, attempt_id: str, url: str, *, by: str) -> PublishAttempt:
+        self._call("set_permalink", attempt_id=attempt_id, url=url, by=by)
+        attempt = self.attempts[attempt_id].model_copy(update={"permalink": url})
+        self.attempts[attempt_id] = attempt
+        return attempt
+
     # maintenance
-    def refresh_tokens(self) -> dict[str, dict[str, Any]]:
-        self._call("refresh_tokens")
+    def refresh_tokens(self, **kwargs: Any) -> dict[str, dict[str, Any]]:
+        self._call("refresh_tokens", **kwargs)
         return {"instagram": {"refreshed": True, "expires_at": "2026-11-27T00:00:00Z", "estimated": False,
                               "message": "60일 연장했어요."}}
 
@@ -605,6 +614,7 @@ def test_status_attempts_resolve_refresh_disconnect(env, stubs, tty, capsys, mon
     code, out, err = run(capsys, "publish", "refresh", "--json")
     assert code == 0 and json.loads(out)["instagram"]["refreshed"] is True
     assert stubs[-1].names() == ["recover", "refresh_tokens", "shutdown"]
+    assert stubs[-1].called("refresh_tokens") == [{"stored_when_off": True}]  # a cron without the IG switch still refreshes
     code, out, err = run(capsys, "publish", "disconnect", "linkedin", "--forget-app")
     assert code == 0 and stubs[-1].called("disconnect") == [{"platform": "linkedin", "forget_app": True}]
     assert "권한 있는 서비스" in out
@@ -619,6 +629,237 @@ def test_every_publish_command_says_off_when_disabled(env, stubs, tty, capsys, m
         assert code == 1 and "API 게시가 꺼져 있어요 (INSIA_PUBLISH=0)." in err, argv
         assert out == ""
     assert all(stub.names() == ["shutdown"] for stub in stubs)  # not even recovery ran
+
+
+def _unknown_attempt(home: Path, item_id: str, platform: str = "linkedin") -> str:
+    """A real 'unknown' attempt (the platform's answer was lost after the write step): it locks the item."""
+    from insia_agents.models import PublishConnection
+
+    ws = Workspace(home)
+    try:
+        ws.save_publish_connection(PublishConnection(platform=platform, account_id="sub-1", status="connected"))
+        digest = "sha256:" + "c" * 64
+        version = ws.get_item(item_id).item.version
+        preview = ws.create_publish_preview(item_id, version, platform, "sub-1", {"schema": 1}, digest,
+                                            created_via="cli", requested_by="cli:test")
+        attempt, owner = ws.begin_publish_attempt(preview.id, digest, via="cli", requested_by="cli:test")
+        ws.claim_publish_write(attempt.id, owner)
+        return ws.finish_publish_failure(attempt.id, owner, status="unknown", error="LinkedIn 500").id
+    finally:
+        ws.close()
+
+
+def test_record_only_commands_still_answer_an_unknown_attempt_when_switched_off(env, tty, capsys, monkeypatch):
+    """Final review F1-1: INSIA_PUBLISH=0 after an 'unknown' attempt must not strand its item. ``attempts`` and
+    ``resolve --published/--not-published`` touch only the records (the real service, no platform); ``--check``
+    and everything that could post stay off. A locked item's error names the way out."""
+    item_id = make_item(env)
+    attempt_id = _unknown_attempt(env, item_id)
+    monkeypatch.setenv("INSIA_PUBLISH", "0")
+    code, out, err = run(capsys, "items", "publish", item_id, "--url", "https://www.linkedin.com/feed/update/urn:li:share:1/")
+    assert code == 1 and "먼저 정리해 주세요" in err and f"insia publish resolve {attempt_id} --published" in err
+    code, out, err = run(capsys, "publish", "attempts", "--json")
+    assert code == 0 and [a["id"] for a in json.loads(out)["attempts"]] == [attempt_id]
+    code, out, err = run(capsys, "publish", "resolve", attempt_id, "--check")
+    assert code == 1 and "API 게시가 꺼져 있어요" in err
+    tty.answers.append("y")
+    code, out, err = run(capsys, "publish", "resolve", attempt_id, "--not-published")
+    assert code == 0 and "'안 올라갔어요'로 정리했어요" in out, err
+    code, out, err = run(capsys, "items", "archive", item_id)
+    assert code == 0, err
+
+
+@pytest.mark.parametrize("argv", [("review",), ("revise", "--instructions", "더 짧게")], ids=["review", "revise"])
+def test_review_and_revise_stop_before_any_agent_call_on_a_locked_item(env, capsys, argv):
+    """Final review F1-2: the CLI checks the publish lock before the job starts (like the server), so no paid
+    research, rewrite or review runs only to fail at the first write."""
+    item_id = make_item(env)
+    attempt_id = _unknown_attempt(env, item_id)
+    code, out, err = run(capsys, argv[0], item_id, *argv[1:], "--mode", "mock", "--speed", "0")
+    assert code == 1 and "먼저 정리해 주세요" in err and f"insia publish resolve {attempt_id}" in err
+    assert "검수" not in out and "수정 중" not in out  # no agent progress at all
+    ws = Workspace(env)
+    try:
+        assert ws.list_runs(kind=argv[0]) == []
+        assert ws.get_item(item_id).item.version == 1
+    finally:
+        ws.close()
+
+
+def test_approve_and_schedule_mention_api_publishing_only_when_the_dashboard_offers_it(env, capsys, monkeypatch):
+    """Final review F1-14: ‘API로 게시’ exists only for a connected LinkedIn/Instagram account with publishing on;
+    everyone else is told the manual way (export → post → items publish), as before API publishing existed."""
+    from insia_agents.models import PublishConnection
+
+    manual = "INSIA는 예정일에 자동으로 게시하지 않아요. 그날 직접 올린 뒤 'insia items publish'로 표시해 주세요."
+
+    def messages(channel: str) -> str:
+        item_id = make_item(env, channel)
+        code, out, err = run(capsys, "items", "schedule", item_id, "--date", "2026-10-07")
+        assert code == 0, err
+        code, approved, err = run(capsys, "items", "approve", item_id)  # scheduled → approved keeps the approval
+        assert code == 0, err
+        return out + approved
+
+    for channel in ("linkedin", "instagram", "naver_blog", "bizplan"):  # nothing set up
+        text = messages(channel)
+        assert "API로 게시" not in text and manual in text, channel
+    ws = Workspace(env)
+    try:
+        for platform in ("linkedin", "instagram"):
+            ws.save_publish_connection(PublishConnection(platform=platform, account_id="sub-1", status="connected"))
+    finally:
+        ws.close()
+    text = messages("linkedin")
+    assert "대시보드의 ‘API로 게시’를 눌러 주세요" in text and "insia publish send" in text
+    assert "API로 게시" not in messages("naver_blog")  # no API publishing for this channel at all
+    # Instagram is a beta, off unless INSIA_PUBLISH_INSTAGRAM says on (the dashboard draws no button then)
+    assert "API로 게시" not in messages("instagram")
+    monkeypatch.setenv("INSIA_PUBLISH_INSTAGRAM", "1")
+    assert "insia publish send" in messages("instagram") and "--ai-label yes|no" in messages("instagram")
+    monkeypatch.setenv("INSIA_PUBLISH_INSTAGRAM", "0")
+    assert "API로 게시" not in messages("instagram")
+    monkeypatch.setenv("INSIA_PUBLISH_FAKE", "1")  # the service may refuse it here (not a temporary workspace)
+    assert "API로 게시" not in messages("linkedin")
+    monkeypatch.delenv("INSIA_PUBLISH_FAKE")
+    monkeypatch.setenv("INSIA_PUBLISH", "0")
+    assert "API로 게시" not in messages("linkedin")
+
+
+def test_the_item_commands_publish_switches_follow_the_publish_settings(tmp_path, monkeypatch):
+    """The item commands read the switches without the publishing package; they must agree with
+    ``PublishSettings`` (Instagram's default included), and never say on where the service is off."""
+    for publish in (None, "0", "1", "off", "YES", "maybe"):
+        for instagram in (None, "0", "1", "on", "no", "maybe"):
+            for fake in (None, "1"):
+                env = {name: value for name, value in (("INSIA_PUBLISH", publish), ("INSIA_PUBLISH_INSTAGRAM", instagram),
+                                                       ("INSIA_PUBLISH_FAKE", fake)) if value is not None}
+                for name in ("INSIA_PUBLISH", "INSIA_PUBLISH_INSTAGRAM", "INSIA_PUBLISH_FAKE"):
+                    monkeypatch.delenv(name, raising=False)
+                for name, value in env.items():
+                    monkeypatch.setenv(name, value)
+                settings = PublishSettings.from_env(env, tmp_path / "ws")
+                switched = {p: cli._api_publishing_switched_on(p) for p in ("linkedin", "instagram")}
+                service = {"linkedin": settings.enabled, "instagram": settings.instagram_enabled}
+                if fake:  # only the service can tell a temporary workspace: the hints stay out
+                    assert switched == {"linkedin": False, "instagram": False}, env
+                else:
+                    assert switched == service, env
+    assert not cli._api_publishing_switched_on("naver_blog")
+
+
+def test_a_locked_instagram_item_offers_the_recheck_only_when_it_would_run(monkeypatch):
+    """``resolve --check`` asks Instagram, so the locked-item hint names it only while Instagram API publishing is
+    switched on; the record-only answers (--published / --not-published) are always there."""
+    from insia_agents.db import ItemLockedError
+
+    locked = ItemLockedError(attempt_id="pa_" + "4" * 24, platform="instagram", status="unknown")
+    for publish, instagram, offered in ((None, None, False), (None, "1", True), ("0", "1", False), (None, "0", False)):
+        for name, value in (("INSIA_PUBLISH", publish), ("INSIA_PUBLISH_INSTAGRAM", instagram)):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        hint = cli.locked_item_hint(locked)
+        assert f"insia publish resolve {locked.attempt_id} --published" in hint and "--not-published" in hint
+        assert ("--check" in hint) is offered, (publish, instagram)
+    linkedin = ItemLockedError(attempt_id="pa_" + "5" * 24, platform="linkedin", status="unknown")
+    assert "--check" not in cli.locked_item_hint(linkedin)
+
+
+def test_attempts_table_shows_steps_in_words_and_how_to_fill_a_missing_address(env, stubs, capsys, monkeypatch):
+    """Final review F1-3 (follow-up): ``insia publish attempts`` names an attempt in flight by its step in words
+    (the attempt JSON's ``step_label``), never ``self_check`` / ``media`` / ``write``; a published attempt without
+    an address says so (not its last step) and the Instagram candidates and ``--permalink`` follow the table."""
+    item_id = make_item(env, "instagram")
+    candidates = [{"id": "18000000000000002", "permalink": "https://www.instagram.com/p/MANUAL/",
+                   "timestamp": "2026-09-28T03:04:00Z"},
+                  {"id": "18000000000000001", "permalink": "https://www.instagram.com/p/APIPOST/",
+                   "timestamp": "2026-09-28T03:00:20Z"}]
+
+    def attempt(digit: str, status: str, step: str, **fields: Any) -> PublishAttempt:
+        return PublishAttempt(id="pa_" + digit * 24, item_id=item_id, version=1, platform="instagram", status=status,
+                              step=step, created_at="2026-09-28T03:00:00Z", updated_at="2026-09-28T03:10:00Z", **fields)
+
+    attempts = [attempt("1", "sending", "self_check"), attempt("2", "sending", "children 3/8"),
+                attempt("3", "sending", "media"), attempt("4", "sending", "some_future_step"),
+                attempt("5", "published", "write", state={"candidates": candidates, "permalink_missing": True}),
+                attempt("6", "published", "write"),
+                attempt("7", "published", "write", permalink="https://www.instagram.com/p/DONE/"),
+                attempt("8", "failed", "write", error="인스타그램에서 오류가 났어요(코드 100). 아무것도 게시되지 않았어요.")]
+    original = CliStub.__init__
+
+    def init(self, workspace, env=None):
+        original(self, workspace, env)
+        self.attempts = {a.id: a for a in attempts}
+
+    monkeypatch.setattr(CliStub, "__init__", init)
+    code, out, err = run(capsys, "publish", "attempts")
+    assert code == 0, err
+    rows = {line.split()[0][3:4]: line for line in out.splitlines() if line.startswith("pa_")}
+    assert set(rows) == set("12345678")
+    for raw in ("self_check", "media", "children", "write", "some_future_step"):
+        assert raw not in out, raw
+    assert rows["1"].endswith("단계: 공개 주소 확인") and rows["2"].endswith("단계: 이미지 등록 3/8")
+    assert rows["3"].endswith("단계: 이미지 올릴 준비") and rows["4"].rstrip().endswith(item_id)  # no words: left out
+    assert rows["5"].endswith("게시물 주소 없음 (후보 2개)") and rows["6"].endswith("게시물 주소 없음")
+    assert rows["7"].endswith("https://www.instagram.com/p/DONE/") and "코드 100" in rows["8"]
+    first, second = "pa_" + "5" * 24, "pa_" + "6" * 24
+    assert f"{first}: 게시물 주소를 하나로 정하지 못했어요" in out
+    assert "1. 2026-09-28 12:04  https://www.instagram.com/p/MANUAL/" in out  # KST, like resolve --check
+    assert f"insia publish resolve {first} --permalink <주소>" in out
+    assert f"{second}: 게시물 주소를 받지 못했어요" in out and f"insia publish resolve {second} --permalink <주소>" in out
+    code, out, err = run(capsys, "publish", "attempts", "--json")
+    assert code == 0 and {a["id"]: a["step_label"] for a in json.loads(out)["attempts"]}["pa_" + "1" * 24] == "공개 주소 확인"
+
+
+def test_send_progress_and_failure_lines_use_the_dashboards_words(capsys):
+    """Final review F1-3: Instagram's 'media'/'self_check' steps print in Korean, and an Instagram failure that
+    already says "아무것도 게시되지 않았어요" does not get a second "nothing was posted" sentence."""
+    printer = cli._publish_step_printer("instagram")
+    for step in ("check", "media", "self_check", "children 2/7", "some_future_step", "write"):
+        printer(step)
+    assert capsys.readouterr().out.splitlines() == ["  · 연결 확인", "  · 이미지 올릴 준비", "  · 공개 주소 확인",
+                                                    "  · 이미지 등록 2/7", "  · 게시 요청 보내는 중"]
+    failed = PublishAttempt(id="pa_" + "1" * 24, item_id="it_x", version=1, platform="instagram", status="failed",
+                            error="인스타그램에서 오류가 났어요(코드 100). 아무것도 게시되지 않았어요.")
+    assert cli._publish_print_outcome(failed, "인스타그램") == 1
+    err = capsys.readouterr().err
+    assert err.strip() == "게시하지 못했어요: 인스타그램에서 오류가 났어요(코드 100). 아무것도 게시되지 않았어요."
+    assert cli._publish_report_interrupted(failed.model_copy(update={"error": "이미지 형식을 받지 않았어요."}),
+                                           "인스타그램", looked_up=True) == 1
+    assert capsys.readouterr().err.count("아무것도 올라가지 않았어요") == 1
+
+
+def test_resolve_check_lists_instagram_candidates_and_permalink_records_one(env, stubs, capsys, monkeypatch):
+    """Final review F1-6: a re-check that found several recent posts prints them (time + address) and says how to
+    record the right one; ``--permalink`` fills it in without a terminal (a record, never a post)."""
+    item_id = make_item(env, "instagram")
+    candidates = [{"id": "18000000000000002", "permalink": "https://www.instagram.com/p/MANUAL/",
+                   "timestamp": "2026-09-28T03:04:00Z"},
+                  {"id": "18000000000000001", "permalink": "https://www.instagram.com/p/APIPOST/",
+                   "timestamp": "2026-09-28T03:00:20Z"}]
+    attempt = PublishAttempt(id="pa_" + "7" * 24, item_id=item_id, version=1, platform="instagram", status="published",
+                             resolved_by="instagram_check", state={"candidates": candidates, "permalink_missing": True},
+                             created_at="2026-09-28T03:00:00Z", updated_at="2026-09-28T03:10:00Z")
+    original = CliStub.__init__
+
+    def init(self, workspace, env=None):
+        original(self, workspace, env)
+        self.attempts = {attempt.id: attempt}
+
+    monkeypatch.setattr(CliStub, "__init__", init)
+    monkeypatch.setattr(cli, "_publish_is_tty", lambda: False)  # both are fine in a script
+    code, out, err = run(capsys, "publish", "resolve", "pa_7777", "--check")
+    assert code == 0, err
+    assert "게시물 주소를 하나로 정하지 못했어요" in out
+    assert "1. 2026-09-28 12:04  https://www.instagram.com/p/MANUAL/" in out  # KST
+    assert "2. 2026-09-28 12:00  https://www.instagram.com/p/APIPOST/" in out
+    assert f"insia publish resolve {attempt.id} --permalink <주소>" in out
+    code, out, err = run(capsys, "publish", "resolve", "pa_7777", "--permalink", "https://www.instagram.com/p/APIPOST/")
+    assert code == 0 and "게시물 주소를 넣었어요: https://www.instagram.com/p/APIPOST/" in out, err
+    assert stubs[-1].called("set_permalink")[0]["url"] == "https://www.instagram.com/p/APIPOST/"
+    assert stubs[-1].called("resolve") == []
 
 
 # ---------------------------------------------------------------------------

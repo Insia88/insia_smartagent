@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from ..channels import check_format
 from ..models import ChannelResult, Draft, Review, ResearchPack
 from .cases import Assertion, EvalCase, format_number
-from .grounding import Evidence, Mention, analyze_numbers, contains, grounding_summary, hedged, placeholders
+from .grounding import Evidence, Mention, analyze_numbers, contains, grounding_summary, hedged, placeholders, unit_key
 
 MONEY_UNITS = ("원",)
 DEFAULT_ASSUMPTION_MARKERS = ("가정",)
@@ -74,8 +74,9 @@ def _money_violations(mentions: Iterable[Mention], units: tuple[str, ...], marke
     draft still has to call it an assumption. Markers are matched as words (``가정용`` is not ``가정``) and plan words
     only when attached to the figure (see ``grounding.hedged``)."""
     bad = []
+    keys = {unit_key(u) for u in units}
     for m in mentions:
-        if m.kind != "claim" or m.unit not in units:
+        if m.kind != "claim" or unit_key(m.unit) not in keys:
             continue
         if any(o.startswith(("research:", "document:")) for o in m.firm_origins):
             continue

@@ -8,3 +8,7 @@ dist/
 outputs/
 .DS_Store
 workspace/
+# Secrets (docs/operations.md 1-2: ANTHROPIC_API_KEY, INSIA_ACCESS_TOKEN, LinkedIn app secret); same as .dockerignore
+.env
+.env.*
+!.env.example
